@@ -1,0 +1,35 @@
+# Секреты
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Результаты работы
+exports/
+logs/
+tmp/
+
+# PostgreSQL
+postgres_data/
+
+# Системные файлы
+.DS_Store
+Thumbs.db
