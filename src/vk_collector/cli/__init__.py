@@ -1,0 +1,1 @@
+"""Команды VK Research Collector."""
