@@ -1,4 +1,4 @@
-"""Начальная схема первого этапа.
+﻿"""Начальная схема первого этапа.
 
 Revision ID: 20260728_0001
 """
@@ -6,8 +6,8 @@ Revision ID: 20260728_0001
 from collections.abc import Sequence
 
 from alembic import op
-from database import models  # noqa: F401
-from database.base import Base
+from vk_collector.database import models  # noqa: F401
+from vk_collector.database.base import Base
 
 revision: str = "20260728_0001"
 down_revision: str | None = None

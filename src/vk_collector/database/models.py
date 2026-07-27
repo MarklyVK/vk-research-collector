@@ -1,4 +1,4 @@
-"""Нормализованная модель данных первого этапа."""
+﻿"""Нормализованная модель данных первого этапа."""
 
 import enum
 import uuid
@@ -23,7 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from database.base import Base
+from vk_collector.database.base import Base
 
 
 class ClassificationStatus(str, enum.Enum):
@@ -144,7 +144,7 @@ class SearchRun(TimestampMixin, Base):
 class SearchRunKeyword(TimestampMixin, Base):
     __tablename__ = "search_run_keywords"
     __table_args__ = (
-        UniqueConstraint("search_run_id", "keyword_id"),
+        UniqueConstraint("search_run_id", "keyword_id", "community_type"),
         CheckConstraint("next_offset >= 0", name="next_offset_nonnegative"),
         Index("ix_search_run_keywords_resume", "search_run_id", "status"),
     )
@@ -159,6 +159,9 @@ class SearchRunKeyword(TimestampMixin, Base):
         BigInteger,
         ForeignKey("search_keywords.id", ondelete="RESTRICT"),
         nullable=False,
+    )
+    community_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default="group"
     )
     status: Mapped[RunStatus] = mapped_column(
         Enum(RunStatus, name="search_run_status", create_type=False),

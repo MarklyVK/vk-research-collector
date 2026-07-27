@@ -1,4 +1,4 @@
-"""Alembic environment с asyncpg."""
+﻿"""Alembic environment с asyncpg."""
 
 import asyncio
 import os
@@ -8,8 +8,8 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
-from database import models  # noqa: F401
-from database.base import Base
+from vk_collector.database import models  # noqa: F401
+from vk_collector.database.base import Base
 
 config = context.config
 if config.config_file_name is not None:
