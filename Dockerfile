@@ -24,7 +24,8 @@ COPY alembic ./alembic
 COPY config ./config
 COPY tests ./tests
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
-RUN chmod 755 /usr/local/bin/docker-entrypoint \
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint \
+    && chmod 755 /usr/local/bin/docker-entrypoint \
     && mkdir -p /app/exports/classification \
     && chown -R collector:collector /app
 

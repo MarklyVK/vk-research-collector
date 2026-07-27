@@ -204,8 +204,8 @@ class ClassificationBatch(Base):
 class ClassificationBatchItem(Base):
     __tablename__ = "classification_batch_items"
     __table_args__ = (
-        UniqueConstraint("batch_id", "group_id"),
-        UniqueConstraint("batch_id", "position"),
+        UniqueConstraint("batch_id", "group_id", name="uq_batch_items_batch_group"),
+        UniqueConstraint("batch_id", "position", name="uq_batch_items_batch_position"),
         CheckConstraint("position >= 0", name="position_nonnegative"),
         Index("ix_classification_batch_items_group_id", "group_id"),
     )
