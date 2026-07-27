@@ -150,7 +150,12 @@ class SearchRunKeyword(TimestampMixin, Base):
     )
     community_type: Mapped[str] = mapped_column(String(50), nullable=False, server_default="group")
     status: Mapped[RunStatus] = mapped_column(
-        Enum(RunStatus, name="search_run_status", create_type=False),
+        Enum(
+            RunStatus,
+            name="search_run_status",
+            values_callable=lambda x: [e.value for e in x],
+            create_type=False,
+        ),
         nullable=False,
         server_default=RunStatus.RUNNING.value,
     )
