@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr
@@ -38,7 +39,7 @@ class Settings(BaseSettings):
         """Вернуть URL SQLAlchemy, не предназначенный для логирования."""
         if self.database_url:
             return self.database_url
-        password = self.postgres_password.get_secret_value()
+        password = quote(self.postgres_password.get_secret_value(), safe="")
         return (
             f"postgresql+asyncpg://{self.postgres_user}:{password}@"
             f"{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"

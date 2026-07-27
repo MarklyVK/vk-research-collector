@@ -79,7 +79,7 @@ jobs:
           scp -P "${SERVER_PORT:-22}" .deploy-secrets/vk_tokens.txt "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/secrets/vk_tokens.txt"
       - name: Запустить и проверить
         run: |
-          ssh -p "${SERVER_PORT:-22}" "$SERVER_USER@$SERVER_HOST" "cd '$DEPLOY_PATH' && chmod 600 .env secrets/vk_tokens.txt && chmod 700 secrets && docker compose build collector && docker compose up -d postgres && docker compose run --rm collector alembic upgrade head && docker compose run --rm collector --help >/dev/null"
+          ssh -p "${SERVER_PORT:-22}" "$SERVER_USER@$SERVER_HOST" "cd '$DEPLOY_PATH' && chmod 600 .env secrets/vk_tokens.txt && chmod 700 secrets && docker compose up -d --build postgres && docker compose build collector && docker compose run --rm collector alembic upgrade head && docker compose run --rm collector --help >/dev/null"
       - name: Уведомить Telegram
         if: always()
         env:
