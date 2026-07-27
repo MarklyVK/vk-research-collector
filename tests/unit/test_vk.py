@@ -47,9 +47,7 @@ def test_loads_unlimited_nonempty_tokens(tmp_path: Path) -> None:
 @async_test
 async def test_pool_rate_limit_cooldown_disable_and_redacted_repr() -> None:
     time = FakeTime()
-    pool = TokenPool(
-        ["secret-a", "secret-b"], rps=2, clock=time.clock, sleep=time.sleep
-    )
+    pool = TokenPool(["secret-a", "secret-b"], rps=2, clock=time.clock, sleep=time.sleep)
     assert await pool.acquire() == "secret-a"
     await pool.cooldown("secret-b", 10)
     assert await pool.acquire() == "secret-a"
@@ -71,9 +69,7 @@ async def test_auth_error_switches_token_without_leaking_it() -> None:
         form = dict(item.split("=") for item in request.content.decode().split("&"))
         seen.append(form["access_token"])
         if len(seen) == 1:
-            return httpx.Response(
-                200, json={"error": {"error_code": 5, "error_msg": "auth"}}
-            )
+            return httpx.Response(200, json={"error": {"error_code": 5, "error_msg": "auth"}})
         return httpx.Response(200, json={"response": {"count": 0, "items": []}})
 
     time = FakeTime()
@@ -133,8 +129,6 @@ async def test_invalid_params_is_not_retried() -> None:
         transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
     ) as http:
         with pytest.raises(VKAPIError):
-            await VKClient(pool, http_client=http, sleep=time.sleep).call(
-                "groups.search", {}
-            )
+            await VKClient(pool, http_client=http, sleep=time.sleep).call("groups.search", {})
     assert calls == 1
     assert time.sleeps == []

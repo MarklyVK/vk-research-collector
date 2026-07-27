@@ -38,9 +38,7 @@ class MemoryPersistence:
     async def get_offset(self, run_id: str, keyword: Keyword, group_type: str) -> int:
         return self.offset
 
-    async def is_keyword_complete(
-        self, run_id: str, keyword: Keyword, group_type: str
-    ) -> bool:
+    async def is_keyword_complete(self, run_id: str, keyword: Keyword, group_type: str) -> bool:
         return False
 
     async def save_page(
@@ -54,9 +52,7 @@ class MemoryPersistence:
         self.saved.append(next_offset)
         self.offset = next_offset
 
-    async def mark_keyword_complete(
-        self, run_id: str, keyword: Keyword, group_type: str
-    ) -> None:
+    async def mark_keyword_complete(self, run_id: str, keyword: Keyword, group_type: str) -> None:
         pass
 
     async def mark_run_complete(self, run_id: str) -> None:

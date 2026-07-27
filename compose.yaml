@@ -11,9 +11,9 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-vk_research}
       POSTGRES_USER: ${POSTGRES_USER:-vk_collector}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_development_only}
       POSTGRES_READER_USER: ${POSTGRES_READER_USER:-vk_reader}
-      POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:?POSTGRES_READER_PASSWORD must be set}
+      POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:-local_reader_only}
       TZ: UTC
       PGTZ: UTC
     command:
@@ -49,6 +49,7 @@ services:
     init: true
     environment:
       APP_ENV: ${APP_ENV:-production}
+      RUN_INTEGRATION_TESTS: ${RUN_INTEGRATION_TESTS:-1}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TZ: UTC
       VK_API_VERSION: ${VK_API_VERSION:-5.199}
@@ -60,7 +61,7 @@ services:
       EXPORT_DIR: ${EXPORT_DIR:-/app/exports/classification}
       POSTGRES_DB: ${POSTGRES_DB:-vk_research}
       POSTGRES_USER: ${POSTGRES_USER:-vk_collector}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_development_only}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}

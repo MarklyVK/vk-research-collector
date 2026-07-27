@@ -15,13 +15,9 @@ class Keyword:
 class SearchPersistence(Protocol):
     async def start_or_resume_run(self, keywords: tuple[Keyword, ...]) -> str: ...
 
-    async def get_offset(
-        self, run_id: str, keyword: Keyword, group_type: str
-    ) -> int: ...
+    async def get_offset(self, run_id: str, keyword: Keyword, group_type: str) -> int: ...
 
-    async def is_keyword_complete(
-        self, run_id: str, keyword: Keyword, group_type: str
-    ) -> bool: ...
+    async def is_keyword_complete(self, run_id: str, keyword: Keyword, group_type: str) -> bool: ...
 
     async def save_page(
         self,
@@ -65,13 +61,9 @@ class SearchService:
         try:
             for keyword in keywords:
                 for group_type in self._group_types:
-                    if await self._persistence.is_keyword_complete(
-                        run_id, keyword, group_type
-                    ):
+                    if await self._persistence.is_keyword_complete(run_id, keyword, group_type):
                         continue
-                    offset = await self._persistence.get_offset(
-                        run_id, keyword, group_type
-                    )
+                    offset = await self._persistence.get_offset(run_id, keyword, group_type)
                     try:
                         async for next_offset, page in self._client.iter_search(
                             keyword.value,
@@ -82,9 +74,7 @@ class SearchService:
                             await self._persistence.save_page(
                                 run_id, keyword, group_type, page.items, next_offset
                             )
-                        await self._persistence.mark_keyword_complete(
-                            run_id, keyword, group_type
-                        )
+                        await self._persistence.mark_keyword_complete(run_id, keyword, group_type)
                     except VKTokensUnavailable:
                         raise
                     except VKError as exc:

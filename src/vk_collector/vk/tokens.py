@@ -14,9 +14,7 @@ Sleep = Callable[[float], Awaitable[None]]
 def load_tokens(path: str | Path) -> tuple[str, ...]:
     """Прочитать произвольное число непустых токенов, по одному на строку."""
     tokens = tuple(
-        line.strip()
-        for line in Path(path).read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()
     )
     if not tokens:
         raise VKTokensUnavailable("Файл токенов не содержит рабочих токенов")
@@ -75,11 +73,7 @@ class TokenPool:
                         self._cursor = (index + 1) % len(self._states)
                         return state.value
                 wait_for = (
-                    min(
-                        max(state.next_request_at, state.cooldown_until)
-                        for state in enabled
-                    )
-                    - now
+                    min(max(state.next_request_at, state.cooldown_until) for state in enabled) - now
                 )
             await self._sleep(max(0.0, wait_for))
 

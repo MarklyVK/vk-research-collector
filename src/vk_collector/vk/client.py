@@ -46,9 +46,7 @@ class VKClient:
         if self._owns_http:
             await self._http.aclose()
 
-    async def call(
-        self, method: str, params: Mapping[str, str | int]
-    ) -> dict[str, Any]:
+    async def call(self, method: str, params: Mapping[str, str | int]) -> dict[str, Any]:
         """Вызвать метод, применяя политику ошибок без утечки токена."""
         retry_index = 0
         while True:
@@ -90,9 +88,7 @@ class VKClient:
                 continue
             if code in RETRYABLE_ERRORS:
                 if retry_index >= len(self._retry_delays):
-                    raise VKRetryExhausted(
-                        f"VK API продолжает возвращать ошибку {code}"
-                    )
+                    raise VKRetryExhausted(f"VK API продолжает возвращать ошибку {code}")
                 await self._sleep(self._retry_delays[retry_index])
                 retry_index += 1
                 continue
@@ -124,9 +120,7 @@ class VKClient:
         items = tuple(
             VKGroup.from_api(item)
             for item in raw_items
-            if isinstance(item, dict)
-            and not item.get("is_closed")
-            and not item.get("deactivated")
+            if isinstance(item, dict) and not item.get("is_closed") and not item.get("deactivated")
         )
         return VKSearchPage(total=int(response.get("count", 0)), items=items)
 

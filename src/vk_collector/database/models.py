@@ -1,9 +1,9 @@
-﻿"""Нормализованная модель данных первого этапа."""
+"""Нормализованная модель данных первого этапа."""
 
-import enum
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
@@ -26,20 +26,20 @@ from sqlalchemy.orm import Mapped, mapped_column
 from vk_collector.database.base import Base
 
 
-class ClassificationStatus(str, enum.Enum):
+class ClassificationStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
 
 
-class RunStatus(str, enum.Enum):
+class RunStatus(StrEnum):
     RUNNING = "running"
     PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
 
 
-class JobStatus(str, enum.Enum):
+class JobStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
@@ -73,20 +73,12 @@ class GroupCandidate(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     vk_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(512), nullable=False)
-    description: Mapped[str] = mapped_column(
-        Text, nullable=False, default="", server_default=""
-    )
-    status_text: Mapped[str] = mapped_column(
-        Text, nullable=False, default="", server_default=""
-    )
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    status_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     screen_name: Mapped[str | None] = mapped_column(String(255))
     address: Mapped[str] = mapped_column(String(1024), nullable=False)
-    first_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    last_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     classification_status: Mapped[ClassificationStatus] = mapped_column(
         Enum(
             ClassificationStatus,
@@ -117,13 +109,9 @@ class SearchKeyword(TimestampMixin, Base):
 
 class SearchRun(TimestampMixin, Base):
     __tablename__ = "search_runs"
-    __table_args__ = (
-        Index("ix_search_runs_status_created_at", "status", "created_at"),
-    )
+    __table_args__ = (Index("ix_search_runs_status_created_at", "status", "created_at"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     status: Mapped[RunStatus] = mapped_column(
         Enum(
             RunStatus,
@@ -160,17 +148,13 @@ class SearchRunKeyword(TimestampMixin, Base):
         ForeignKey("search_keywords.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    community_type: Mapped[str] = mapped_column(
-        String(50), nullable=False, server_default="group"
-    )
+    community_type: Mapped[str] = mapped_column(String(50), nullable=False, server_default="group")
     status: Mapped[RunStatus] = mapped_column(
         Enum(RunStatus, name="search_run_status", create_type=False),
         nullable=False,
         server_default=RunStatus.RUNNING.value,
     )
-    next_offset: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0"
-    )
+    next_offset: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
 
@@ -209,9 +193,7 @@ class GroupKeywordMatch(Base):
 class ClassificationBatch(Base):
     __tablename__ = "classification_batches"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     batch_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -272,9 +254,7 @@ class CollectionJob(TimestampMixin, Base):
         Index("ix_collection_jobs_status_created_at", "status", "created_at"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[JobStatus] = mapped_column(
         Enum(
@@ -285,9 +265,7 @@ class CollectionJob(TimestampMixin, Base):
         nullable=False,
         server_default=JobStatus.PENDING.value,
     )
-    progress_offset: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, server_default="0"
-    )
+    progress_offset: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     error_message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

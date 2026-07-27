@@ -6,6 +6,6 @@ case "${1:-}" in
     exec "$@"
     ;;
   *)
-    exec vk-collector "$@"
+    exec collector "$@"
     ;;
 esac

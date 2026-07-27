@@ -191,5 +191,5 @@ async def classification_summary(session: AsyncSession) -> dict[str, Any]:
         "pending": statuses["pending"],
         "approved": statuses["approved"],
         "rejected": statuses["rejected"],
-        "approved_by_label": dict(label_rows),
+        "approved_by_label": {label: count for label, count in label_rows},
     }
