@@ -1,0 +1,84 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vk_research}
+      POSTGRES_USER: ${POSTGRES_USER:-vk_collector}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_READER_USER: ${POSTGRES_READER_USER:-vk_reader}
+      POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:?POSTGRES_READER_PASSWORD must be set}
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=20
+      - -c
+      - effective_cache_size=384MB
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init-readonly.sh:/docker-entrypoint-initdb.d/20-readonly.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    mem_limit: 512m
+    cpus: 0.75
+    logging: *default-logging
+
+  collector:
+    build:
+      context: .
+    init: true
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: UTC
+      VK_API_VERSION: ${VK_API_VERSION:-5.199}
+      VK_TOKENS_FILE: ${VK_TOKENS_FILE:-/run/secrets/vk_tokens.txt}
+      VK_REQUEST_TIMEOUT_SECONDS: ${VK_REQUEST_TIMEOUT_SECONDS:-30}
+      VK_MAX_CONCURRENCY: ${VK_MAX_CONCURRENCY:-3}
+      VK_PER_TOKEN_RPS: ${VK_PER_TOKEN_RPS:-2.5}
+      CLASSIFICATION_BATCH_SIZE: ${CLASSIFICATION_BATCH_SIZE:-100}
+      EXPORT_DIR: ${EXPORT_DIR:-/app/exports/classification}
+      POSTGRES_DB: ${POSTGRES_DB:-vk_research}
+      POSTGRES_USER: ${POSTGRES_USER:-vk_collector}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DISK_WARNING_PERCENT: ${DISK_WARNING_PERCENT:-85}
+      DISK_STOP_PERCENT: ${DISK_STOP_PERCENT:-95}
+    volumes:
+      - ./config:/app/config:ro
+      - ./exports:/app/exports
+      - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 384m
+    cpus: 0.75
+    logging: *default-logging
+    profiles: ["tools"]
+
+volumes:
+  postgres_data:

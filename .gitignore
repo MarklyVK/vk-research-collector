@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 secrets/
+.deploy-secrets/
 *.pem
 *.key
 *.token

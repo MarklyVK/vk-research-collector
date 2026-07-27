@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/group-discovery-classification]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: vk_research_test
+          POSTGRES_USER: vk_collector
+          POSTGRES_PASSWORD: test_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U vk_collector -d vk_research_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APP_ENV: test
+      TZ: UTC
+      DATABASE_URL: postgresql+asyncpg://vk_collector:test_password@localhost:5432/vk_research_test
+      POSTGRES_DB: vk_research_test
+      POSTGRES_USER: vk_collector
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_READER_USER: vk_reader
+      POSTGRES_READER_PASSWORD: test_reader_password
+      VK_TOKENS_FILE: /tmp/nonexistent-vk-tokens
+      TELEGRAM_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src
+      - run: alembic upgrade head
+      - run: pytest -q
+      - run: docker build -t vk-research-collector:ci .
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_READER_PASSWORD: test_reader_password
+      POSTGRES_BIND_ADDRESS: 127.0.0.1
+      TELEGRAM_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p secrets exports && : > secrets/vk_tokens.txt
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - run: docker compose up -d postgres
+      - run: docker compose run --rm collector alembic upgrade head
+      - run: docker compose run --rm collector pytest -q
+      - if: always()
+        run: docker compose logs --no-color --tail=200
