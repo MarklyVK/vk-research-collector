@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -31,6 +32,7 @@ from vk_collector.vk import VKAPIError, VKClient, VKError, VKTokensUnavailable
 
 TERMINAL_VK_CODES = frozenset({7, 15, 18, 30})
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
+logger = logging.getLogger(__name__)
 
 
 def _counter(value: object) -> int:
@@ -97,12 +99,13 @@ class CollectionWorker:
         *,
         scope: str | None = None,
         max_jobs: int | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> int:
         """Обработать доступные jobs с ограниченной concurrency до idle."""
         await self._queue.recover_expired(run_id)
         tasks: set[asyncio.Task[None]] = set()
         claimed = 0
-        while True:
+        while stop_event is None or not stop_event.is_set():
             disk = inspect_disk(
                 self._settings.collection_export_dir,
                 self._settings.disk_warning_percent,
@@ -129,6 +132,13 @@ class CollectionWorker:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 await task
+            logger.info(
+                "run=%s claimed=%s active=%s max_jobs=%s",
+                run_id,
+                claimed,
+                len(tasks),
+                max_jobs,
+            )
             if max_jobs is not None and claimed >= max_jobs and not tasks:
                 break
         if tasks:

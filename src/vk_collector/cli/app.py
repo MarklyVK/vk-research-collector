@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import signal
 import time
 import uuid
 from datetime import UTC, datetime
@@ -17,6 +19,7 @@ from vk_collector.classification.service import (
     import_classification,
 )
 from vk_collector.collection import CollectionQueue, CollectionWorker
+from vk_collector.collection.notifications import notify
 from vk_collector.collection.reporting import (
     capacity_gate_passed,
     database_metrics,
@@ -45,7 +48,7 @@ from vk_collector.vk import TokenPool, VKClient, VKTokensUnavailable, load_token
 app = typer.Typer(help="Поиск и ручная классификация сообществ VK.")
 groups_app = typer.Typer(help="Поиск и статистика групп.")
 classification_app = typer.Typer(help="Пакеты ручной классификации.")
-collection_app = typer.Typer(help="Будущий основной сбор данных.")
+collection_app = typer.Typer(help="Возобновляемый сбор публичных approved-данных.")
 privacy_app = typer.Typer(help="Проверка и минимизация персональных данных.")
 app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
@@ -272,9 +275,16 @@ async def _execute_collection(
             api_version=settings.vk_api_version,
             timeout=settings.vk_request_timeout_seconds,
         )
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for handled_signal in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.add_signal_handler(handled_signal, stop_event.set)
+        await notify(settings, f"Collection run {target} started")
         processed = await CollectionWorker(sessions, client, settings).run(
-            target, scope=scope, max_jobs=max_jobs
+            target, scope=scope, max_jobs=max_jobs, stop_event=stop_event
         )
+        await notify(settings, f"Collection run {target} reached idle; processed={processed}")
         return target, processed
     finally:
         if client is not None:
@@ -307,7 +317,19 @@ async def _show_status(run_id: uuid.UUID | None) -> dict[str, Any]:
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     try:
-        return await run_summary(sessions, run_id)
+        payload = await run_summary(sessions, run_id)
+        disk = inspect_disk(
+            settings.collection_export_dir,
+            settings.disk_warning_percent,
+            settings.disk_stop_percent,
+        )
+        jobs = payload.get("jobs", {})
+        if isinstance(jobs, dict):
+            payload["estimated_remaining_jobs"] = sum(
+                int(jobs.get(status, 0)) for status in ("pending", "running", "retry_wait")
+            )
+        payload["disk_used_percent"] = round(disk.used_percent, 1)
+        return payload
     finally:
         await engine.dispose()
 
@@ -430,6 +452,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
         queue = CollectionQueue(sessions, settings)
         preview = await queue.preview(pilot=True)
         run_id = await queue.plan(pilot=True)
+        await notify(settings, f"Pilot {run_id} started")
         try:
             tokens = load_tokens(settings.vk_tokens_file)
         except VKTokensUnavailable as exc:
@@ -480,6 +503,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
         }
         _write_json(settings.collection_export_dir / "pilot-summary.json", pilot_summary)
         _write_json(settings.collection_export_dir / "capacity-estimate.json", capacity)
+        await notify(settings, f"Pilot {run_id} completed; capacity={decision}")
         return run_id, pilot_summary, capacity
     finally:
         if client is not None:

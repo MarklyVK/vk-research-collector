@@ -139,7 +139,12 @@ class CollectionQueue:
         async with self._sessions() as session:
             existing = await session.scalar(
                 select(CollectionRun).where(
-                    CollectionRun.status == CollectionRunStatus.PLANNED,
+                    CollectionRun.status.in_(
+                        [
+                            CollectionRunStatus.PLANNED,
+                            CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                        ]
+                    ),
                     CollectionRun.configuration["plan_key"].astext == plan_key,
                 )
             )
