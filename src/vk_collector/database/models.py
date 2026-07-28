@@ -20,7 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from vk_collector.database.base import Base
@@ -42,9 +42,24 @@ class RunStatus(StrEnum):
 class JobStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
+    RETRY_WAIT = "retry_wait"
     PAUSED = "paused"
     COMPLETED = "completed"
+    SKIPPED = "skipped"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class CollectionRunStatus(StrEnum):
+    PLANNED = "planned"
+    RUNNING = "running"
+    PAUSED = "paused"
+    PAUSED_NO_TOKENS = "paused_no_tokens"
+    PAUSED_CAPACITY_LIMIT = "paused_capacity_limit"
+    COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class TimestampMixin:
@@ -252,15 +267,68 @@ class GroupLabel(Base):
     )
 
 
+class CollectionRun(TimestampMixin, Base):
+    __tablename__ = "collection_runs"
+    __table_args__ = (Index("ix_collection_runs_status_created_at", "status", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[CollectionRunStatus] = mapped_column(
+        Enum(
+            CollectionRunStatus,
+            name="collection_run_status",
+            values_callable=lambda x: [e.value for e in x],
+        ),
+        nullable=False,
+        default=CollectionRunStatus.PLANNED,
+        server_default=CollectionRunStatus.PLANNED.value,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requested_by: Mapped[str] = mapped_column(String(100), nullable=False, server_default="cli")
+    configuration: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    total_jobs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    completed_jobs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    failed_jobs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    skipped_jobs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
 class CollectionJob(TimestampMixin, Base):
     __tablename__ = "collection_jobs"
     __table_args__ = (
         CheckConstraint("progress_offset >= 0", name="progress_offset_nonnegative"),
-        Index("ix_collection_jobs_status_created_at", "status", "created_at"),
+        CheckConstraint("attempt_count >= 0", name="collection_jobs_attempt_nonnegative"),
+        CheckConstraint("max_attempts > 0", name="collection_jobs_max_attempts_positive"),
+        UniqueConstraint(
+            "collection_run_id",
+            "job_type",
+            "entity_type",
+            "entity_id",
+            name="uq_collection_jobs_run_type_entity",
+        ),
+        Index(
+            "ix_collection_jobs_queue",
+            "status",
+            "next_attempt_at",
+            "priority",
+            "created_at",
+        ),
+        Index("ix_collection_jobs_lease", "status", "locked_at"),
+        Index("ix_collection_jobs_run_status", "collection_run_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collection_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("collection_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     job_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    entity_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[JobStatus] = mapped_column(
         Enum(
             JobStatus,
@@ -270,7 +338,193 @@ class CollectionJob(TimestampMixin, Base):
         nullable=False,
         server_default=JobStatus.PENDING.value,
     )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default="100")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="5")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_by: Mapped[str | None] = mapped_column(String(255))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checkpoint: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
     progress_offset: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    last_error_type: Mapped[str | None] = mapped_column(String(100))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
+    api_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    rows_inserted: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    rows_updated: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GroupCollectionState(Base):
+    __tablename__ = "group_collection_states"
+
+    group_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("group_candidates.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    posts_checkpoint: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    members_checkpoint: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    last_group_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_posts_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_members_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_type: Mapped[str | None] = mapped_column(String(100))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unavailable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    skip_reason: Mapped[str | None] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class GroupPost(TimestampMixin, Base):
+    __tablename__ = "group_posts"
+    __table_args__ = (
+        UniqueConstraint("vk_owner_id", "vk_post_id", name="uq_group_posts_owner_post"),
+        Index("ix_group_posts_group_published", "group_id", "published_at"),
+        Index("ix_group_posts_signer", "signer_vk_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    vk_owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    vk_post_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_candidates.id", ondelete="CASCADE"), nullable=False
+    )
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    text: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    post_type: Mapped[str] = mapped_column(String(50), nullable=False, server_default="post")
+    is_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_ad: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    marked_as_ads: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    comments_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    likes_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    reposts_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    views_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    signer_vk_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class PostAttachment(Base):
+    __tablename__ = "post_attachments"
+    __table_args__ = (
+        UniqueConstraint("post_id", "position", name="uq_post_attachments_post_position"),
+        Index("ix_post_attachments_type", "attachment_type"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    post_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_posts.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    attachment_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    vk_owner_id: Mapped[int | None] = mapped_column(BigInteger)
+    vk_attachment_id: Mapped[int | None] = mapped_column(BigInteger)
+    access_key: Mapped[str | None] = mapped_column(String(255))
+    duration: Mapped[int | None] = mapped_column(Integer)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str | None] = mapped_column(String(1000))
+    external_url: Mapped[str | None] = mapped_column(Text)
+    attachment_metadata: Mapped[dict[str, object]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+
+class VKUser(Base):
+    __tablename__ = "vk_users"
+    __table_args__ = (Index("ix_vk_users_profile_updated_at", "profile_updated_at"),)
+
+    vk_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    first_name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    last_name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    screen_name: Mapped[str | None] = mapped_column(String(255))
+    is_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    can_access_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    deactivated: Mapped[str | None] = mapped_column(String(50))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    profile_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GroupMembership(Base):
+    __tablename__ = "group_memberships"
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_id", name="uq_group_memberships_group_user"),
+        Index("ix_group_memberships_user", "user_id"),
+        Index("ix_group_memberships_current", "group_id", "is_current"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_candidates.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), nullable=False
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    source_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+
+
+class UserGroupSubscription(Base):
+    __tablename__ = "user_group_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "vk_group_id", name="uq_user_group_subscriptions"),
+        Index("ix_user_group_subscriptions_group", "vk_group_id"),
+        Index("ix_user_group_subscriptions_current", "user_id", "is_current"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), nullable=False
+    )
+    vk_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    source_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+
+
+class CollectionError(Base):
+    __tablename__ = "collection_errors"
+    __table_args__ = (
+        Index("ix_collection_errors_run_created", "collection_run_id", "created_at"),
+        Index("ix_collection_errors_category", "error_category"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    collection_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_jobs.id", ondelete="CASCADE")
+    )
+    token_fingerprint: Mapped[str | None] = mapped_column(String(32))
+    endpoint: Mapped[str] = mapped_column(String(100), nullable=False)
+    error_category: Mapped[str] = mapped_column(String(100), nullable=False)
+    vk_error_code: Mapped[int | None] = mapped_column(Integer)
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    sanitized_message: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
