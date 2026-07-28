@@ -16,7 +16,8 @@
 
 - [x] Начальный аудит, сверка классификации и идентификация 12 test fixtures.
 - [x] Архитектура, требования, модель, план ёмкости и критерии приёмки.
-- [ ] Миграция и PostgreSQL queue.
-- [ ] VK scopes, worker, CLI, privacy и наблюдаемость.
-- [ ] Fake/integration/smoke tests, Docker и CI.
-- [ ] Реальный pilot, capacity gate и разрешённые волны основного сбора.
+- [x] Миграции `0002`/`0003` и PostgreSQL queue с lease/SKIP LOCKED.
+- [x] VK scopes, worker, CLI, privacy и наблюдаемость.
+- [x] Fake/integration/smoke tests, Docker и CI.
+- [x] Реальный pilot и capacity gate: прогноз 13,54 GiB, full run безопасно поставлен
+  в `paused_capacity_limit`; повторный уменьшенный pilot ещё не выполнен.
