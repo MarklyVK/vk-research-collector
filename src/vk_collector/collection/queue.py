@@ -102,6 +102,21 @@ class CollectionQueue:
             scopes.append("subscriptions")
         return tuple(scopes)
 
+    def collection_configuration(self) -> dict[str, object]:
+        """Вернуть параметры, влияющие на объём и семантику сбора."""
+        return {
+            "scopes": list(self.enabled_scopes()),
+            "posts_max_per_group": self._settings.collection_posts_max_per_group,
+            "posts_page_size": self._settings.collection_posts_page_size,
+            "posts_stop_at_date": self._settings.collection_posts_stop_at_date,
+            "members_max_per_group": self._settings.collection_members_max_per_group,
+            "members_page_size": self._settings.collection_members_page_size,
+            "user_profile_ttl_days": self._settings.collection_user_profile_ttl_days,
+            "user_batch_size": self._settings.collection_user_batch_size,
+            "subscriptions_max_per_user": (self._settings.collection_subscriptions_max_per_user),
+            "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
+        }
+
     async def preview(self, *, pilot: bool = False) -> PlanPreview:
         all_ids = await self.approved_group_ids()
         ids = await self.pilot_group_ids() if pilot else all_ids
@@ -132,7 +147,12 @@ class CollectionQueue:
     async def plan(self, *, pilot: bool = False) -> uuid.UUID:
         ids = await self.pilot_group_ids() if pilot else await self.approved_group_ids()
         scopes = self.enabled_scopes()
-        key_payload = {"pilot": pilot, "group_ids": ids, "scopes": scopes}
+        collection_configuration = self.collection_configuration()
+        key_payload = {
+            "pilot": pilot,
+            "group_ids": ids,
+            "collection": collection_configuration,
+        }
         plan_key = hashlib.sha256(
             json.dumps(key_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -158,6 +178,7 @@ class CollectionQueue:
                     "pilot": pilot,
                     "scopes": list(scopes),
                     "group_count": len(ids),
+                    "collection": collection_configuration,
                 },
             )
             session.add(run)
@@ -374,7 +395,12 @@ class CollectionQueue:
             run.skipped_jobs = by_status.get(JobStatus.SKIPPED, 0)
             active = sum(
                 by_status.get(status, 0)
-                for status in (JobStatus.PENDING, JobStatus.RUNNING, JobStatus.RETRY_WAIT)
+                for status in (
+                    JobStatus.PENDING,
+                    JobStatus.RUNNING,
+                    JobStatus.RETRY_WAIT,
+                    JobStatus.PAUSED,
+                )
             )
             if active == 0 and run.total_jobs:
                 run.finished_at = datetime.now(UTC)

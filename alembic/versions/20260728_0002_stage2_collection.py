@@ -114,7 +114,7 @@ def upgrade() -> None:
         models.VKUser.__table__,
         models.GroupMembership.__table__,
         models.UserGroupSubscription.__table__,
-        models.CollectionError.__table__,
+        models.CollectionJobError.__table__,
     ):
         table.create(bind, checkfirst=True)
 
@@ -122,7 +122,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     for table in (
-        models.CollectionError.__table__,
+        models.CollectionJobError.__table__,
         models.UserGroupSubscription.__table__,
         models.GroupMembership.__table__,
         models.VKUser.__table__,

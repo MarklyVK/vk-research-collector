@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import uuid
@@ -16,8 +17,9 @@ from vk_collector.collection.queue import ClaimedJob, CollectionQueue
 from vk_collector.collection.safety import inspect_disk, sanitize_message
 from vk_collector.config import Settings
 from vk_collector.database.models import (
-    CollectionError,
     CollectionJob,
+    CollectionJobError,
+    CollectionRun,
     CollectionRunStatus,
     GroupCandidate,
     GroupCollectionState,
@@ -100,6 +102,7 @@ class CollectionWorker:
         scope: str | None = None,
         max_jobs: int | None = None,
         stop_event: asyncio.Event | None = None,
+        until_idle: bool = True,
     ) -> int:
         """Обработать доступные jobs с ограниченной concurrency до idle."""
         await self._queue.recover_expired(run_id)
@@ -128,7 +131,25 @@ class CollectionWorker:
                 tasks.add(asyncio.create_task(self._process(job)))
                 claimed += 1
             if not tasks:
-                break
+                await self._queue.refresh_run(run_id)
+                if until_idle:
+                    break
+                async with self._sessions() as session:
+                    run = await session.get(CollectionRun, run_id)
+                    if run is None or run.status not in {
+                        CollectionRunStatus.PLANNED,
+                        CollectionRunStatus.RUNNING,
+                    }:
+                        break
+                if stop_event is None:
+                    await asyncio.sleep(self._settings.collection_idle_sleep_seconds)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            stop_event.wait(),
+                            timeout=self._settings.collection_idle_sleep_seconds,
+                        )
+                continue
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 await task
@@ -637,7 +658,7 @@ class CollectionWorker:
     ) -> None:
         async with self._sessions() as session:
             session.add(
-                CollectionError(
+                CollectionJobError(
                     collection_run_id=job.run_id,
                     job_id=job.id,
                     endpoint=job.job_type,

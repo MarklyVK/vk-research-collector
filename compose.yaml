@@ -49,7 +49,7 @@ services:
     build:
       context: .
     init: true
-    environment:
+    environment: &collector-environment
       APP_ENV: ${APP_ENV:-production}
       RUN_INTEGRATION_TESTS: ${RUN_INTEGRATION_TESTS:-1}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -77,12 +77,12 @@ services:
       COLLECTION_JOB_HEARTBEAT_SECONDS: ${COLLECTION_JOB_HEARTBEAT_SECONDS:-60}
       COLLECTION_IDLE_SLEEP_SECONDS: ${COLLECTION_IDLE_SLEEP_SECONDS:-5}
       COLLECTION_POSTS_ENABLED: ${COLLECTION_POSTS_ENABLED:-true}
-      COLLECTION_POSTS_MAX_PER_GROUP: ${COLLECTION_POSTS_MAX_PER_GROUP:-200}
+      COLLECTION_POSTS_MAX_PER_GROUP: ${COLLECTION_POSTS_MAX_PER_GROUP:-100}
       COLLECTION_POSTS_PAGE_SIZE: ${COLLECTION_POSTS_PAGE_SIZE:-100}
       COLLECTION_POSTS_INCLUDE_PINNED: ${COLLECTION_POSTS_INCLUDE_PINNED:-true}
       COLLECTION_POSTS_STOP_AT_DATE: ${COLLECTION_POSTS_STOP_AT_DATE:-}
       COLLECTION_MEMBERS_ENABLED: ${COLLECTION_MEMBERS_ENABLED:-true}
-      COLLECTION_MEMBERS_MAX_PER_GROUP: ${COLLECTION_MEMBERS_MAX_PER_GROUP:-1000}
+      COLLECTION_MEMBERS_MAX_PER_GROUP: ${COLLECTION_MEMBERS_MAX_PER_GROUP:-200}
       COLLECTION_MEMBERS_PAGE_SIZE: ${COLLECTION_MEMBERS_PAGE_SIZE:-1000}
       COLLECTION_USERS_ENABLED: ${COLLECTION_USERS_ENABLED:-true}
       COLLECTION_USER_PROFILE_TTL_DAYS: ${COLLECTION_USER_PROFILE_TTL_DAYS:-30}
@@ -93,10 +93,27 @@ services:
       COLLECTION_PILOT_SEED: ${COLLECTION_PILOT_SEED:-20260728}
       COLLECTION_PILOT_GROUPS_PER_CATEGORY: ${COLLECTION_PILOT_GROUPS_PER_CATEGORY:-10}
       COLLECTION_EXPORT_DIR: ${COLLECTION_EXPORT_DIR:-/app/exports/stage2-pilot}
-    volumes:
+    volumes: &collector-volumes
       - ./config:/app/config:ro
       - ./exports:/app/exports
       - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 384m
+    cpus: 0.75
+    logging: *default-logging
+
+  collector-worker:
+    build:
+      context: .
+    init: true
+    command: ["collection", "worker"]
+    restart: unless-stopped
+    environment:
+      <<: *collector-environment
+      COLLECTION_WORKER_ID: ${COLLECTION_WORKER_ID:-collector-worker-1}
+    volumes: *collector-volumes
     depends_on:
       postgres:
         condition: service_healthy

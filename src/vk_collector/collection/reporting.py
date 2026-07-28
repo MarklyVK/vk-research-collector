@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.database.models import (
     ClassificationStatus,
-    CollectionError,
     CollectionJob,
+    CollectionJobError,
     CollectionRun,
     CollectionRunStatus,
     GroupCandidate,
@@ -29,6 +29,26 @@ async def latest_run_id(
     async with sessions() as session:
         run_id: uuid.UUID | None = await session.scalar(
             select(CollectionRun.id).order_by(CollectionRun.created_at.desc()).limit(1)
+        )
+        return run_id
+
+
+async def latest_runnable_run_id(
+    sessions: async_sessionmaker[AsyncSession],
+) -> uuid.UUID | None:
+    """Найти последний разрешённый full run для автономного worker."""
+    async with sessions() as session:
+        run_id: uuid.UUID | None = await session.scalar(
+            select(CollectionRun.id)
+            .where(
+                CollectionRun.scope == "full",
+                CollectionRun.status.in_(
+                    [CollectionRunStatus.PLANNED, CollectionRunStatus.RUNNING]
+                ),
+                CollectionRun.configuration["capacity_gate"].astext == "passed",
+            )
+            .order_by(CollectionRun.created_at.desc())
+            .limit(1)
         )
         return run_id
 
@@ -86,7 +106,7 @@ async def global_summary(sessions: async_sessionmaker[AsyncSession]) -> dict[str
             "subscriptions": UserGroupSubscription,
             "runs": CollectionRun,
             "jobs": CollectionJob,
-            "errors": CollectionError,
+            "errors": CollectionJobError,
         }
         result: dict[str, int] = {}
         for label, model in models.items():
@@ -198,9 +218,9 @@ async def error_categories(
     async with sessions() as session:
         rows = (
             await session.execute(
-                select(CollectionError.error_category, func.count(CollectionError.id))
-                .where(CollectionError.collection_run_id == run_id)
-                .group_by(CollectionError.error_category)
+                select(CollectionJobError.error_category, func.count(CollectionJobError.id))
+                .where(CollectionJobError.collection_run_id == run_id)
+                .group_by(CollectionJobError.error_category)
             )
         ).all()
     return dict(Counter({category: count for category, count in rows}))

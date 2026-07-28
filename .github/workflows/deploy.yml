@@ -76,10 +76,10 @@ jobs:
           COLLECTION_JOB_HEARTBEAT_SECONDS=60
           COLLECTION_IDLE_SLEEP_SECONDS=5
           COLLECTION_POSTS_ENABLED=true
-          COLLECTION_POSTS_MAX_PER_GROUP=200
+          COLLECTION_POSTS_MAX_PER_GROUP=100
           COLLECTION_POSTS_PAGE_SIZE=100
           COLLECTION_MEMBERS_ENABLED=true
-          COLLECTION_MEMBERS_MAX_PER_GROUP=1000
+          COLLECTION_MEMBERS_MAX_PER_GROUP=200
           COLLECTION_MEMBERS_PAGE_SIZE=1000
           COLLECTION_USERS_ENABLED=true
           COLLECTION_USER_PROFILE_TTL_DAYS=30
@@ -98,7 +98,7 @@ jobs:
           scp -P "${SERVER_PORT:-22}" .deploy-secrets/vk_tokens.txt "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/secrets/vk_tokens.txt"
       - name: Запустить и проверить
         run: |
-          ssh -p "${SERVER_PORT:-22}" "$SERVER_USER@$SERVER_HOST" "cd '$DEPLOY_PATH' && chmod 600 .env secrets/vk_tokens.txt && chmod 700 secrets && docker compose up -d --build postgres && docker compose build collector && docker compose run --rm collector alembic upgrade head && docker compose run --rm collector --help >/dev/null"
+          ssh -p "${SERVER_PORT:-22}" "$SERVER_USER@$SERVER_HOST" "cd '$DEPLOY_PATH' && chmod 600 .env secrets/vk_tokens.txt && chmod 700 secrets && docker compose up -d --build postgres && docker compose build collector collector-worker && docker compose run --rm collector alembic upgrade head && docker compose run --rm collector --help >/dev/null && docker compose up -d collector-worker"
       - name: Уведомить Telegram
         if: always()
         env:

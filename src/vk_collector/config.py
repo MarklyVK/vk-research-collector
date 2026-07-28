@@ -41,12 +41,12 @@ class Settings(BaseSettings):
     collection_job_heartbeat_seconds: int = Field(default=60, ge=10)
     collection_idle_sleep_seconds: float = Field(default=5, ge=0.1)
     collection_posts_enabled: bool = True
-    collection_posts_max_per_group: int = Field(default=200, ge=1)
+    collection_posts_max_per_group: int = Field(default=100, ge=1)
     collection_posts_page_size: int = Field(default=100, ge=1, le=100)
     collection_posts_include_pinned: bool = True
     collection_posts_stop_at_date: str = ""
     collection_members_enabled: bool = True
-    collection_members_max_per_group: int | None = Field(default=1000, ge=1)
+    collection_members_max_per_group: int | None = Field(default=200, ge=1)
     collection_members_page_size: int = Field(default=1000, ge=1, le=1000)
     collection_users_enabled: bool = True
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)

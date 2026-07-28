@@ -2,9 +2,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from pydantic import SecretStr
 
 from vk_collector.collection.notifications import notify
+from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.safety import inspect_disk, sanitize_message
 from vk_collector.collection.worker import normalize_attachment
 from vk_collector.config import Settings
@@ -54,6 +56,30 @@ def test_disk_thresholds_are_monotonic(tmp_path: Path) -> None:
     state = inspect_disk(tmp_path, warning_percent=0, stop_percent=0)
     assert state.warning
     assert state.stop
+
+
+def test_collection_configuration_captures_capacity_limits() -> None:
+    small = CollectionQueue(  # type: ignore[arg-type]
+        None,
+        Settings(collection_posts_max_per_group=100, collection_members_max_per_group=200),
+    )
+    large = CollectionQueue(  # type: ignore[arg-type]
+        None,
+        Settings(collection_posts_max_per_group=200, collection_members_max_per_group=1000),
+    )
+    assert small.collection_configuration() != large.collection_configuration()
+    assert small.collection_configuration()["posts_max_per_group"] == 100
+    assert small.collection_configuration()["members_max_per_group"] == 200
+
+
+def test_compose_defines_restartable_autonomous_worker() -> None:
+    compose = yaml.safe_load(Path("compose.yaml").read_text(encoding="utf-8"))
+    worker = compose["services"]["collector-worker"]
+    assert worker["command"] == ["collection", "worker"]
+    assert worker["restart"] == "unless-stopped"
+    assert any(
+        str(volume).endswith(":/run/secrets/vk_tokens.txt:ro") for volume in worker["volumes"]
+    )
 
 
 @pytest.mark.asyncio

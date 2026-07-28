@@ -25,6 +25,7 @@ from vk_collector.collection.reporting import (
     database_metrics,
     global_summary,
     latest_run_id,
+    latest_runnable_run_id,
     run_summary,
     verify_run,
 )
@@ -247,7 +248,12 @@ def collection_plan(
 
 
 async def _execute_collection(
-    run_id: uuid.UUID | None, scope: str | None, max_jobs: int | None
+    run_id: uuid.UUID | None,
+    scope: str | None,
+    max_jobs: int | None,
+    *,
+    until_idle: bool,
+    stop_event: asyncio.Event | None = None,
 ) -> tuple[uuid.UUID, int]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -257,13 +263,18 @@ async def _execute_collection(
         target = run_id or await latest_run_id(sessions)
         if target is None:
             raise ValueError("Нет спланированного запуска")
+        queue = CollectionQueue(sessions, settings)
         async with sessions() as session:
             run = await session.get(CollectionRun, target)
             if run is None:
                 raise ValueError("Запуск не найден")
             if run.scope == "full" and not await capacity_gate_passed(sessions, target):
                 raise ValueError("Full run запрещён до успешного capacity gate")
-        queue = CollectionQueue(sessions, settings)
+            expected_configuration = run.configuration.get("collection")
+            if expected_configuration != queue.collection_configuration():
+                raise ValueError(
+                    "Runtime-настройки сбора не совпадают с проверенным plan/capacity report"
+                )
         try:
             tokens = load_tokens(settings.vk_tokens_file)
         except VKTokensUnavailable as exc:
@@ -275,14 +286,18 @@ async def _execute_collection(
             api_version=settings.vk_api_version,
             timeout=settings.vk_request_timeout_seconds,
         )
-        stop_event = asyncio.Event()
+        stop_event = stop_event or asyncio.Event()
         loop = asyncio.get_running_loop()
         for handled_signal in (signal.SIGTERM, signal.SIGINT):
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(handled_signal, stop_event.set)
         await notify(settings, f"Collection run {target} started")
         processed = await CollectionWorker(sessions, client, settings).run(
-            target, scope=scope, max_jobs=max_jobs, stop_event=stop_event
+            target,
+            scope=scope,
+            max_jobs=max_jobs,
+            stop_event=stop_event,
+            until_idle=until_idle,
         )
         await notify(settings, f"Collection run {target} reached idle; processed={processed}")
         return target, processed
@@ -300,16 +315,57 @@ def run_collection(
     until_idle: Annotated[bool, typer.Option("--until-idle")] = False,
 ) -> None:
     """Запустить foreground worker; результат всегда сохраняется в PostgreSQL."""
-    del until_idle  # worker по определению завершает текущую сессию при idle
     if scope not in {None, "groups", "posts", "members", "users", "subscriptions"}:
         typer.echo("Неизвестный scope.", err=True)
         raise typer.Exit(code=2)
     try:
-        target, processed = asyncio.run(_execute_collection(run_id, scope, max_jobs))
+        target, processed = asyncio.run(
+            _execute_collection(run_id, scope, max_jobs, until_idle=until_idle)
+        )
     except ValueError as exc:
         typer.echo(f"Запуск отклонён: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(f"Run: {target}; обработано jobs: {processed}")
+
+
+async def _collection_worker_service() -> None:
+    """Ожидать разрешённый full run и выполнять его независимо от CLI-сессии."""
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for handled_signal in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(handled_signal, stop_event.set)
+    try:
+        while not stop_event.is_set():
+            target = await latest_runnable_run_id(sessions)
+            if target is None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
+                    )
+                continue
+            await _execute_collection(
+                target,
+                None,
+                None,
+                until_idle=False,
+                stop_event=stop_event,
+            )
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("worker")
+def collection_worker() -> None:
+    """Запустить автономный worker, ожидающий разрешённые full runs."""
+    try:
+        asyncio.run(_collection_worker_service())
+    except ValueError as exc:
+        typer.echo(f"Worker остановлен: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 async def _show_status(run_id: uuid.UUID | None) -> dict[str, Any]:
@@ -479,6 +535,8 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
         decision = (
             "passed"
             if completed and projected is not None and projected <= 7 * 1024**3
+            else "failed"
+            if completed and projected is not None
             else "paused_no_tokens"
             if summary["status"] == "paused_no_tokens"
             else "insufficient_measurement"
@@ -500,6 +558,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
             "safe_limit_bytes": 7 * 1024**3,
             "reserve_factor": 1.30,
             "decision": decision,
+            "configuration": queue.collection_configuration(),
         }
         _write_json(settings.collection_export_dir / "pilot-summary.json", pilot_summary)
         _write_json(settings.collection_export_dir / "capacity-estimate.json", capacity)
@@ -541,6 +600,8 @@ async def _apply_capacity(run_id: uuid.UUID, source: Path) -> dict[str, Any]:
             run = await session.get(CollectionRun, run_id, with_for_update=True)
             if run is None or run.scope != "full":
                 raise ValueError("Full run не найден")
+            if payload.get("configuration") != run.configuration.get("collection"):
+                raise ValueError("Capacity report относится к другой конфигурации сбора")
             run.configuration = {
                 **run.configuration,
                 "capacity_gate": "passed",

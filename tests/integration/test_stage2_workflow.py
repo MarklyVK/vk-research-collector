@@ -10,6 +10,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from vk_collector.collection.queue import CollectionQueue
+from vk_collector.collection.reporting import latest_runnable_run_id
 from vk_collector.collection.worker import CollectionWorker
 from vk_collector.config import Settings
 from vk_collector.database.models import (
@@ -136,6 +137,37 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                     group_id = group.id
 
                 queue = CollectionQueue(sessions, settings)
+                async with sessions() as session:
+                    runnable = CollectionRun(
+                        scope="full",
+                        status=CollectionRunStatus.PLANNED,
+                        configuration={
+                            "capacity_gate": "passed",
+                            "collection": queue.collection_configuration(),
+                        },
+                    )
+                    session.add(runnable)
+                    await session.commit()
+                    runnable_id = runnable.id
+                assert await latest_runnable_run_id(sessions) == runnable_id
+
+                await queue.set_run_status(run_id, CollectionRunStatus.PAUSED)
+                await queue.refresh_run(run_id)
+                async with sessions() as session:
+                    paused_run = await session.get(CollectionRun, run_id)
+                    assert paused_run is not None
+                    assert paused_run.status == CollectionRunStatus.PAUSED
+                    assert (
+                        await session.scalar(
+                            select(func.count(CollectionJob.id)).where(
+                                CollectionJob.collection_run_id == run_id,
+                                CollectionJob.status == JobStatus.PAUSED,
+                            )
+                        )
+                        == 3
+                    )
+                await queue.set_run_status(run_id, CollectionRunStatus.RUNNING)
+
                 claimed = await queue.claim(run_id)
                 assert claimed is not None
                 second = await queue.claim(run_id)

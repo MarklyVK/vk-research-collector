@@ -504,11 +504,11 @@ class UserGroupSubscription(Base):
     )
 
 
-class CollectionError(Base):
-    __tablename__ = "collection_errors"
+class CollectionJobError(Base):
+    __tablename__ = "collection_job_errors"
     __table_args__ = (
-        Index("ix_collection_errors_run_created", "collection_run_id", "created_at"),
-        Index("ix_collection_errors_category", "error_category"),
+        Index("ix_collection_job_errors_run_created", "collection_run_id", "created_at"),
+        Index("ix_collection_job_errors_category", "error_category"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
