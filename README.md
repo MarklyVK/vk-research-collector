@@ -28,7 +28,9 @@ make collection-status
 
 `collection plan` ничего не изменяет без `--apply`. Полный run запрещён до успешного
 pilot capacity gate. Возобновление: `make collection-resume RUN_ID=...`, затем
-`make collection-run RUN_ID=...`. Проверка: `make collection-verify RUN_ID=...`.
+`make collection-run RUN_ID=...`. Для длительного разрешённого run используйте
+`docker compose up -d collector-worker`; service имеет `restart: unless-stopped` и
+продолжает работу из PostgreSQL checkpoints. Проверка: `make collection-verify RUN_ID=...`.
 
 Privacy-команды показывают только агрегаты: `collector privacy inspect-user VK_ID` и
 `collector privacy inspect-group VK_ID`. Удаление пользователя требует явного

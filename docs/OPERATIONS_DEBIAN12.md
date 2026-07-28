@@ -21,6 +21,14 @@ docker compose run --rm collector alembic upgrade head
 docker compose run --rm collector --help
 ```
 
+После применения успешного capacity gate включите автономный worker и автозапуск Docker:
+
+```bash
+sudo systemctl enable --now docker
+docker compose up -d collector-worker
+docker compose logs -f collector-worker
+```
+
 Read-only роль создаётся при первой инициализации тома PostgreSQL. После миграций её default privileges позволяют читать новые таблицы. При изменении пароля на существующем томе выполните `ALTER ROLE` вручную от пользователя приложения.
 
 ## PostgreSQL и безопасное подключение

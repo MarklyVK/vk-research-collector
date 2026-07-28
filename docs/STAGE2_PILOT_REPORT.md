@@ -1,6 +1,6 @@
 # Отчёт о pilot второго этапа
 
-## Результат
+## Первый pilot: исходные лимиты 200/1000
 
 Pilot с seed `20260728` выполнен 28.07.2026 на 35 уникальных approved-группах:
 14 food_delivery, 15 customer_acquisition, 11 tender_support и все пять multi-label
@@ -23,7 +23,7 @@ Pilot с seed `20260728` выполнен 28.07.2026 на 35 уникальны�
 официальной ошибкой VK 15 `Access denied: group hide members`; scraping не применялся.
 Посты, memberships и subscriptions не имеют дублей; rejected jobs и зависшие locks — 0.
 
-## Ёмкость
+## Первый capacity gate
 
 Точный baseline получен восстановлением predpilot dump во временную БД: 85 777 431
 байт. После pilot: 117 513 239 байт; прирост 31 735 808 байт. Линейная стратифицированная
@@ -37,3 +37,30 @@ subscriptions=false. Снимать паузу до нового измерен�
 
 Машиночитаемые результаты: `exports/stage2-pilot/pilot-summary.json` и
 `exports/stage2-pilot/capacity-estimate.json`.
+
+## Уменьшенный repilot: лимиты 100/200
+
+Чтобы повторные upsert не занизили прирост, `backups/stage2-pilot-20260728-002754Z.dump`
+восстановлен в отдельную БД `vk_research_repilot_0836`. После migration 0004 baseline
+содержал 12 260 approved-групп и ноль posts/members/users stage 2.
+
+Repilot `b09b119a-3e5b-408e-a6ad-a327888c57fd` завершён за 70,5 секунды:
+
+| Показатель | Значение |
+|---|---:|
+| выбранные группы | 35 |
+| completed / skipped / failed jobs | 4 413 / 5 / 0 |
+| VK requests / retries | 105 / 0 |
+| посты / attachments | 2 367 / 4 432 |
+| memberships / users | 4 319 / 4 313 |
+| subscriptions | 0 (выключены) |
+| БД до / после | 85 228 567 / 94 206 999 байт |
+| прирост | 8 978 432 байта |
+
+Пять skips — ожидаемый `groups.getMembers` error 15. Дубли posts, memberships и
+subscriptions, rejected jobs и зависшие locks — 0. Прогноз с резервом 30% равен
+4 173 749 973 байтам (3,89 GiB), что ниже safe limit 7 GiB: capacity gate `passed`.
+
+Разрешены scopes groups, posts (до 100), members (до 200) и users. Subscriptions
+остаются выключенными до отдельного измерения. Машиночитаемые результаты находятся в
+`exports/stage2-repilot/`.

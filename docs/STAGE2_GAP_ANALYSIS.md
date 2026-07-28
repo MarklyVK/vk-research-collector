@@ -9,16 +9,15 @@
 | Runs/jobs, SKIP LOCKED, lease recovery, idempotency | complete | `collection/queue.py`, `test_stage2_workflow.py` |
 | Посты, attachments, members, profiles, subscriptions | complete | `collection/worker.py`, fake full-path integration test |
 | Privacy CLI и транзакционный rollback | complete | `privacy.py`, `test_stage2_workflow.py` |
-| Точное имя `collection_job_errors` | partial | Реализация и migration 0004 подготовлены, Docker migration ещё не проверена |
-| Привязка capacity report к лимитам plan/runtime | partial | Код и тест конфигурации подготовлены, реальный repilot ещё не выполнен |
-| Автономный Compose worker | partial | Service и команда `collection worker` подготовлены, контейнер ещё не запущен |
-| Unit/static checks | complete | Ruff/mypy и 20 local tests проходят; 2 PostgreSQL tests локально skipped |
-| Чистая и существующая PostgreSQL migration | unverified | Требуется Docker build, upgrade текущей и отдельной чистой БД |
-| Уменьшенный реальный pilot 100 posts / 200 members | missing | Первый pilot 200/1000 не прошёл capacity gate |
-| Capacity-safe full run | missing | Старый run безопасно paused; новый run ещё не разрешён |
-| Restart/resume автономного контейнера | unverified | Fake restart прошёл; требуется остановка/запуск Compose worker |
+| Точное имя `collection_job_errors` | complete | Migration 0004 прошла на существующей/чистой БД, пять error rows сохранены |
+| Привязка capacity report к лимитам plan/runtime | complete | Plan/config/report binding реализован и применён к full run 100/200 |
+| Автономный Compose worker | complete | Service запущен, restart policy проверена через Docker inspect, UTC job logs видимы |
+| Unit/static checks | complete | Ruff/mypy и 21 local test проходят; PostgreSQL tests выполняются в Docker |
+| Чистая и существующая PostgreSQL migration | complete | 0001→0004, repeat upgrade и `alembic check` прошли |
+| Уменьшенный реальный pilot 100 posts / 200 members | complete | Run `b09b119a-...`, 105 requests, прогноз 3,89 GiB, gate passed |
+| Capacity-safe full run | complete | Run `9be2813e-...` запущен; groups/posts/members/users разрешены |
+| Restart/resume автономного контейнера | complete | 124→190 completed после stop/start; последующий recreate продолжил тот же run |
 | Remote CI | unverified | Push прямо запрещён; workflow проверяется локально |
 
 Документ обновляется после каждого фактического gate; наличие файла без успешного
 запуска не переводит пункт в `complete`.
-

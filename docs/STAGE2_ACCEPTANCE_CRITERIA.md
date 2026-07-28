@@ -17,4 +17,7 @@
 - [x] CI workflow содержит Ruff, format, mypy, tests, compose/build, migrations и secret scan.
 - [x] Pilot по seed `20260728` завершён, результаты и реальный capacity estimate сохранены.
 - [x] Full run разрешён только при прогнозе <= 7 GiB и выполненных safety checks.
-- [x] Разрешённых full-волн нет; отчёт честно фиксирует `paused_capacity_limit`.
+- [x] Уменьшенный repilot 100/200 прошёл gate: прогноз 3,89 GiB <= 7 GiB.
+- [x] Full run разрешён только для groups/posts/members/users; subscriptions выключены.
+- [x] Автономный `collector-worker` имеет `restart: unless-stopped`, пишет UTC progress
+  logs и продолжил тот же run после реальной остановки/перезапуска контейнера.

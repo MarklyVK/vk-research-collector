@@ -35,6 +35,38 @@ docker compose run --rm collector collection run --run-id RUN_ID --until-idle
 `docker compose logs --tail=200`. При 85% диска не создавайте тяжёлые задания; при 95%
 оставьте run на паузе. Никогда не очищайте PostgreSQL автоматически.
 
+## Автономный worker
+
+После успешного `capacity-apply` запустите service, который сам находит последний
+разрешённый full run и хранит весь progress в PostgreSQL:
+
+```bash
+docker compose up -d collector-worker
+docker compose ps
+docker compose logs -f collector-worker
+docker compose run --rm collector collection status --run-id RUN_ID
+```
+
+Service имеет `restart: unless-stopped`. Проверенный production run:
+`9be2813e-e1de-4ac9-bc07-7d92ac82438c`. Штатная остановка завершает текущие page
+transactions и прекращает захват новых jobs; повторный `docker compose up -d
+collector-worker` продолжает тот же run. На Windows автоматическое продолжение после
+перезагрузки возможно только после запуска Docker Desktop. На Debian включите Docker:
+
+```bash
+sudo systemctl enable --now docker
+docker compose up -d postgres collector-worker
+```
+
+Точные команды управления:
+
+```bash
+docker compose run --rm collector collection status --run-id RUN_ID
+docker compose run --rm collector collection summary
+docker compose run --rm collector collection pause --run-id RUN_ID
+docker compose run --rm collector collection resume --run-id RUN_ID
+```
+
 ## Privacy and data minimization
 
 Доступны `privacy inspect-user VK_ID`, `privacy delete-user VK_ID --confirm` и
