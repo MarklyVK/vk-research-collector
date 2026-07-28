@@ -30,6 +30,7 @@ tmp/
 
 # PostgreSQL
 postgres_data/
+backups/
 
 # Системные файлы
 .DS_Store

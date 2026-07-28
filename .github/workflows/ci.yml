@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feat/group-discovery-classification]
+    branches: [main, feat/group-discovery-classification, feat/approved-data-collection]
   pull_request:
 
 permissions:
@@ -46,6 +46,12 @@ jobs:
       - run: mypy src
       - run: alembic upgrade head
       - run: pytest -q
+      - name: Secret scan
+        run: |
+          if git grep -nE 'vk1\.a\.[A-Za-z0-9_-]{20,}' -- .; then
+            echo 'Обнаружен возможный VK token' >&2
+            exit 1
+          fi
       - run: docker build -t vk-research-collector:ci .
 
   compose-smoke:
@@ -63,5 +69,6 @@ jobs:
       - run: docker compose up -d postgres
       - run: docker compose run --rm collector alembic upgrade head
       - run: docker compose run --rm collector pytest -q
+      - run: docker compose run --rm collector collection summary
       - if: always()
         run: docker compose logs --no-color --tail=200
