@@ -15,6 +15,14 @@ make collection-status
 имеет решение `passed`. Затем `make collection-plan APPLY=1` и `make collection-run`.
 Subscriptions остаются выключенными до отдельного решения.
 
+После уменьшенного повторного pilot команда ниже снимет capacity-паузу только если
+машиночитаемый отчёт содержит `decision=passed` и прогноз не выше safe limit:
+
+```bash
+make collection-capacity-apply RUN_ID=FULL_RUN_ID
+make collection-run RUN_ID=FULL_RUN_ID
+```
+
 Pause/resume:
 
 ```bash

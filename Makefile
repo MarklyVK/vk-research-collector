@@ -1,4 +1,4 @@
-.PHONY: search-groups groups-summary export-classification import-classification classification-summary start-collection collection-plan collection-pilot collection-run collection-status collection-pause collection-resume collection-retry-failed collection-verify collection-summary backup migrate test lint logs up down smoke
+.PHONY: search-groups groups-summary export-classification import-classification classification-summary start-collection collection-plan collection-pilot collection-capacity-apply collection-run collection-status collection-pause collection-resume collection-retry-failed collection-verify collection-summary backup migrate test lint logs up down smoke
 
 RUN = docker compose run --rm collector
 
@@ -19,6 +19,9 @@ collection-plan:
 	$(RUN) collection plan $(if $(APPLY),--apply,)
 collection-pilot:
 	$(RUN) collection pilot
+collection-capacity-apply:
+	@test -n "$(RUN_ID)" || (echo "Укажите RUN_ID" && exit 2)
+	$(RUN) collection capacity-apply --run-id $(RUN_ID)
 collection-run:
 	$(RUN) collection run $(if $(RUN_ID),--run-id $(RUN_ID),) --until-idle
 collection-status:

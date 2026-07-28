@@ -519,6 +519,62 @@ def collection_pilot() -> None:
     typer.echo(f"Capacity gate: {capacity['decision']}")
 
 
+async def _apply_capacity(run_id: uuid.UUID, source: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Capacity report не читается: {exc}") from exc
+    projected = payload.get("projected_database_bytes")
+    safe_limit = payload.get("safe_limit_bytes")
+    if (
+        payload.get("decision") != "passed"
+        or not isinstance(projected, int)
+        or not isinstance(safe_limit, int)
+        or projected > safe_limit
+    ):
+        raise ValueError("Capacity report не разрешает full run")
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if run is None or run.scope != "full":
+                raise ValueError("Full run не найден")
+            run.configuration = {
+                **run.configuration,
+                "capacity_gate": "passed",
+                "projected_database_bytes": projected,
+                "safe_limit_bytes": safe_limit,
+                "capacity_report": str(source),
+            }
+            run.status = CollectionRunStatus.PLANNED
+            run.error_message = None
+            await session.commit()
+            return {"run_id": str(run_id), "status": "planned", "capacity_gate": "passed"}
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("capacity-apply")
+def apply_capacity_gate(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Проверенный capacity-estimate.json."),
+    ] = None,
+) -> None:
+    """Разрешить full run только по измеренному успешному capacity report."""
+    settings = get_settings()
+    target = source or settings.collection_export_dir / "capacity-estimate.json"
+    try:
+        payload = asyncio.run(_apply_capacity(run_id, target))
+    except ValueError as exc:
+        typer.echo(f"Capacity gate отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 async def _privacy_operation(
     kind: str, vk_id: int, *, commit_delete: bool = False
 ) -> dict[str, Any]:
