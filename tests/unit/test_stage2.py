@@ -1,5 +1,10 @@
 from pathlib import Path
 
+import httpx
+import pytest
+from pydantic import SecretStr
+
+from vk_collector.collection.notifications import notify
 from vk_collector.collection.safety import inspect_disk, sanitize_message
 from vk_collector.collection.worker import normalize_attachment
 from vk_collector.config import Settings
@@ -49,3 +54,25 @@ def test_disk_thresholds_are_monotonic(tmp_path: Path) -> None:
     state = inspect_disk(tmp_path, warning_percent=0, stop_percent=0)
     assert state.warning
     assert state.stop
+
+
+@pytest.mark.asyncio
+async def test_telegram_failure_does_not_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailingClient:
+        async def __aenter__(self) -> "FailingClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            request = httpx.Request("POST", "https://api.telegram.test")
+            raise httpx.ConnectError("offline", request=request)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: FailingClient())
+    settings = Settings(
+        telegram_enabled=True,
+        telegram_bot_token=SecretStr("fake"),
+        telegram_chat_id="123",
+    )
+    assert not await notify(settings, "test")
