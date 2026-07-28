@@ -132,3 +132,30 @@ async def test_invalid_params_is_not_retried() -> None:
             await VKClient(pool, http_client=http, sleep=time.sleep).call("groups.search", {})
     assert calls == 1
     assert time.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_uses_injected_jitter_without_real_wait() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json={"response": []}, request=request)
+
+    time = FakeTime()
+    pool = TokenPool(["fake"], rps=1000, clock=time.clock, sleep=time.sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        client = VKClient(
+            pool,
+            http_client=http,
+            sleep=time.sleep,
+            retry_delays=(10,),
+            jitter=lambda delay: delay + 1,
+        )
+        assert await client.call("groups.getById", {}) == []
+    assert time.sleeps == [11]

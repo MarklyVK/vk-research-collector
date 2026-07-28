@@ -1,6 +1,7 @@
 """Асинхронный клиент минимальной части VK API."""
 
 import asyncio
+import random
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
@@ -11,6 +12,7 @@ from .models import VKGroup, VKSearchPage
 from .tokens import TokenPool
 
 Sleep = Callable[[float], Awaitable[None]]
+Jitter = Callable[[float], float]
 
 AUTH_ERRORS = frozenset({5, 27, 28})
 RATE_LIMIT_ERRORS = frozenset({6, 29})
@@ -31,12 +33,14 @@ class VKClient:
         sleep: Sleep = asyncio.sleep,
         retry_delays: Sequence[float] = (60, 300, 900, 3600, 21600),
         cooldown_seconds: float = 60.0,
+        jitter: Jitter | None = None,
     ) -> None:
         self._pool = token_pool
         self._api_version = api_version
         self._sleep = sleep
         self._retry_delays = tuple(retry_delays)
         self._cooldown_seconds = cooldown_seconds
+        self._jitter = jitter or (lambda delay: random.uniform(0.9, 1.1) * delay)
         self._http = http_client or httpx.AsyncClient(
             base_url="https://api.vk.com/method/", timeout=timeout
         )
@@ -65,7 +69,7 @@ class VKClient:
             ) as exc:
                 if retry_index >= len(self._retry_delays):
                     raise VKRetryExhausted("VK API недоступен после повторов") from exc
-                await self._sleep(self._retry_delays[retry_index])
+                await self._sleep(self._jitter(self._retry_delays[retry_index]))
                 retry_index += 1
                 continue
 
@@ -89,7 +93,7 @@ class VKClient:
             if code in RETRYABLE_ERRORS:
                 if retry_index >= len(self._retry_delays):
                     raise VKRetryExhausted(f"VK API продолжает возвращать ошибку {code}")
-                await self._sleep(self._retry_delays[retry_index])
+                await self._sleep(self._jitter(self._retry_delays[retry_index]))
                 retry_index += 1
                 continue
             if code in {PERMISSION_ERROR, INVALID_PARAMS_ERROR}:
