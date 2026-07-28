@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from vk_collector.collection.notifications import notify
 from vk_collector.config import Settings
 from vk_collector.database.models import (
     ClassificationStatus,
@@ -377,6 +378,7 @@ class CollectionQueue:
         await self.refresh_run(job.collection_run_id)
 
     async def refresh_run(self, run_id: uuid.UUID) -> None:
+        progress_notification: int | None = None
         async with self._sessions() as session:
             counts = (
                 await session.execute(
@@ -393,6 +395,17 @@ class CollectionQueue:
             run.completed_jobs = by_status.get(JobStatus.COMPLETED, 0)
             run.failed_jobs = by_status.get(JobStatus.FAILED, 0)
             run.skipped_jobs = by_status.get(JobStatus.SKIPPED, 0)
+            terminal = run.completed_jobs + run.failed_jobs + run.skipped_jobs
+            progress = min(100, terminal * 100 // run.total_jobs) if run.total_jobs else 0
+            progress_bucket = progress // 10 * 10
+            raw_last_notified = run.configuration.get("last_notified_percent", 0)
+            last_notified = raw_last_notified if isinstance(raw_last_notified, int) else 0
+            if progress_bucket >= 10 and progress_bucket > last_notified:
+                run.configuration = {
+                    **run.configuration,
+                    "last_notified_percent": progress_bucket,
+                }
+                progress_notification = progress_bucket
             active = sum(
                 by_status.get(status, 0)
                 for status in (
@@ -410,6 +423,11 @@ class CollectionQueue:
                     else CollectionRunStatus.COMPLETED
                 )
             await session.commit()
+        if progress_notification is not None:
+            await notify(
+                self._settings,
+                f"Collection run {run_id}: progress={progress_notification}%",
+            )
 
     async def set_run_status(
         self, run_id: uuid.UUID, status: CollectionRunStatus, reason: str | None = None

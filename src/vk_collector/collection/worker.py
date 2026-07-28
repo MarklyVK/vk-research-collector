@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -108,6 +109,7 @@ class CollectionWorker:
         await self._queue.recover_expired(run_id)
         tasks: set[asyncio.Task[None]] = set()
         claimed = 0
+        disk_warning_sent = False
         while stop_event is None or not stop_event.is_set():
             disk = inspect_disk(
                 self._settings.collection_export_dir,
@@ -122,6 +124,17 @@ class CollectionWorker:
                 )
                 await notify(self._settings, f"Сбор {run_id} поставлен на паузу: диск >95%")
                 break
+            if disk.warning and not disk_warning_sent:
+                logger.warning(
+                    "run=%s disk_used_percent=%.1f threshold=warning", run_id, disk.used_percent
+                )
+                await notify(
+                    self._settings,
+                    f"Сбор {run_id}: предупреждение, диск заполнен на {disk.used_percent:.1f}%",
+                )
+                disk_warning_sent = True
+            elif not disk.warning:
+                disk_warning_sent = False
             while len(tasks) < self._settings.collection_max_concurrency and (
                 max_jobs is None or claimed < max_jobs
             ):
@@ -168,6 +181,7 @@ class CollectionWorker:
         return claimed
 
     async def _process(self, job: ClaimedJob) -> None:
+        started = time.monotonic()
         try:
             if job.job_type == "refresh_group":
                 await self._refresh_group(job)
@@ -210,6 +224,39 @@ class CollectionWorker:
             message = sanitize_message(str(exc))
             await self._record_error(job, type(exc).__name__, message)
             await self._retry_or_fail(job, type(exc).__name__, message)
+        finally:
+            await self._log_job(job, time.monotonic() - started)
+
+    async def _log_job(self, job: ClaimedJob, duration_seconds: float) -> None:
+        async with self._sessions() as session:
+            metrics = (
+                await session.execute(
+                    select(
+                        CollectionJob.status,
+                        CollectionJob.api_requests,
+                        CollectionJob.rows_inserted,
+                        CollectionJob.rows_updated,
+                    ).where(CollectionJob.id == job.id)
+                )
+            ).one_or_none()
+        if metrics is None:
+            return
+        status, requests, inserted, updated = metrics
+        logger.info(
+            "run=%s job=%s endpoint=%s entity=%s:%s attempt=%s status=%s "
+            "api_requests=%s rows_inserted=%s rows_updated=%s duration_seconds=%.3f",
+            job.run_id,
+            job.id,
+            job.job_type,
+            job.entity_type,
+            job.entity_id,
+            job.attempt_count,
+            status.value,
+            requests,
+            inserted,
+            updated,
+            duration_seconds,
+        )
 
     async def _retry_or_fail(self, job: ClaimedJob, category: str, message: str) -> None:
         if job.attempt_count >= len(RETRY_DELAYS):

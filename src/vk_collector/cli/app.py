@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import signal
 import time
 import uuid
@@ -55,6 +56,20 @@ app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
 app.add_typer(collection_app, name="collection")
 app.add_typer(privacy_app, name="privacy")
+
+
+@app.callback()
+def configure_logging() -> None:
+    """Настроить безопасные UTC-логи CLI и автономного worker."""
+    settings = get_settings()
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)sZ level=%(levelname)s logger=%(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def _run_search() -> str:
@@ -405,6 +420,7 @@ async def _change_run_status(run_id: uuid.UUID, status: CollectionRunStatus) -> 
     sessions = create_session_factory(engine)
     try:
         await CollectionQueue(sessions, settings).set_run_status(run_id, status)
+        await notify(settings, f"Collection run {run_id}: status={status.value}")
     finally:
         await engine.dispose()
 
