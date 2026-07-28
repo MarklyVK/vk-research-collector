@@ -46,7 +46,7 @@ class VKClient:
         if self._owns_http:
             await self._http.aclose()
 
-    async def call(self, method: str, params: Mapping[str, str | int]) -> dict[str, Any]:
+    async def call(self, method: str, params: Mapping[str, str | int]) -> Any:
         """Вызвать метод, применяя политику ошибок без утечки токена."""
         retry_index = 0
         while True:
@@ -72,7 +72,7 @@ class VKClient:
             error = body.get("error")
             if not isinstance(error, dict):
                 result = body.get("response")
-                if not isinstance(result, dict):
+                if not isinstance(result, (dict, list)):
                     raise VKAPIError(-1, "Некорректная структура ответа")
                 return result
             code = int(error.get("error_code", -1))
@@ -114,6 +114,8 @@ class VKClient:
                 "fields": "description,status",
             },
         )
+        if not isinstance(response, dict):
+            raise VKAPIError(-1, "Некорректный ответ поиска групп")
         raw_items = response.get("items", [])
         if not isinstance(raw_items, list):
             raise VKAPIError(-1, "Некорректный список групп")
@@ -144,3 +146,59 @@ class VKClient:
             if consumed == 0 or next_offset >= page.total:
                 break
             offset = next_offset
+
+    async def get_groups(self, group_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """Получить только публичные поля групп."""
+        response = await self.call(
+            "groups.getById",
+            {
+                "group_ids": ",".join(str(value) for value in group_ids),
+                "fields": "description,status,screen_name,members_count,is_closed,deactivated",
+            },
+        )
+        if isinstance(response, list):
+            return [item for item in response if isinstance(item, dict)]
+        if isinstance(response, dict):
+            raw = response.get("groups", response.get("items", []))
+            if isinstance(raw, list):
+                return [item for item in raw if isinstance(item, dict)]
+        raise VKAPIError(-1, "Некорректный ответ groups.getById")
+
+    async def get_wall_page(self, group_vk_id: int, offset: int, count: int) -> dict[str, Any]:
+        response = await self.call(
+            "wall.get", {"owner_id": -group_vk_id, "offset": offset, "count": count}
+        )
+        if not isinstance(response, dict):
+            raise VKAPIError(-1, "Некорректный ответ wall.get")
+        return response
+
+    async def get_members_page(self, group_vk_id: int, offset: int, count: int) -> dict[str, Any]:
+        response = await self.call(
+            "groups.getMembers", {"group_id": group_vk_id, "offset": offset, "count": count}
+        )
+        if not isinstance(response, dict):
+            raise VKAPIError(-1, "Некорректный ответ groups.getMembers")
+        return response
+
+    async def get_users(self, user_ids: Sequence[int]) -> list[dict[str, Any]]:
+        response = await self.call(
+            "users.get",
+            {
+                "user_ids": ",".join(str(value) for value in user_ids),
+                "fields": "screen_name,is_closed,can_access_closed,deactivated",
+            },
+        )
+        if not isinstance(response, list):
+            raise VKAPIError(-1, "Некорректный ответ users.get")
+        return [item for item in response if isinstance(item, dict)]
+
+    async def get_subscriptions_page(
+        self, user_vk_id: int, offset: int, count: int
+    ) -> dict[str, Any]:
+        response = await self.call(
+            "groups.get",
+            {"user_id": user_vk_id, "offset": offset, "count": count, "extended": 0},
+        )
+        if not isinstance(response, dict):
+            raise VKAPIError(-1, "Некорректный ответ groups.get")
+        return response

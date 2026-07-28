@@ -448,7 +448,7 @@ class VKUser(Base):
     __tablename__ = "vk_users"
     __table_args__ = (Index("ix_vk_users_profile_updated_at", "profile_updated_at"),)
 
-    vk_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    vk_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     first_name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
     last_name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
     screen_name: Mapped[str | None] = mapped_column(String(255))
