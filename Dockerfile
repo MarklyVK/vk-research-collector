@@ -19,14 +19,14 @@ RUN groupadd --system --gid 10001 collector \
 WORKDIR /app
 COPY --from=builder /wheels /wheels
 RUN python -m pip install --no-cache-dir /wheels/* && rm -rf /wheels
-COPY alembic.ini ./
+COPY alembic.ini compose.yaml ./
 COPY alembic ./alembic
 COPY config ./config
 COPY tests ./tests
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint \
     && chmod 755 /usr/local/bin/docker-entrypoint \
-    && mkdir -p /app/exports/classification \
+    && mkdir -p /app/exports/classification /app/exports/stage2-pilot \
     && chown -R collector:collector /app
 
 USER collector

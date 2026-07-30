@@ -16,7 +16,26 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    Base.metadata.create_all(op.get_bind())
+    # Эта историческая миграция фиксирует только stage 1. CollectionJob намеренно
+    # создаётся следующей миграцией: иначе динамический Base.metadata добавил бы stage 2
+    # при разворачивании чистой БД до выполнения stage 2 revision.
+    stage_one_tables = [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name
+        not in {
+            "collection_jobs",
+            "collection_runs",
+            "group_collection_states",
+            "group_posts",
+            "post_attachments",
+            "vk_users",
+            "group_memberships",
+            "user_group_subscriptions",
+            "collection_job_errors",
+        }
+    ]
+    Base.metadata.create_all(op.get_bind(), tables=stage_one_tables)
 
     # Состав экспортированного пакета неизменяем после создания.
     op.execute(
@@ -55,4 +74,20 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP FUNCTION IF EXISTS reject_batch_item_mutation() CASCADE")
-    Base.metadata.drop_all(op.get_bind())
+    stage_one_tables = [
+        table
+        for table in reversed(Base.metadata.sorted_tables)
+        if table.name
+        not in {
+            "collection_jobs",
+            "collection_runs",
+            "group_collection_states",
+            "group_posts",
+            "post_attachments",
+            "vk_users",
+            "group_memberships",
+            "user_group_subscriptions",
+            "collection_job_errors",
+        }
+    ]
+    Base.metadata.drop_all(op.get_bind(), tables=stage_one_tables)

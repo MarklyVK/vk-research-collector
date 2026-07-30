@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import quote
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,8 +31,41 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     database_url: str | None = None
     telegram_enabled: bool = False
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_chat_id: str = ""
     disk_warning_percent: int = 85
     disk_stop_percent: int = 95
+    collection_worker_id: str = "collector-1"
+    collection_max_concurrency: int = Field(default=3, ge=1, le=10)
+    collection_job_lease_seconds: int = Field(default=300, ge=30)
+    collection_job_heartbeat_seconds: int = Field(default=60, ge=10)
+    collection_idle_sleep_seconds: float = Field(default=5, ge=0.1)
+    collection_posts_enabled: bool = True
+    collection_posts_max_per_group: int = Field(default=100, ge=1)
+    collection_posts_page_size: int = Field(default=100, ge=1, le=100)
+    collection_posts_include_pinned: bool = True
+    collection_posts_stop_at_date: str = ""
+    collection_members_enabled: bool = True
+    collection_members_max_per_group: int | None = Field(default=200, ge=1)
+    collection_members_page_size: int = Field(default=1000, ge=1, le=1000)
+    collection_users_enabled: bool = True
+    collection_user_profile_ttl_days: int = Field(default=30, ge=1)
+    collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
+    collection_subscriptions_enabled: bool = False
+    collection_subscriptions_max_per_user: int | None = Field(default=None, ge=1)
+    collection_subscriptions_page_size: int = Field(default=500, ge=1, le=1000)
+    collection_pilot_seed: int = 20260728
+    collection_pilot_groups_per_category: int = Field(default=10, ge=1)
+    collection_export_dir: Path = Path("/app/exports/stage2-pilot")
+
+    @field_validator(
+        "collection_members_max_per_group",
+        "collection_subscriptions_max_per_user",
+        mode="before",
+    )
+    @classmethod
+    def blank_limit_is_none(cls, value: object) -> object:
+        return None if value == "" else value
 
     @property
     def sqlalchemy_url(self) -> str:

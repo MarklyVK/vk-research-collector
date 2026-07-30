@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    pull_policy: missing
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init-readonly.sh:/docker-entrypoint-initdb.d/20-readonly.sh:ro
+
+  collector:
+    image: ${COLLECTOR_IMAGE:?COLLECTOR_IMAGE must contain an immutable sha tag}
+    pull_policy: never
+    volumes:
+      - ./config:/app/config:ro
+      - ./exports:/app/exports
+      - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
+
+  collector-worker:
+    image: ${COLLECTOR_IMAGE:?COLLECTOR_IMAGE must contain an immutable sha tag}
+    pull_policy: never
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config:ro
+      - ./exports:/app/exports
+      - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import pathlib,sys;
+          sys.exit(0 if any(b'collection\x00worker' in p.read_bytes()
+          for p in pathlib.Path('/proc').glob('[0-9]*/cmdline')) else 1)
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+
+volumes:
+  postgres_data:
+    name: ${POSTGRES_VOLUME_NAME:-vk_research_postgres_data}
