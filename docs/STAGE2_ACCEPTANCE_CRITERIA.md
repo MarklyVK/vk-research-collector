@@ -21,3 +21,14 @@
 - [x] Full run разрешён только для groups/posts/members/users; subscriptions выключены.
 - [x] Автономный `collector-worker` имеет `restart: unless-stopped`, пишет UTC progress
   logs и продолжил тот же run после реальной остановки/перезапуска контейнера.
+
+## Расширение food_service
+
+- [x] Четвёртая область добавлена в config, Pydantic, PostgreSQL CHECK, CLI и planner.
+- [x] Migration 0005 проверена на чистой БД, восстановленной копии и рабочей БД.
+- [x] Reclassification требует полный snapshot и сохраняет прежние labels.
+- [x] Отдельный search поддерживает `--subject food_service`, known/new dedupe и counters.
+- [x] Incremental planner не меняет основной run и требует audit/capacity gates.
+- [ ] Завершены 37 407 семантических решений reclassification.
+- [ ] Выполнены поиск, классификация новых групп и независимый аудит.
+- [ ] Импортированы решения и создан отдельный incremental run.

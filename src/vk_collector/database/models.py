@@ -111,6 +111,11 @@ class SearchKeyword(TimestampMixin, Base):
     __tablename__ = "search_keywords"
     __table_args__ = (
         UniqueConstraint("subject", "keyword"),
+        CheckConstraint(
+            "subject IN ('food_delivery', 'customer_acquisition', 'tender_support', "
+            "'food_service')",
+            name="subject_allowed",
+        ),
         Index("ix_search_keywords_subject", "subject"),
     )
 
@@ -142,6 +147,13 @@ class SearchRun(TimestampMixin, Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+    configuration: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    api_results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    private_results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    deleted_results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
 
 class SearchRunKeyword(TimestampMixin, Base):
@@ -177,6 +189,26 @@ class SearchRunKeyword(TimestampMixin, Base):
     next_offset: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class SearchRunGroup(Base):
+    __tablename__ = "search_run_groups"
+    __table_args__ = (
+        UniqueConstraint("search_run_id", "group_id", name="uq_search_run_groups_run_group"),
+        Index("ix_search_run_groups_run_new", "search_run_id", "was_new"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    search_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("search_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_candidates.id", ondelete="CASCADE"), nullable=False
+    )
+    was_new: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class GroupKeywordMatch(Base):
@@ -249,7 +281,7 @@ class GroupLabel(Base):
     __table_args__ = (
         UniqueConstraint("group_id", "label"),
         CheckConstraint(
-            "label IN ('food_delivery', 'customer_acquisition', 'tender_support')",
+            "label IN ('food_delivery', 'customer_acquisition', 'tender_support', 'food_service')",
             name="label_allowed",
         ),
         Index("ix_group_labels_label", "label"),
@@ -262,6 +294,36 @@ class GroupLabel(Base):
         nullable=False,
     )
     label: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ClassificationReview(Base):
+    """Неизменяемая запись аудита повторной классификации группы."""
+
+    __tablename__ = "classification_reviews"
+    __table_args__ = (
+        UniqueConstraint("operation_id", "group_id", name="uq_reviews_operation_group"),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1", name="classification_review_confidence_range"
+        ),
+        Index("ix_classification_reviews_group", "group_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_candidates.id", ondelete="RESTRICT"), nullable=False
+    )
+    previous_approved: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    previous_labels: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    food_service: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    final_approved: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    final_labels: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -24,6 +24,8 @@ class DiskState:
     used_percent: float
     warning: bool
     stop: bool
+    total_bytes: int
+    free_bytes: int
 
 
 def inspect_disk(path: Path, warning_percent: int, stop_percent: int) -> DiskState:
@@ -31,4 +33,4 @@ def inspect_disk(path: Path, warning_percent: int, stop_percent: int) -> DiskSta
     target = path if path.exists() else Path.cwd()
     usage = shutil.disk_usage(target)
     used = 100.0 * (usage.total - usage.free) / usage.total
-    return DiskState(used, used >= warning_percent, used >= stop_percent)
+    return DiskState(used, used >= warning_percent, used >= stop_percent, usage.total, usage.free)

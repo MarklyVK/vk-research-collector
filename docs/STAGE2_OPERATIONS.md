@@ -15,6 +15,40 @@ make collection-status
 имеет решение `passed`. Затем `make collection-plan APPLY=1` и `make collection-run`.
 Subscriptions остаются выключенными до отдельного решения.
 
+## Расширение «Общепит»
+
+Безопасная последовательность неизменяема:
+
+```bash
+make backup PURPOSE=food-service-migration
+docker compose run --rm collector alembic upgrade head
+docker compose run --rm collector classification reclassification-prepare
+# выполнить полную семантическую разметку decisions.json
+docker compose run --rm collector classification reclassification-validate \
+  /app/exports/food-service-reclassification/decisions.json
+# создать и проверить новый backup непосредственно перед импортом
+docker compose run --rm collector classification reclassification-import \
+  /app/exports/food-service-reclassification/decisions.json --backup /app/backups/VERIFIED.dump
+docker compose run --rm collector groups search --subject food_service
+docker compose run --rm collector classification summary --subject food_service
+```
+
+После классификации новых pending-групп подготовьте аудит и только затем plan:
+
+```bash
+docker compose run --rm collector classification audit-prepare \
+  /app/exports/food-service-reclassification/decisions.json
+docker compose run --rm collector classification audit-validate \
+  /app/exports/food-service-audit/audit-results.json
+docker compose run --rm collector collection plan --apply \
+  --incremental-from 9be2813e-e1de-4ac9-bc07-7d92ac82438c \
+  --reason food_service_increment --source food_service_expansion \
+  --audit-summary /app/exports/food-service-audit/summary.json
+```
+
+Если прогноз достигает warning threshold, incremental run создаётся в
+`paused_capacity_limit`; worker его не выбирает.
+
 После уменьшенного повторного pilot команда ниже снимет capacity-паузу только если
 машиночитаемый отчёт содержит `decision=passed` и прогноз не выше safe limit:
 

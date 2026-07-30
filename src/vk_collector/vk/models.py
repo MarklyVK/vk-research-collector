@@ -33,3 +33,6 @@ class VKGroup:
 class VKSearchPage:
     total: int
     items: tuple[VKGroup, ...]
+    raw_count: int = 0
+    private_count: int = 0
+    deleted_count: int = 0

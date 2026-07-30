@@ -123,12 +123,24 @@ class VKClient:
         raw_items = response.get("items", [])
         if not isinstance(raw_items, list):
             raise VKAPIError(-1, "Некорректный список групп")
+        typed_items = [item for item in raw_items if isinstance(item, dict)]
+        deleted_count = sum(bool(item.get("deactivated")) for item in typed_items)
+        private_count = sum(
+            bool(item.get("is_closed")) and not bool(item.get("deactivated"))
+            for item in typed_items
+        )
         items = tuple(
             VKGroup.from_api(item)
-            for item in raw_items
-            if isinstance(item, dict) and not item.get("is_closed") and not item.get("deactivated")
+            for item in typed_items
+            if not item.get("is_closed") and not item.get("deactivated")
         )
-        return VKSearchPage(total=int(response.get("count", 0)), items=items)
+        return VKSearchPage(
+            total=int(response.get("count", 0)),
+            items=items,
+            raw_count=len(typed_items),
+            private_count=private_count,
+            deleted_count=deleted_count,
+        )
 
     async def iter_search(
         self,

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
-from vk_collector.vk import VKClient, VKError, VKGroup, VKTokensUnavailable
+from vk_collector.vk import VKClient, VKError, VKSearchPage, VKTokensUnavailable
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +24,7 @@ class SearchPersistence(Protocol):
         run_id: str,
         keyword: Keyword,
         group_type: str,
-        groups: tuple[VKGroup, ...],
+        page: VKSearchPage,
         next_offset: int,
     ) -> None: ...
 
@@ -72,7 +72,7 @@ class SearchService:
                             group_type=group_type,
                         ):
                             await self._persistence.save_page(
-                                run_id, keyword, group_type, page.items, next_offset
+                                run_id, keyword, group_type, page, next_offset
                             )
                         await self._persistence.mark_keyword_complete(run_id, keyword, group_type)
                     except VKTokensUnavailable:

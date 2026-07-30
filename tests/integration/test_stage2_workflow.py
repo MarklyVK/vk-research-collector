@@ -20,6 +20,7 @@ from vk_collector.database.models import (
     CollectionRun,
     CollectionRunStatus,
     GroupCandidate,
+    GroupLabel,
     GroupMembership,
     GroupPost,
     JobStatus,
@@ -282,6 +283,121 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                     await nested.rollback()
                     after = await inspect_user(session, 9_000_000_001)
                     assert before == after
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_food_service_incremental_plan_is_snapshot_safe_and_idempotent() -> None:
+    if not database_url().rsplit("/", 1)[-1].endswith("_test"):
+        pytest.skip("Incremental integration test требует изолированную test DB")
+    engine = create_database_engine(database_url())
+    marker = int(uuid.uuid4().hex[:10], 16)
+    settings = Settings(
+        database_url=database_url(),
+        collection_posts_max_per_group=100,
+        collection_members_max_per_group=200,
+        collection_subscriptions_enabled=False,
+    )
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection,
+                expire_on_commit=False,
+                autoflush=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                async with sessions() as session:
+                    old_group = GroupCandidate(
+                        vk_id=marker + 20_000_000_000,
+                        name="Старая approved-группа",
+                        description="",
+                        status_text="",
+                        address="https://vk.com/old",
+                        first_seen_at=datetime.now(UTC),
+                        last_seen_at=datetime.now(UTC),
+                        classification_status=ClassificationStatus.APPROVED,
+                    )
+                    new_group = GroupCandidate(
+                        vk_id=marker + 30_000_000_000,
+                        name="Новое кафе",
+                        description="Действующее кафе",
+                        status_text="",
+                        address="https://vk.com/new",
+                        first_seen_at=datetime.now(UTC),
+                        last_seen_at=datetime.now(UTC),
+                        classification_status=ClassificationStatus.APPROVED,
+                    )
+                    session.add_all([old_group, new_group])
+                    await session.flush()
+                    session.add_all(
+                        [
+                            GroupLabel(group_id=new_group.id, label="food_service"),
+                            GroupLabel(group_id=new_group.id, label="food_delivery"),
+                        ]
+                    )
+                    baseline = CollectionRun(
+                        scope="full",
+                        status=CollectionRunStatus.RUNNING,
+                        configuration={
+                            "group_count": 1,
+                            "projected_database_bytes": 512 * 1024,
+                        },
+                    )
+                    session.add(baseline)
+                    await session.flush()
+                    session.add(
+                        CollectionJob(
+                            collection_run_id=baseline.id,
+                            job_type="refresh_group",
+                            entity_type="group",
+                            entity_id=old_group.id,
+                        )
+                    )
+                    await session.commit()
+                    baseline_id = baseline.id
+                    new_group_id = new_group.id
+
+                queue = CollectionQueue(sessions, settings)
+                assert await queue.incremental_group_ids(baseline_id) == [new_group_id]
+                preview = await queue.preview(incremental_from=baseline_id)
+                assert preview.selected_groups == 1
+                first = await queue.plan(
+                    incremental_from=baseline_id,
+                    reason="food_service_increment",
+                    source="food_service_expansion",
+                    capacity_passed=True,
+                    estimated_disk_growth_bytes=preview.estimated_disk_growth_bytes,
+                )
+                second = await queue.plan(
+                    incremental_from=baseline_id,
+                    reason="food_service_increment",
+                    source="food_service_expansion",
+                    capacity_passed=True,
+                    estimated_disk_growth_bytes=preview.estimated_disk_growth_bytes,
+                )
+                assert first == second
+                async with sessions() as session:
+                    jobs = list(
+                        (
+                            await session.scalars(
+                                select(CollectionJob).where(
+                                    CollectionJob.collection_run_id == first
+                                )
+                            )
+                        ).all()
+                    )
+                    assert len(jobs) == 3
+                    assert {job.entity_id for job in jobs} == {new_group_id}
+                    run = await session.get(CollectionRun, first)
+                    assert run is not None
+                    assert run.scope == "incremental"
+                    assert run.configuration["reason"] == "food_service_increment"
+                    assert run.configuration["source"] == "food_service_expansion"
             finally:
                 await outer.rollback()
     finally:

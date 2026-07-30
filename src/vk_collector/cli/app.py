@@ -14,6 +14,12 @@ from typing import Annotated, Any
 import typer
 from sqlalchemy import func, select, update
 
+from vk_collector.classification.audit import evaluate_audit, prepare_audit
+from vk_collector.classification.reclassification import (
+    import_reclassification,
+    load_reclassification,
+    prepare_reclassification,
+)
 from vk_collector.classification.service import (
     classification_summary,
     export_batch,
@@ -43,8 +49,9 @@ from vk_collector.database.models import (
 )
 from vk_collector.database.session import create_database_engine, create_session_factory
 from vk_collector.privacy import delete_user, inspect_group, inspect_user
-from vk_collector.search.postgres import PostgresSearchPersistence
+from vk_collector.search.postgres import PostgresSearchPersistence, search_run_summary
 from vk_collector.search.service import Keyword, SearchService
+from vk_collector.subjects import SubjectName, ensure_subject
 from vk_collector.vk import TokenPool, VKClient, VKTokensUnavailable, load_tokens
 
 app = typer.Typer(help="Поиск и ручная классификация сообществ VK.")
@@ -72,7 +79,7 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-async def _run_search() -> str:
+async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]:
     settings = get_settings()
     keyword_config = load_keyword_config()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -93,22 +100,36 @@ async def _run_search() -> str:
             PostgresSearchPersistence(sessions),
             group_types=tuple(keyword_config.community_types),
         )
-        return await service.run(
-            tuple(
-                Keyword(value=item.keyword, subject=item.subject)
-                for item in keyword_config.keywords
-            )
+        keywords = tuple(
+            Keyword(value=item.keyword, subject=item.subject)
+            for item in keyword_config.keywords
+            if subject is None or item.subject == subject
         )
+        run_id = await service.run(keywords)
+        async with sessions() as session:
+            summary = await search_run_summary(session, uuid.UUID(run_id))
+        return run_id, summary
     finally:
         await client.aclose()
         await engine.dispose()
 
 
 @groups_app.command("search")
-def search_groups() -> None:
+def search_groups(
+    subject: Annotated[
+        str | None,
+        typer.Option("--subject", help="Искать только одну предметную область."),
+    ] = None,
+) -> None:
     """Запустить новый поиск или продолжить незавершённый."""
-    run_id = asyncio.run(_run_search())
+    try:
+        validated_subject = ensure_subject(subject) if subject is not None else None
+        run_id, summary = asyncio.run(_run_search(validated_subject))
+    except ValueError as exc:
+        typer.echo(f"Поиск отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     typer.echo(f"Поиск завершён или приостановлен. ID запуска: {run_id}")
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 async def _group_summary() -> dict[str, int]:
@@ -182,13 +203,137 @@ def import_results(
     typer.echo(f"Классификация применена к {count} группам.")
 
 
-async def _classification_summary() -> dict[str, Any]:
+async def _prepare_reclassification(output_dir: Path) -> dict[str, Any]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     try:
         async with sessions() as session:
-            return await classification_summary(session)
+            return await prepare_reclassification(session, output_dir)
+    finally:
+        await engine.dispose()
+
+
+@classification_app.command("reclassification-prepare")
+def reclassification_prepare(
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Каталог артефактов повторной классификации."),
+    ] = Path("/app/exports/food-service-reclassification"),
+) -> None:
+    """Создать полный snapshot для семантической проверки food_service."""
+    payload = asyncio.run(_prepare_reclassification(output_dir))
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@classification_app.command("reclassification-validate")
+def reclassification_validate(
+    source: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Проверить формат завершённых решений без изменения базы."""
+    try:
+        document = load_reclassification(source)
+    except ValueError as exc:
+        typer.echo(f"Валидация отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "valid": True,
+                "operation_id": document.operation_id,
+                "decisions": len(document.decisions),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+async def _import_reclassification(source: Path) -> dict[str, int]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            try:
+                return await import_reclassification(session, source)
+            except Exception:
+                await session.rollback()
+                raise
+    finally:
+        await engine.dispose()
+
+
+@classification_app.command("reclassification-import")
+def reclassification_import(
+    source: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    backup: Annotated[
+        Path,
+        typer.Option(
+            "--backup",
+            exists=True,
+            dir_okay=False,
+            help="Проверенный PostgreSQL backup, созданный непосредственно перед импортом.",
+        ),
+    ],
+) -> None:
+    """Импортировать проверенную reclassification с обязательным backup."""
+    if backup.stat().st_size <= 0:
+        typer.echo("Импорт отклонён: backup пуст.", err=True)
+        raise typer.Exit(code=2)
+    try:
+        result = asyncio.run(_import_reclassification(source))
+    except ValueError as exc:
+        typer.echo(f"Импорт отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@classification_app.command("audit-prepare")
+def audit_prepare(
+    decisions: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Каталог независимого аудита."),
+    ] = Path("/app/exports/food-service-audit"),
+) -> None:
+    """Создать фиксированную независимую выборку food_service."""
+    try:
+        summary = prepare_audit(decisions, output_dir)
+    except ValueError as exc:
+        typer.echo(f"Подготовка аудита отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+@classification_app.command("audit-validate")
+def audit_validate(
+    source: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Путь для машиночитаемого summary.json."),
+    ] = None,
+) -> None:
+    """Проверить независимый аудит и вычислить quality gates."""
+    try:
+        summary = evaluate_audit(source)
+    except (OSError, ValueError) as exc:
+        typer.echo(f"Аудит отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    target = output or source.parent / "summary.json"
+    _write_json(target, summary)
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary["decision"] != "passed":
+        raise typer.Exit(code=1)
+
+
+async def _classification_summary(subject: SubjectName | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            return await classification_summary(session, subject)
     finally:
         await engine.dispose()
 
@@ -200,12 +345,27 @@ def _print_classification_summary(summary: dict[str, Any]) -> None:
     typer.echo("Approved по областям:")
     for label, count in sorted(summary["approved_by_label"].items()):
         typer.echo(f"  {label}: {count}")
+    if "subject" in summary:
+        typer.echo("Статистика выбранной области:")
+        for key, value in summary["subject"].items():
+            typer.echo(f"  {key}: {value}")
 
 
 @classification_app.command("summary")
-def show_classification_summary() -> None:
+def show_classification_summary(
+    subject: Annotated[
+        str | None,
+        typer.Option("--subject", help="Фильтр по предметной области."),
+    ] = None,
+) -> None:
     """Показать результаты ручной классификации."""
-    _print_classification_summary(asyncio.run(_classification_summary()))
+    try:
+        validated_subject = ensure_subject(subject) if subject is not None else None
+        summary = asyncio.run(_classification_summary(validated_subject))
+    except ValueError as exc:
+        typer.echo(f"Статистика отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    _print_classification_summary(summary)
 
 
 @collection_app.command("start")
@@ -214,26 +374,62 @@ def start_collection() -> None:
     collection_plan(apply=False, pilot=False)
 
 
-async def _plan_collection(*, apply: bool, pilot: bool) -> tuple[Any, uuid.UUID | None, float]:
+def _validate_audit_gate(source: Path) -> None:
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Отчёт аудита не читается: {exc}") from exc
+    if payload.get("seed") != 20260730 or payload.get("decision") != "passed":
+        raise ValueError("Incremental plan требует успешный аудит с seed 20260730")
+
+
+async def _plan_collection(
+    *,
+    apply: bool,
+    pilot: bool,
+    incremental_from: uuid.UUID | None = None,
+    reason: str = "food_service_increment",
+    source: str = "food_service_expansion",
+    audit_summary: Path | None = None,
+) -> tuple[Any, uuid.UUID | None, float, float]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     try:
         queue = CollectionQueue(sessions, settings)
-        preview = await queue.preview(pilot=pilot)
+        if pilot and incremental_from is not None:
+            raise ValueError("Нельзя одновременно планировать pilot и incremental run")
+        preview = await queue.preview(pilot=pilot, incremental_from=incremental_from)
         disk = inspect_disk(
             settings.collection_export_dir,
             settings.disk_warning_percent,
             settings.disk_stop_percent,
         )
         run_id = None
+        used_bytes = disk.total_bytes - disk.free_bytes
+        projected_used_percent = (
+            100.0 * (used_bytes + preview.estimated_disk_growth_bytes) / disk.total_bytes
+        )
         if apply:
-            if disk.warning:
+            if incremental_from is not None:
+                if audit_summary is None:
+                    raise ValueError("Для incremental plan укажите --audit-summary")
+                _validate_audit_gate(audit_summary)
+                capacity_passed = projected_used_percent < settings.disk_warning_percent
+                run_id = await queue.plan(
+                    incremental_from=incremental_from,
+                    reason=reason,
+                    source=source,
+                    capacity_passed=capacity_passed,
+                    estimated_disk_growth_bytes=preview.estimated_disk_growth_bytes,
+                )
+            elif disk.warning:
                 raise ValueError(
                     f"Создание тяжёлых заданий запрещено: диск заполнен на {disk.used_percent:.1f}%"
                 )
-            run_id = await queue.plan(pilot=pilot)
-        return preview, run_id, disk.used_percent
+            else:
+                run_id = await queue.plan(pilot=pilot)
+        return preview, run_id, disk.used_percent, projected_used_percent
     finally:
         await engine.dispose()
 
@@ -242,10 +438,29 @@ async def _plan_collection(*, apply: bool, pilot: bool) -> tuple[Any, uuid.UUID 
 def collection_plan(
     apply: Annotated[bool, typer.Option("--apply", help="Создать run и jobs.")] = False,
     pilot: Annotated[bool, typer.Option("--pilot", help="Планировать pilot-выборку.")] = False,
+    incremental_from: Annotated[
+        uuid.UUID | None,
+        typer.Option("--incremental-from", help="Исключить snapshot базового run."),
+    ] = None,
+    reason: Annotated[str, typer.Option("--reason")] = "food_service_increment",
+    source: Annotated[str, typer.Option("--source")] = "food_service_expansion",
+    audit_summary: Annotated[
+        Path | None,
+        typer.Option("--audit-summary", help="Успешный summary независимого аудита."),
+    ] = None,
 ) -> None:
     """Показать безопасный план; без --apply база не изменяется."""
     try:
-        preview, run_id, disk = asyncio.run(_plan_collection(apply=apply, pilot=pilot))
+        preview, run_id, disk, projected_disk = asyncio.run(
+            _plan_collection(
+                apply=apply,
+                pilot=pilot,
+                incremental_from=incremental_from,
+                reason=reason,
+                source=source,
+                audit_summary=audit_summary,
+            )
+        )
     except ValueError as exc:
         typer.echo(f"Планирование отклонено: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -254,6 +469,12 @@ def collection_plan(
     typer.echo(f"Scopes: {', '.join(preview.scopes)}")
     typer.echo(f"Jobs: {preview.jobs}; оценка VK-запросов: {preview.estimated_requests}")
     typer.echo(f"Заполнение диска: {disk:.1f}%")
+    if incremental_from is not None:
+        typer.echo(
+            "Прогноз дополнительного объёма: "
+            f"{preview.estimated_disk_growth_bytes} байт; прогноз заполнения: "
+            f"{projected_disk:.1f}%"
+        )
     for warning in preview.warnings:
         typer.echo(f"Предупреждение: {warning}")
     if run_id:
@@ -283,8 +504,10 @@ async def _execute_collection(
             run = await session.get(CollectionRun, target)
             if run is None:
                 raise ValueError("Запуск не найден")
-            if run.scope == "full" and not await capacity_gate_passed(sessions, target):
-                raise ValueError("Full run запрещён до успешного capacity gate")
+            if run.scope in {"full", "incremental"} and not await capacity_gate_passed(
+                sessions, target
+            ):
+                raise ValueError("Full/incremental run запрещён до успешного capacity gate")
             expected_configuration = run.configuration.get("collection")
             if expected_configuration != queue.collection_configuration():
                 raise ValueError(

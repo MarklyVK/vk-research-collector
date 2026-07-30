@@ -9,6 +9,8 @@ import yaml
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from vk_collector.subjects import SUBJECT_NAMES, SUBJECT_TITLES, SubjectName, ensure_subject
+
 
 class Settings(BaseSettings):
     """Настройки приложения, изменяемые через переменные окружения."""
@@ -80,26 +82,65 @@ class Settings(BaseSettings):
 
 
 class Keyword(BaseModel):
-    subject: str
+    subject: SubjectName
     keyword: str
 
 
 class KeywordConfig(BaseModel):
     community_types: list[str]
+    subjects: tuple[SubjectName, ...]
     keywords: list[Keyword]
+
+
+def _keyword_identity(value: str) -> str:
+    """Нормализовать значение только для поиска конфигурационных дублей."""
+    return " ".join(value.strip().casefold().replace("ё", "е").split())
 
 
 def load_keyword_config(path: Path = Path("config/keywords.yml")) -> KeywordConfig:
     """Загрузить и нормализовать предметные области и ключевые слова."""
-    payload: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
-    subjects = payload.get("subjects", {})
-    keywords = [
-        Keyword(subject=subject, keyword=value)
-        for subject, details in subjects.items()
-        for value in details.get("keywords", [])
-    ]
+    raw_payload: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_payload, dict):
+        raise ValueError("Конфигурация ключевых слов должна быть объектом YAML")
+    payload: dict[str, Any] = raw_payload
+    raw_subjects = payload.get("subjects", {})
+    if not isinstance(raw_subjects, dict):
+        raise ValueError("Раздел subjects должен быть объектом YAML")
+    subject_names = tuple(ensure_subject(str(value)) for value in raw_subjects)
+    if subject_names != SUBJECT_NAMES:
+        raise ValueError(
+            "Раздел subjects должен содержать четыре области в стабильном порядке: "
+            + ", ".join(SUBJECT_NAMES)
+        )
+
+    keywords: list[Keyword] = []
+    seen: dict[str, SubjectName] = {}
+    for subject in subject_names:
+        details = raw_subjects[subject]
+        if not isinstance(details, dict):
+            raise ValueError(f"Настройки {subject} должны быть объектом YAML")
+        if details.get("title") != SUBJECT_TITLES[subject]:
+            raise ValueError(f"Некорректное русское название предметной области {subject}")
+        values = details.get("keywords", [])
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Для {subject} нужен непустой список ключевых слов")
+        for raw_value in values:
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                raise ValueError(f"Пустое или некорректное ключевое слово в {subject}")
+            value = raw_value.strip()
+            identity = _keyword_identity(value)
+            previous = seen.get(identity)
+            if previous is not None:
+                raise ValueError(f"Дублирующееся ключевое слово {value!r}: {previous} и {subject}")
+            seen[identity] = subject
+            keywords.append(Keyword(subject=subject, keyword=value))
+
+    raw_types = payload.get("search", {}).get("community_types", ["group"])
+    if not isinstance(raw_types, list) or not raw_types:
+        raise ValueError("search.community_types должен быть непустым списком")
     return KeywordConfig(
-        community_types=payload.get("search", {}).get("community_types", ["group"]),
+        community_types=[str(value) for value in raw_types],
+        subjects=subject_names,
         keywords=keywords,
     )
 

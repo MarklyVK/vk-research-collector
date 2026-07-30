@@ -109,6 +109,9 @@ async def test_pagination_filters_unavailable_groups() -> None:
         pages = [page async for page in client.iter_search("еда", page_size=2)]
     assert [offset for offset, _ in pages] == [2, 3]
     assert pages[0][1].items[0].address == "https://vk.com/one"
+    assert pages[0][1].raw_count == 2
+    assert pages[0][1].private_count == 1
+    assert pages[1][1].deleted_count == 1
     assert [request["offset"] for request in requests] == ["0", "2"]
 
 
