@@ -52,6 +52,25 @@ def test_full_import_supports_multiple_labels() -> None:
     assert decision.labels == {"food_delivery", "customer_acquisition"}
 
 
+def test_food_service_and_delivery_multilabel_is_allowed() -> None:
+    result = FullResult(
+        vk_id=1,
+        approved=True,
+        labels=["food_service", "food_delivery"],
+        confidence=0.96,
+    )
+    assert result.labels == ["food_service", "food_delivery"]
+
+
+def test_unknown_label_and_inconsistent_decisions_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        FullResult(vk_id=1, approved=True, labels=["unknown"], confidence=0.9)  # type: ignore[list-item]
+    with pytest.raises(ValidationError):
+        FullResult(vk_id=1, approved=True, labels=[], confidence=0.9)
+    with pytest.raises(ValidationError):
+        FullResult(vk_id=1, approved=False, labels=["food_service"], confidence=0.9)
+
+
 def test_confidence_range_is_enforced() -> None:
     with pytest.raises(ValidationError):
         FullResult(vk_id=1, approved=True, labels=[], confidence=1.1)

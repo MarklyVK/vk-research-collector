@@ -46,7 +46,7 @@ class MemoryPersistence:
         run_id: str,
         keyword: Keyword,
         group_type: str,
-        groups: tuple[VKGroup, ...],
+        page: VKSearchPage,
         next_offset: int,
     ) -> None:
         self.saved.append(next_offset)
