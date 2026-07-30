@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -13,10 +16,11 @@ from vk_collector.database.models import (
     RunStatus,
     SearchKeyword,
     SearchRun,
+    SearchRunGroup,
     SearchRunKeyword,
 )
 from vk_collector.search.service import Keyword
-from vk_collector.vk import VKGroup
+from vk_collector.vk import VKSearchPage
 
 
 class PostgresSearchPersistence:
@@ -38,16 +42,33 @@ class PostgresSearchPersistence:
         return int(await session.scalar(statement))
 
     async def start_or_resume_run(self, keywords: tuple[Keyword, ...]) -> str:
+        key_payload = [
+            {"subject": keyword.subject, "keyword": keyword.value} for keyword in keywords
+        ]
+        plan_key = hashlib.sha256(
+            json.dumps(key_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        subjects = list(dict.fromkeys(keyword.subject for keyword in keywords))
         async with self._sessions() as session:
             run = await session.scalar(
                 select(SearchRun)
-                .where(SearchRun.status.in_([RunStatus.RUNNING, RunStatus.PAUSED]))
+                .where(
+                    SearchRun.status.in_([RunStatus.RUNNING, RunStatus.PAUSED]),
+                    SearchRun.configuration["plan_key"].astext == plan_key,
+                )
                 .order_by(SearchRun.created_at.desc())
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
             if run is None:
-                run = SearchRun(status=RunStatus.RUNNING)
+                run = SearchRun(
+                    status=RunStatus.RUNNING,
+                    configuration={
+                        "plan_key": plan_key,
+                        "subjects": subjects,
+                        "keyword_count": len(keywords),
+                    },
+                )
                 session.add(run)
                 await session.flush()
             else:
@@ -101,13 +122,22 @@ class PostgresSearchPersistence:
         run_id: str,
         keyword: Keyword,
         group_type: str,
-        groups: tuple[VKGroup, ...],
+        page: VKSearchPage,
         next_offset: int,
     ) -> None:
         now = datetime.now(UTC)
         async with self._sessions() as session:
             keyword_id = await self._keyword_id(session, keyword)
-            for group in groups:
+            existing_vk_ids = set(
+                (
+                    await session.scalars(
+                        select(GroupCandidate.vk_id).where(
+                            GroupCandidate.vk_id.in_([item.vk_id for item in page.items])
+                        )
+                    )
+                ).all()
+            )
+            for group in page.items:
                 group_id = await session.scalar(
                     insert(GroupCandidate)
                     .values(
@@ -147,6 +177,18 @@ class PostgresSearchPersistence:
                         set_={"last_matched_at": now},
                     )
                 )
+                await session.execute(
+                    insert(SearchRunGroup)
+                    .values(
+                        search_run_id=uuid.UUID(run_id),
+                        group_id=group_id,
+                        was_new=group.vk_id not in existing_vk_ids,
+                        first_seen_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        constraint="uq_search_run_groups_run_group"
+                    )
+                )
             await session.execute(
                 update(SearchRunKeyword)
                 .where(
@@ -155,6 +197,19 @@ class PostgresSearchPersistence:
                     SearchRunKeyword.community_type == group_type,
                 )
                 .values(next_offset=next_offset)
+            )
+            await session.execute(
+                update(SearchRun)
+                .where(SearchRun.id == uuid.UUID(run_id))
+                .values(
+                    api_results_count=SearchRun.api_results_count + page.raw_count,
+                    private_results_count=(
+                        SearchRun.private_results_count + page.private_count
+                    ),
+                    deleted_results_count=(
+                        SearchRun.deleted_results_count + page.deleted_count
+                    ),
+                )
             )
             await session.commit()
 
@@ -197,3 +252,39 @@ class PostgresSearchPersistence:
         self, run_id: str, keyword: Keyword, group_type: str, error: str
     ) -> None:
         await self._set_progress(run_id, keyword, group_type, RunStatus.FAILED, error)
+        async with self._sessions() as session:
+            await session.execute(
+                update(SearchRun)
+                .where(SearchRun.id == uuid.UUID(run_id))
+                .values(error_count=SearchRun.error_count + 1)
+            )
+            await session.commit()
+
+
+async def search_run_summary(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any]:
+    """Вернуть дедуплицированную статистику одного запуска поиска."""
+    run = await session.get(SearchRun, run_id)
+    if run is None:
+        raise ValueError("Запуск поиска не найден")
+    unique_groups, new_groups = (
+        await session.execute(
+            select(
+                func.count(SearchRunGroup.id),
+                func.count(SearchRunGroup.id).filter(SearchRunGroup.was_new.is_(True)),
+            ).where(SearchRunGroup.search_run_id == run_id)
+        )
+    ).one()
+    unique_count = int(unique_groups)
+    new_count = int(new_groups)
+    return {
+        "run_id": str(run.id),
+        "status": run.status.value,
+        "subjects": run.configuration.get("subjects", []),
+        "total_api_results": run.api_results_count,
+        "unique_vk_groups": unique_count,
+        "already_known_groups": unique_count - new_count,
+        "new_groups": new_count,
+        "private_results": run.private_results_count,
+        "deleted_results": run.deleted_results_count,
+        "errors": run.error_count,
+    }

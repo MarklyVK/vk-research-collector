@@ -43,8 +43,9 @@ from vk_collector.database.models import (
 )
 from vk_collector.database.session import create_database_engine, create_session_factory
 from vk_collector.privacy import delete_user, inspect_group, inspect_user
-from vk_collector.search.postgres import PostgresSearchPersistence
+from vk_collector.search.postgres import PostgresSearchPersistence, search_run_summary
 from vk_collector.search.service import Keyword, SearchService
+from vk_collector.subjects import SubjectName, ensure_subject
 from vk_collector.vk import TokenPool, VKClient, VKTokensUnavailable, load_tokens
 
 app = typer.Typer(help="Поиск и ручная классификация сообществ VK.")
@@ -72,7 +73,7 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-async def _run_search() -> str:
+async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]:
     settings = get_settings()
     keyword_config = load_keyword_config()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -93,22 +94,36 @@ async def _run_search() -> str:
             PostgresSearchPersistence(sessions),
             group_types=tuple(keyword_config.community_types),
         )
-        return await service.run(
-            tuple(
-                Keyword(value=item.keyword, subject=item.subject)
-                for item in keyword_config.keywords
-            )
+        keywords = tuple(
+            Keyword(value=item.keyword, subject=item.subject)
+            for item in keyword_config.keywords
+            if subject is None or item.subject == subject
         )
+        run_id = await service.run(keywords)
+        async with sessions() as session:
+            summary = await search_run_summary(session, uuid.UUID(run_id))
+        return run_id, summary
     finally:
         await client.aclose()
         await engine.dispose()
 
 
 @groups_app.command("search")
-def search_groups() -> None:
+def search_groups(
+    subject: Annotated[
+        str | None,
+        typer.Option("--subject", help="Искать только одну предметную область."),
+    ] = None,
+) -> None:
     """Запустить новый поиск или продолжить незавершённый."""
-    run_id = asyncio.run(_run_search())
+    try:
+        validated_subject = ensure_subject(subject) if subject is not None else None
+        run_id, summary = asyncio.run(_run_search(validated_subject))
+    except ValueError as exc:
+        typer.echo(f"Поиск отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     typer.echo(f"Поиск завершён или приостановлен. ID запуска: {run_id}")
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 async def _group_summary() -> dict[str, int]:
