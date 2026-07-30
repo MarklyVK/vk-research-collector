@@ -6,10 +6,10 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import func, select, update
+from sqlalchemy import Table, bindparam, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,8 @@ from vk_collector.database.models import (
 )
 
 RECLASSIFICATION_SOURCE = "food_service_expansion"
+RECLASSIFICATION_QUERY_BATCH_SIZE = 10_000
+RECLASSIFICATION_WRITE_BATCH_SIZE = 1_000
 
 
 class ReclassificationDecision(BaseModel):
@@ -249,32 +251,49 @@ async def import_reclassification(session: AsyncSession, source: Path) -> dict[s
             return {"processed": 0, "food_service_added": 0, "rejected_to_approved": 0}
         raise ValueError("Найден неполный ранее применённый operation_id")
 
-    groups = list(
-        (
-            await session.scalars(
-                select(GroupCandidate)
-                .where(GroupCandidate.vk_id.in_([item.vk_id for item in document.decisions]))
-                .with_for_update()
-            )
-        ).all()
-    )
+    decision_vk_ids = [item.vk_id for item in document.decisions]
+    groups: list[GroupCandidate] = []
+    for start in range(0, len(decision_vk_ids), RECLASSIFICATION_QUERY_BATCH_SIZE):
+        groups.extend(
+            (
+                await session.scalars(
+                    select(GroupCandidate)
+                    .where(
+                        GroupCandidate.vk_id.in_(
+                            decision_vk_ids[start : start + RECLASSIFICATION_QUERY_BATCH_SIZE]
+                        )
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
     by_vk = {group.vk_id: group for group in groups}
     unknown = {item.vk_id for item in document.decisions} - set(by_vk)
     if unknown:
         raise ValueError(f"Неизвестные VK ID: {sorted(unknown)}")
-    label_rows = (
-        await session.execute(
-            select(GroupLabel.group_id, GroupLabel.label).where(
-                GroupLabel.group_id.in_([group.id for group in groups])
-            )
+    group_ids = [group.id for group in groups]
+    label_rows: list[Any] = []
+    for start in range(0, len(group_ids), RECLASSIFICATION_QUERY_BATCH_SIZE):
+        label_rows.extend(
+            (
+                await session.execute(
+                    select(GroupLabel.group_id, GroupLabel.label).where(
+                        GroupLabel.group_id.in_(
+                            group_ids[start : start + RECLASSIFICATION_QUERY_BATCH_SIZE]
+                        )
+                    )
+                )
+            ).all()
         )
-    ).all()
     current_labels: dict[int, set[str]] = defaultdict(set)
     for group_id, label in label_rows:
         current_labels[group_id].add(label)
 
     food_service_added = 0
     rejected_to_approved = 0
+    group_updates: list[dict[str, Any]] = []
+    labels_to_insert: list[dict[str, Any]] = []
+    reviews_to_insert: list[dict[str, Any]] = []
     for decision in document.decisions:
         group = by_vk[decision.vk_id]
         actual_approved = group.classification_status == ClassificationStatus.APPROVED
@@ -288,36 +307,65 @@ async def import_reclassification(session: AsyncSession, source: Path) -> dict[s
         if decision.food_service and not actual_approved:
             rejected_to_approved += 1
 
-        await session.execute(
-            update(GroupCandidate)
-            .where(GroupCandidate.id == group.id)
-            .values(
-                classification_status=(
+        group_updates.append(
+            {
+                "target_id": group.id,
+                "target_status": (
                     ClassificationStatus.APPROVED
                     if decision.final_approved
                     else ClassificationStatus.REJECTED
                 ),
-                confidence=decision.confidence,
-            )
+                "target_confidence": decision.confidence,
+            }
         )
         for label in decision.final_labels:
-            await session.execute(
-                insert(GroupLabel)
-                .values(group_id=group.id, label=label)
-                .on_conflict_do_nothing(index_elements=[GroupLabel.group_id, GroupLabel.label])
+            labels_to_insert.append(
+                {
+                    "group_id": group.id,
+                    "label": label,
+                }
             )
-        session.add(
-            ClassificationReview(
-                operation_id=document.operation_id,
-                group_id=group.id,
-                previous_approved=decision.previous_approved,
-                previous_labels=sorted(decision.previous_labels),
-                food_service=decision.food_service,
-                final_approved=decision.final_approved,
-                final_labels=sorted(decision.final_labels),
-                confidence=decision.confidence,
-                reason=decision.reason,
-                source=document.source,
+        reviews_to_insert.append(
+            {
+                "operation_id": document.operation_id,
+                "group_id": group.id,
+                "previous_approved": decision.previous_approved,
+                "previous_labels": sorted(decision.previous_labels),
+                "food_service": decision.food_service,
+                "final_approved": decision.final_approved,
+                "final_labels": sorted(decision.final_labels),
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+                "source": document.source,
+            }
+        )
+
+    group_candidate_table = cast(Table, GroupCandidate.__table__)
+    group_label_table = cast(Table, GroupLabel.__table__)
+    classification_review_table = cast(Table, ClassificationReview.__table__)
+    group_update = (
+        update(group_candidate_table)
+        .where(GroupCandidate.id == bindparam("target_id"))
+        .values(
+            classification_status=bindparam("target_status"),
+            confidence=bindparam("target_confidence"),
+        )
+    )
+    for start in range(0, len(group_updates), RECLASSIFICATION_WRITE_BATCH_SIZE):
+        await session.execute(
+            group_update,
+            group_updates[start : start + RECLASSIFICATION_WRITE_BATCH_SIZE],
+        )
+    for start in range(0, len(labels_to_insert), RECLASSIFICATION_WRITE_BATCH_SIZE):
+        await session.execute(
+            insert(group_label_table)
+            .values(labels_to_insert[start : start + RECLASSIFICATION_WRITE_BATCH_SIZE])
+            .on_conflict_do_nothing(index_elements=[GroupLabel.group_id, GroupLabel.label])
+        )
+    for start in range(0, len(reviews_to_insert), RECLASSIFICATION_WRITE_BATCH_SIZE):
+        await session.execute(
+            insert(classification_review_table).values(
+                reviews_to_insert[start : start + RECLASSIFICATION_WRITE_BATCH_SIZE]
             )
         )
     await session.commit()

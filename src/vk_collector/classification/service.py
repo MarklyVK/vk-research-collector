@@ -5,10 +5,10 @@ import uuid
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ValidationError
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import Table, bindparam, delete, exists, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from vk_collector.classification.schemas import (
@@ -180,23 +180,40 @@ async def import_classification(session: AsyncSession, source: Path) -> int:
                 )
         return 0
 
+    group_updates: list[dict[str, Any]] = []
+    labels_to_insert: list[dict[str, Any]] = []
     for decision in decisions:
         group_id = internal_by_vk[decision.vk_id]
-        await session.execute(
-            update(GroupCandidate)
-            .where(GroupCandidate.id == group_id)
-            .values(
-                classification_status=(
+        group_updates.append(
+            {
+                "target_id": group_id,
+                "target_status": (
                     ClassificationStatus.APPROVED
                     if decision.approved
                     else ClassificationStatus.REJECTED
                 ),
-                confidence=decision.confidence,
-            )
+                "target_confidence": decision.confidence,
+            }
         )
-        await session.execute(delete(GroupLabel).where(GroupLabel.group_id == group_id))
         for label in sorted(decision.labels if decision.approved else set()):
-            session.add(GroupLabel(group_id=group_id, label=label))
+            labels_to_insert.append({"group_id": group_id, "label": label})
+
+    group_candidate_table = cast(Table, GroupCandidate.__table__)
+    group_label_table = cast(Table, GroupLabel.__table__)
+    await session.execute(
+        update(group_candidate_table)
+        .where(GroupCandidate.id == bindparam("target_id"))
+        .values(
+            classification_status=bindparam("target_status"),
+            confidence=bindparam("target_confidence"),
+        ),
+        group_updates,
+    )
+    await session.execute(
+        delete(group_label_table).where(GroupLabel.group_id.in_(list(internal_by_vk.values())))
+    )
+    if labels_to_insert:
+        await session.execute(insert(group_label_table).values(labels_to_insert))
     batch.imported_at = datetime.now(UTC)
     await session.commit()
     return len(decisions)

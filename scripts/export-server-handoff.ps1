@@ -1,10 +1,11 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ServerUser,
     [string]$ServerHost,
     [string]$RemoteDirectory = "/opt/vk-research-collector/backups",
     [string]$RunId,
-    [string]$OutputDirectory = "backups"
+    [string]$OutputDirectory = "backups",
+    [switch]$SkipUpload
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,10 +35,18 @@ function Get-EnvValue {
 
 function Get-ClassificationCounts {
     $lines = Invoke-DockerCompose run --rm collector classification summary
-    $counts = @{ pending = 0; approved = 0; rejected = 0 }
+    $counts = @{
+        pending = 0
+        approved = 0
+        rejected = 0
+        approved_by_label = [ordered]@{}
+    }
     foreach ($line in $lines) {
         if ($line -match "^(Pending|Approved|Rejected):\s+(\d+)$") {
             $counts[$matches[1].ToLowerInvariant()] = [int]$matches[2]
+        }
+        elseif ($line -match "^\s{2}([a-z_]+):\s+(\d+)$") {
+            $counts.approved_by_label[$matches[1]] = [int]$matches[2]
         }
     }
     return $counts
@@ -46,9 +55,20 @@ function Get-ClassificationCounts {
 if ([string]::IsNullOrWhiteSpace($ServerUser) -xor [string]::IsNullOrWhiteSpace($ServerHost)) {
     throw "Для передачи укажите одновременно -ServerUser и -ServerHost."
 }
+if ($SkipUpload -and -not [string]::IsNullOrWhiteSpace($ServerHost)) {
+    throw "-SkipUpload нельзя использовать вместе с -ServerUser/-ServerHost."
+}
 
-& docker info *> $null
-if ($LASTEXITCODE -ne 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "Continue"
+    & docker info 2> $null | Out-Null
+    $dockerInfoExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($dockerInfoExitCode -ne 0) {
     throw "Docker не запущен."
 }
 Invoke-DockerCompose config --quiet
@@ -74,6 +94,13 @@ if ([string]::IsNullOrWhiteSpace($RunId)) {
 }
 
 $classification = Get-ClassificationCounts
+$alembicText = (Invoke-DockerCompose run --rm collector alembic current) -join "`n"
+$alembicRevision = if ($alembicText -match "(?m)^([0-9]{8}_[0-9]{4})\s") {
+    $matches[1]
+}
+else {
+    throw "Не удалось определить текущую ревизию Alembic."
+}
 $database = Get-EnvValue -Name "POSTGRES_DB" -Default "vk_research"
 $databaseUser = Get-EnvValue -Name "POSTGRES_USER" -Default "vk_collector"
 $timestamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmssZ")
@@ -116,16 +143,18 @@ $manifest = [ordered]@{
     sha256 = $sha256
     database = $database
     run_id = $RunId
+    alembic_revision = $alembicRevision
     classification = [ordered]@{
         approved = $classification.approved
         rejected = $classification.rejected
         pending = $classification.pending
+        approved_by_label = $classification.approved_by_label
     }
     collection_status = $collectionStatus
 }
 $manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
-if (-not [string]::IsNullOrWhiteSpace($ServerHost)) {
+if (-not $SkipUpload -and -not [string]::IsNullOrWhiteSpace($ServerHost)) {
     $remote = "${ServerUser}@${ServerHost}:$RemoteDirectory/"
     & scp -- $dumpPath $manifestPath $remote
     if ($LASTEXITCODE -ne 0) {
