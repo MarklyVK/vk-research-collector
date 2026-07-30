@@ -37,18 +37,13 @@ def _add_search_run_columns(bind: sa.Connection) -> None:
 def upgrade() -> None:
     bind = op.get_bind()
     op.execute("ALTER TABLE group_labels DROP CONSTRAINT IF EXISTS label_allowed")
-    op.execute(
-        "ALTER TABLE group_labels DROP CONSTRAINT IF EXISTS ck_group_labels_label_allowed"
-    )
+    op.execute("ALTER TABLE group_labels DROP CONSTRAINT IF EXISTS ck_group_labels_label_allowed")
     op.create_check_constraint("label_allowed", "group_labels", f"label IN {_ALLOWED_SQL}")
     op.execute("ALTER TABLE search_keywords DROP CONSTRAINT IF EXISTS subject_allowed")
     op.execute(
-        "ALTER TABLE search_keywords "
-        "DROP CONSTRAINT IF EXISTS ck_search_keywords_subject_allowed"
+        "ALTER TABLE search_keywords DROP CONSTRAINT IF EXISTS ck_search_keywords_subject_allowed"
     )
-    op.create_check_constraint(
-        "subject_allowed", "search_keywords", f"subject IN {_ALLOWED_SQL}"
-    )
+    op.create_check_constraint("subject_allowed", "search_keywords", f"subject IN {_ALLOWED_SQL}")
     _add_search_run_columns(bind)
     models.SearchRunGroup.__table__.create(bind, checkfirst=True)
     models.ClassificationReview.__table__.create(bind, checkfirst=True)
@@ -86,14 +81,11 @@ def downgrade() -> None:
             op.drop_column("search_runs", name)
     op.execute("ALTER TABLE search_keywords DROP CONSTRAINT IF EXISTS subject_allowed")
     op.execute(
-        "ALTER TABLE search_keywords "
-        "DROP CONSTRAINT IF EXISTS ck_search_keywords_subject_allowed"
+        "ALTER TABLE search_keywords DROP CONSTRAINT IF EXISTS ck_search_keywords_subject_allowed"
     )
     op.create_check_constraint(
         "subject_allowed", "search_keywords", f"subject IN {_OLD_ALLOWED_SQL}"
     )
     op.execute("ALTER TABLE group_labels DROP CONSTRAINT IF EXISTS label_allowed")
-    op.execute(
-        "ALTER TABLE group_labels DROP CONSTRAINT IF EXISTS ck_group_labels_label_allowed"
-    )
+    op.execute("ALTER TABLE group_labels DROP CONSTRAINT IF EXISTS ck_group_labels_label_allowed")
     op.create_check_constraint("label_allowed", "group_labels", f"label IN {_OLD_ALLOWED_SQL}")

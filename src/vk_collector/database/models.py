@@ -151,12 +151,8 @@ class SearchRun(TimestampMixin, Base):
         JSONB, nullable=False, default=dict, server_default="{}"
     )
     api_results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    private_results_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0"
-    )
-    deleted_results_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0"
-    )
+    private_results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    deleted_results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     error_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
 
@@ -285,8 +281,7 @@ class GroupLabel(Base):
     __table_args__ = (
         UniqueConstraint("group_id", "label"),
         CheckConstraint(
-            "label IN ('food_delivery', 'customer_acquisition', 'tender_support', "
-            "'food_service')",
+            "label IN ('food_delivery', 'customer_acquisition', 'tender_support', 'food_service')",
             name="label_allowed",
         ),
         Index("ix_group_labels_label", "label"),

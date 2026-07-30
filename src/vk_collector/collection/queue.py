@@ -23,6 +23,7 @@ from vk_collector.database.models import (
     GroupLabel,
     JobStatus,
 )
+from vk_collector.subjects import SUBJECT_NAMES
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,7 @@ class PlanPreview:
     scopes: tuple[str, ...]
     jobs: int
     estimated_requests: int
+    estimated_disk_growth_bytes: int = 0
     warnings: tuple[str, ...] = ()
 
 
@@ -82,7 +84,7 @@ class CollectionQueue:
             labels.setdefault(group_id, set()).add(label)
         rng = random.Random(self._settings.collection_pilot_seed)
         selected: set[int] = set()
-        for label in ("food_delivery", "customer_acquisition", "tender_support"):
+        for label in SUBJECT_NAMES:
             candidates = sorted(group_id for group_id, values in labels.items() if label in values)
             rng.shuffle(candidates)
             selected.update(candidates[: self._settings.collection_pilot_groups_per_category])
@@ -118,9 +120,53 @@ class CollectionQueue:
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
         }
 
-    async def preview(self, *, pilot: bool = False) -> PlanPreview:
+    async def incremental_group_ids(self, baseline_run_id: uuid.UUID) -> list[int]:
+        """Вернуть approved-группы вне неизменяемого snapshot основного run."""
+        async with self._sessions() as session:
+            baseline = await session.get(CollectionRun, baseline_run_id)
+            if baseline is None:
+                raise ValueError("Базовый collection run не найден")
+            baseline_ids = select(CollectionJob.entity_id).where(
+                CollectionJob.collection_run_id == baseline_run_id,
+                CollectionJob.entity_type == "group",
+            )
+            return list(
+                (
+                    await session.scalars(
+                        select(GroupCandidate.id)
+                        .where(
+                            GroupCandidate.classification_status == ClassificationStatus.APPROVED,
+                            GroupCandidate.id.not_in(baseline_ids),
+                        )
+                        .order_by(GroupCandidate.id)
+                    )
+                ).all()
+            )
+
+    async def _estimated_incremental_bytes(
+        self, baseline_run_id: uuid.UUID, selected_groups: int
+    ) -> int:
+        async with self._sessions() as session:
+            baseline = await session.get(CollectionRun, baseline_run_id)
+            if baseline is None:
+                raise ValueError("Базовый collection run не найден")
+            projected = baseline.configuration.get("projected_database_bytes")
+            group_count = baseline.configuration.get("group_count")
+            if isinstance(projected, int) and isinstance(group_count, int) and group_count > 0:
+                return int(projected / group_count * selected_groups)
+        return selected_groups * 512 * 1024
+
+    async def preview(
+        self, *, pilot: bool = False, incremental_from: uuid.UUID | None = None
+    ) -> PlanPreview:
         all_ids = await self.approved_group_ids()
-        ids = await self.pilot_group_ids() if pilot else all_ids
+        ids = (
+            await self.incremental_group_ids(incremental_from)
+            if incremental_from is not None
+            else await self.pilot_group_ids()
+            if pilot
+            else all_ids
+        )
         scopes = self.enabled_scopes()
         initial = sum(scope in scopes for scope in ("groups", "posts", "members"))
         jobs = len(ids) * initial
@@ -143,14 +189,39 @@ class CollectionQueue:
             warnings.append("Подписки требуют отдельного capacity gate.")
         if not pilot:
             warnings.append("Full plan разрешён только после успешного pilot capacity gate.")
-        return PlanPreview(len(all_ids), len(ids), scopes, jobs, requests, tuple(warnings))
+        estimated_disk = (
+            await self._estimated_incremental_bytes(incremental_from, len(ids))
+            if incremental_from is not None
+            else 0
+        )
+        if incremental_from is not None:
+            warnings = ["Incremental plan разрешён только после успешного аудита и capacity gate."]
+        return PlanPreview(
+            len(all_ids), len(ids), scopes, jobs, requests, estimated_disk, tuple(warnings)
+        )
 
-    async def plan(self, *, pilot: bool = False) -> uuid.UUID:
-        ids = await self.pilot_group_ids() if pilot else await self.approved_group_ids()
+    async def plan(
+        self,
+        *,
+        pilot: bool = False,
+        incremental_from: uuid.UUID | None = None,
+        reason: str | None = None,
+        source: str | None = None,
+        capacity_passed: bool = False,
+        estimated_disk_growth_bytes: int = 0,
+    ) -> uuid.UUID:
+        ids = (
+            await self.incremental_group_ids(incremental_from)
+            if incremental_from is not None
+            else await self.pilot_group_ids()
+            if pilot
+            else await self.approved_group_ids()
+        )
         scopes = self.enabled_scopes()
         collection_configuration = self.collection_configuration()
         key_payload = {
             "pilot": pilot,
+            "incremental_from": str(incremental_from) if incremental_from else None,
             "group_ids": ids,
             "collection": collection_configuration,
         }
@@ -158,28 +229,50 @@ class CollectionQueue:
             json.dumps(key_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
         async with self._sessions() as session:
+            reusable_statuses = [
+                CollectionRunStatus.PLANNED,
+                CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+            ]
+            if incremental_from is not None:
+                reusable_statuses.extend(
+                    [
+                        CollectionRunStatus.RUNNING,
+                        CollectionRunStatus.COMPLETED,
+                        CollectionRunStatus.COMPLETED_WITH_ERRORS,
+                    ]
+                )
             existing = await session.scalar(
                 select(CollectionRun).where(
-                    CollectionRun.status.in_(
-                        [
-                            CollectionRunStatus.PLANNED,
-                            CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
-                        ]
-                    ),
+                    CollectionRun.status.in_(reusable_statuses),
                     CollectionRun.configuration["plan_key"].astext == plan_key,
                 )
             )
             if existing is not None:
                 return existing.id
             run = CollectionRun(
-                scope="pilot" if pilot else "full",
-                status=CollectionRunStatus.PLANNED,
+                scope=("incremental" if incremental_from else "pilot" if pilot else "full"),
+                status=(
+                    CollectionRunStatus.PLANNED
+                    if incremental_from is None or capacity_passed
+                    else CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                ),
                 configuration={
                     "plan_key": plan_key,
                     "pilot": pilot,
                     "scopes": list(scopes),
                     "group_count": len(ids),
                     "collection": collection_configuration,
+                    **(
+                        {
+                            "baseline_run_id": str(incremental_from),
+                            "reason": reason or "food_service_increment",
+                            "source": source or "food_service_expansion",
+                            "capacity_gate": "passed" if capacity_passed else "failed",
+                            "estimated_disk_growth_bytes": estimated_disk_growth_bytes,
+                        }
+                        if incremental_from
+                        else {}
+                    ),
                 },
             )
             session.add(run)
@@ -190,9 +283,21 @@ class CollectionQueue:
                 "posts": "collect_group_posts",
                 "members": "collect_group_members",
             }
+            completed_specs: set[tuple[int, str]] = set()
+            if incremental_from is not None and ids:
+                completed_rows = (
+                    await session.execute(
+                        select(CollectionJob.entity_id, CollectionJob.job_type).where(
+                            CollectionJob.entity_type == "group",
+                            CollectionJob.entity_id.in_(ids),
+                            CollectionJob.status == JobStatus.COMPLETED,
+                        )
+                    )
+                ).all()
+                completed_specs = {(entity_id, job_type) for entity_id, job_type in completed_rows}
             for group_id in ids:
                 for scope, job_type in mapping.items():
-                    if scope in scopes:
+                    if scope in scopes and (group_id, job_type) not in completed_specs:
                         specs.append(
                             {
                                 "collection_run_id": run.id,

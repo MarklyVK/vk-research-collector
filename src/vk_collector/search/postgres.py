@@ -185,9 +185,7 @@ class PostgresSearchPersistence:
                         was_new=group.vk_id not in existing_vk_ids,
                         first_seen_at=now,
                     )
-                    .on_conflict_do_nothing(
-                        constraint="uq_search_run_groups_run_group"
-                    )
+                    .on_conflict_do_nothing(constraint="uq_search_run_groups_run_group")
                 )
             await session.execute(
                 update(SearchRunKeyword)
@@ -203,12 +201,8 @@ class PostgresSearchPersistence:
                 .where(SearchRun.id == uuid.UUID(run_id))
                 .values(
                     api_results_count=SearchRun.api_results_count + page.raw_count,
-                    private_results_count=(
-                        SearchRun.private_results_count + page.private_count
-                    ),
-                    deleted_results_count=(
-                        SearchRun.deleted_results_count + page.deleted_count
-                    ),
+                    private_results_count=(SearchRun.private_results_count + page.private_count),
+                    deleted_results_count=(SearchRun.deleted_results_count + page.deleted_count),
                 )
             )
             await session.commit()

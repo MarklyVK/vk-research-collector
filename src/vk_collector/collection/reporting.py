@@ -36,12 +36,12 @@ async def latest_run_id(
 async def latest_runnable_run_id(
     sessions: async_sessionmaker[AsyncSession],
 ) -> uuid.UUID | None:
-    """Найти последний разрешённый full run для автономного worker."""
+    """Найти последний разрешённый full/incremental run для автономного worker."""
     async with sessions() as session:
         run_id: uuid.UUID | None = await session.scalar(
             select(CollectionRun.id)
             .where(
-                CollectionRun.scope == "full",
+                CollectionRun.scope.in_(["full", "incremental"]),
                 CollectionRun.status.in_(
                     [CollectionRunStatus.PLANNED, CollectionRunStatus.RUNNING]
                 ),
@@ -233,7 +233,7 @@ async def capacity_gate_passed(
         run = await session.get(CollectionRun, run_id)
         return bool(
             run
-            and run.scope == "full"
+            and run.scope in {"full", "incremental"}
             and run.configuration.get("capacity_gate") == "passed"
             and run.status
             in {

@@ -131,9 +131,7 @@ def load_keyword_config(path: Path = Path("config/keywords.yml")) -> KeywordConf
             identity = _keyword_identity(value)
             previous = seen.get(identity)
             if previous is not None:
-                raise ValueError(
-                    f"Дублирующееся ключевое слово {value!r}: {previous} и {subject}"
-                )
+                raise ValueError(f"Дублирующееся ключевое слово {value!r}: {previous} и {subject}")
             seen[identity] = subject
             keywords.append(Keyword(subject=subject, keyword=value))
 

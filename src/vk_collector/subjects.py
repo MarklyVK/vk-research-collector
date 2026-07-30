@@ -1,9 +1,9 @@
 """Единый реестр поддерживаемых предметных областей."""
 
 from enum import StrEnum
-from typing import Literal, TypeAlias
+from typing import Literal
 
-SubjectName: TypeAlias = Literal[
+type SubjectName = Literal[
     "food_delivery",
     "customer_acquisition",
     "tender_support",
