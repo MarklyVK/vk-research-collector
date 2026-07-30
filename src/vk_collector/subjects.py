@@ -1,7 +1,7 @@
 """Единый реестр поддерживаемых предметных областей."""
 
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, cast
 
 type SubjectName = Literal[
     "food_delivery",
@@ -48,4 +48,4 @@ def ensure_subject(value: str) -> SubjectName:
     if value not in SUBJECT_NAMES:
         allowed = ", ".join(SUBJECT_NAMES)
         raise ValueError(f"Неизвестная предметная область {value!r}; разрешены: {allowed}")
-    return value  # type: ignore[return-value]
+    return cast(SubjectName, value)
