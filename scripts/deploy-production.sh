@@ -11,7 +11,7 @@ IMAGE="${COLLECTOR_IMAGE:-}"
 EXPECTED_IMAGE_DIGEST="${COLLECTOR_IMAGE_DIGEST:-}"
 GIT_SHA="${DEPLOY_GIT_SHA:-}"
 EXPECTED_USER="${DEPLOY_USER:-deploy}"
-BACKUP_KEEP="${PREDEPLOY_BACKUP_KEEP:-5}"
+BACKUP_KEEP="${PREDEPLOY_BACKUP_KEEP:-1}"
 PROGRESS_WAIT="${DEPLOY_PROGRESS_WAIT_SECONDS:-20}"
 WORKER_STOP_TIMEOUT="${DEPLOY_WORKER_STOP_TIMEOUT_SECONDS:-360}"
 LOCK_FILE=""
@@ -110,6 +110,19 @@ compose() {
     -f "$DEPLOY_DIR/compose.yaml" \
     -f "$DEPLOY_DIR/compose.production.yaml" \
     "$@"
+}
+
+stop_worker_on_critical_disk() {
+  local used=$1 stage=$2
+  if (( used < DISK_STOP )); then
+    return 0
+  fi
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    log "Диск заполнен на ${used}% (${stage}); collector-worker останавливается."
+    compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker || true
+  fi
+  ROLLBACK_ALLOWED=0
+  die "Критическое заполнение диска: ${used}% (stop=${DISK_STOP}%, stage=${stage})."
 }
 
 service_state() {
@@ -288,13 +301,7 @@ DISK_WARNING=${DISK_WARNING:-85}
 DISK_STOP=${DISK_STOP:-95}
 DISK_USED=${DEPLOY_DISK_USED_PERCENT_OVERRIDE:-$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')}
 [[ "$DISK_USED" =~ ^[0-9]+$ ]] || die 'Не удалось определить заполнение диска.'
-if (( DISK_USED >= DISK_STOP )); then
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    log "Диск заполнен на ${DISK_USED}%; collector-worker останавливается до скачивания image."
-    compose stop collector-worker || true
-  fi
-  die "Критическое заполнение диска: ${DISK_USED}% (stop=${DISK_STOP}%)."
-fi
+stop_worker_on_critical_disk "$DISK_USED" preflight
 if (( DISK_USED >= DISK_WARNING )); then
   die "Диск заполнен на ${DISK_USED}% (warning=${DISK_WARNING}%); image не скачивался."
 fi
@@ -348,10 +355,20 @@ for old_backup in "${OLD_BACKUPS[@]}"; do
   [[ "$old_backup" == "$BACKUP_FILE" ]] || rm -f -- "$old_backup"
 done
 
+DISK_AFTER_BACKUP=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+stop_worker_on_critical_disk "$DISK_AFTER_BACKUP" post-backup
+(( DISK_AFTER_BACKUP < DISK_WARNING )) \
+  || die "После ротации backup диск заполнен на ${DISK_AFTER_BACKUP}%; image не скачивался."
+
 atomic_text "$DEPLOY_DIR/.deploy/previous-image" "$PREVIOUS_IMAGE"
 log 'Скачивается неизменяемый SHA image.'
 docker pull "$IMAGE"
 verify_local_image
+DISK_AFTER_PULL=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+stop_worker_on_critical_disk "$DISK_AFTER_PULL" post-pull
+if (( DISK_AFTER_PULL >= DISK_WARNING )); then
+  log "После pull диск заполнен на ${DISK_AFTER_PULL}%; deployment продолжается без удаления данных."
+fi
 
 fast_forward_checkout
 compose config --quiet
@@ -432,7 +449,7 @@ if [[ -n "$RUN_ID" ]]; then
 fi
 
 DISK_AFTER=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
-(( DISK_AFTER < DISK_STOP )) || die "После deployment диск достиг stop threshold: ${DISK_AFTER}%"
+stop_worker_on_critical_disk "$DISK_AFTER" post-deployment
 
 REPORT_STATUS=success
 ROLLBACK_ALLOWED=0

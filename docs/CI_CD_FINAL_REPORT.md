@@ -26,8 +26,8 @@ Secrets находятся только в `/opt/vk-research-collector/.env` и
 
 Перед миграциями создаётся
 `backups/predeploy-YYYYMMDD-HHMMSSZ-FULL_SHA.dump` командой `pg_dump -Fc`, затем
-обязательны `test -s` и `pg_restore --list`. Ротируются только predeploy backups;
-последние пять сохраняются.
+обязательны `test -s` и `pg_restore --list`. Ротируются только predeploy backups; на
+малом production-диске сохраняется последний проверенный backup.
 
 Worker останавливается отдельно с graceful timeout 360 секунд. Выполняются
 `alembic current`, `alembic upgrade head` и `alembic check`; downgrade отсутствует.

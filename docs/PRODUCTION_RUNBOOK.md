@@ -27,8 +27,9 @@ deployment на self-hosted runner. Predeploy backup:
 /opt/vk-research-collector/backups/predeploy-YYYYMMDD-HHMMSSZ-FULL_SHA.dump
 ```
 
-Хранятся пять последних `predeploy-*`; manual, handoff и `server-before-handoff-*`
-скрипт не ротирует. При 85% диска deploy прекращается до pull. При 95% дополнительно
+Хранится последний проверенный `predeploy-*`; manual, handoff и
+`server-before-handoff-*` скрипт не ротирует. При 85% диска deploy прекращается до
+pull. После backup и pull пороги проверяются повторно. При 95% дополнительно
 останавливается worker. PostgreSQL остаётся запущенным.
 
 ## Ошибки

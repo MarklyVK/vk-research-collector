@@ -83,7 +83,8 @@ pull-request jobs или непроверенным workflow.
 4. Проверяет отсутствие tracked-изменений и обновляет production checkout только
    fast-forward до exact SHA из GitHub checkout; untracked `.env`, `secrets` и
    `runner/` не затрагиваются.
-5. Создаёт и проверяет `pg_dump -Fc`; оставляет пять последних predeploy backup.
+5. Создаёт и проверяет `pg_dump -Fc`; на сервере 8,4 GB оставляет только последний
+   predeploy backup, а manual/handoff backups не ротирует.
 6. Скачивает SHA-image, сверяет digest/revision и останавливает только worker с
    graceful timeout 360 секунд.
 7. Выполняет Alembic upgrade/check и запускает только worker с `--no-deps --no-build`;

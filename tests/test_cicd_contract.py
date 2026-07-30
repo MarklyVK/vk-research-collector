@@ -110,6 +110,10 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "verify_local_image",
         "org.opencontainers.image.revision",
         "EXPECTED_IMAGE_DIGEST",
+        'BACKUP_KEEP="${PREDEPLOY_BACKUP_KEEP:-1}"',
+        "stop_worker_on_critical_disk",
+        "DISK_AFTER_BACKUP",
+        "DISK_AFTER_PULL",
     )
     assert all(item in text for item in required)
     assert "alembic downgrade" not in text
