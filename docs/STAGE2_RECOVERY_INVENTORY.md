@@ -31,3 +31,38 @@ Recovery-артефакты (исключены из Git):
   worktree; все patch-файлы пусты, в `main-untracked.txt` указан только `collector.zip`;
 - `backups/stage2-recovery-20260728-082608Z.dump` — проверенный PostgreSQL backup.
 
+## Повторная проверка после сбоя 30.07.2026
+
+Основной репозиторий повторно подтверждён командой `git rev-parse --show-toplevel`:
+`C:\data\vk-research-collector`. Перед продолжением создан и проверен полный bundle
+`backups/recovery/session-20260730-161745Z/pre-second-recovery.bundle`, а также
+сохранены status, staged/unstaged patch, список untracked, log и reflog. Stale lock,
+незавершённых merge/cherry-pick/rebase и активных Git-процессов не было.
+
+| Источник | Путь | Ветка | HEAD при аудите | Незакоммиченные / новые файлы | Подсистема | Качество | Нужно интегрировать |
+|---|---|---|---|---|---|---|---|
+| основной репозиторий | `C:\data\vk-research-collector` | `feat/approved-data-collection` | `49e86bc` | worker, integration test, final report / `collector.zip` | restart/resume | complete после тестов | да, commit `797194e` |
+| live worktree | `C:\data\vk-research-worktrees\agent-a-db` | `codex/agent-a-db` | `93b2732` | нет / нет | PostgreSQL stage 1 | duplicate | нет |
+| live worktree | `C:\data\vk-research-worktrees\agent-b-vk` | `codex/agent-b-vk` | `c53f312` | нет / нет | VK client/search | duplicate | нет |
+| live worktree | `C:\data\vk-research-worktrees\agent-d-infra` | `codex/agent-d-infra` | `71d0774` | нет / нет | Docker/CI | duplicate | нет |
+| live worktree | `C:\data\vk-research-worktrees\agent-e-audit` | `codex/agent-e-audit` | `250d385` | нет / нет | audit/tests | duplicate | нет |
+| архив worktree | `C:\data\vk-research-recovery-worktrees-20260728-1323.zip` | неприменимо | неприменимо | caches и копии worktree | recovery archive | obsolete | нет |
+| распакованный архив | `C:\data\vk-research-recovery-worktrees-20260728-1323` | повреждённые `.git`-ссылки | неприменимо | копии четырёх worktree | recovery archive | duplicate | нет |
+
+Текущий статус компонентов после повторной проверки:
+
+| Компонент | Статус | Проверка / примечание |
+|---|---|---|
+| Проектная документация | complete | requirements, architecture, data model, operations, privacy, recovery, gap и final report |
+| Модели PostgreSQL и Alembic | complete | head `20260728_0004`, `alembic check` без новых операций |
+| Collection run/jobs, locking, lease recovery | complete | PostgreSQL `SKIP LOCKED`, heartbeat и периодический recovery просроченного lease |
+| VK client и token pool | complete | cooldown, invalid-token isolation, jitter retry, masking |
+| Posts и attachments | complete | реальный сбор работает, fake pagination/upsert покрыты тестами |
+| Members, profiles и subscriptions | complete | subscriptions реализованы и fake-tested, production scope выключен capacity gate |
+| CLI, privacy CLI | complete | plan/run/status/pause/resume/retry/verify/summary и inspect/delete controls |
+| Docker worker и disk guard | complete | новый image проверен stop/recreate/resume, `restart: unless-stopped` |
+| Telegram | complete | best-effort и failure isolation |
+| Unit/integration/fake VK | complete | 21 local и 23 container tests |
+| CI | unverified | workflow существует; remote run невозможен без запрещённого `git push`, локальные эквиваленты passed |
+| Pilot и capacity gate | complete | repilot 35 групп, прогноз 3,89 GiB, безопасные лимиты 100/200 |
+| Operations documentation | complete | Debian 12, worker, monitoring, pause/resume и backup |

@@ -1,6 +1,7 @@
 # Итоговый отчёт второго этапа
 
-Дата: 28.07.2026. Ветка: `feat/approved-data-collection`.
+Дата первоначального завершения: 28.07.2026. Повторная recovery-проверка: 30.07.2026.
+Ветка: `feat/approved-data-collection`.
 
 ## Итоговый статус
 
@@ -14,6 +15,11 @@
 очередь, lease, checkpoints и прогресс в PostgreSQL. Старый опасный run
 `301fe7a5-be50-4b31-9640-147e067c4045` сохранён в `paused_capacity_limit` и не
 используется.
+
+После повторного аварийного запуска 30.07 восстановлен незакоммиченный lease-recovery
+loop: worker периодически возвращает просроченные jobs во время собственной работы,
+а не только один раз при старте. Исправление зафиксировано в `797194e`, новый image
+развёрнут, тот же основной run продолжен.
 
 ## 1–6. Recovery и завершённая реализация
 
@@ -36,6 +42,12 @@ untracked `collector.zip`; он содержит `.env` и поэтому не �
 `71d0774`; в достижимом commit исправлены deploy workflow и smoke script, поэтому
 `e3ecb16` обоснованно отброшен. Незавершённых merge/cherry-pick/rebase, stale lock,
 stash и потерянных незакоммиченных исходников не было.
+
+Повторный `git fsck` 30.07 дополнительно показал `21b378c` и `14010bf`: это
+предшественники достижимых, исправленных commits `4f8e938` и `e2a6371`. Они также не
+восстанавливались. Проверен точный архив
+`C:\data\vk-research-recovery-worktrees-20260728-1323.zip`; новых исходников в нём
+нет.
 
 Agent-ветки ранее уже были семантически объединены в stage 1 commits `a50e79a`,
 `1687356`, `dd6c1b6`, `c4708a8` и `75b4095`; повторный blind cherry-pick не выполнялся.
@@ -157,6 +169,20 @@ recreate продолжил тот же run и довёл счётчик выш�
 После перезагрузки Windows worker продолжится после запуска Docker Desktop; на Debian
 нужны enabled Docker service и Compose unit из operations guide.
 
+Повторный контрольный stop/recreate на новом image 30.07.2026:
+
+| Показатель | До recreate | Через 8 секунд после recreate |
+|---|---:|---:|
+| completed jobs | 12 361 | 12 380 |
+| pending jobs | 24 413 | 24 394 |
+| retries | 5 | 5 |
+| failed / duplicates / rejected jobs | 0 | 0 |
+
+Следующий согласованный снимок во время волны постов: 12 452 completed, 24 322
+pending, 6 running, 5 retries; 18 329 posts, 31 989 attachments, 12 316 memberships,
+12 285 users и 0 subscriptions. Размер БД — 165 198 871 байт, disk used — 83,0%.
+Значения продолжают меняться, потому что worker работает.
+
 Disk warning=85%, stop=95%. Текущие 83,5% ниже warning, но близки к нему; worker
 проверяет диск перед тяжёлыми jobs, однократно уведомляет о warning и ставит run на
 паузу при stop threshold.
@@ -175,6 +201,7 @@ Disk warning=85%, stop=95%. Текущие 83,5% ниже warning, но близ
 | `backups/stage2-repilot-20260728-083636Z.dump` | 21 578 639 | до repilot |
 | `backups/stage2-pre-full-20260728-083901Z.dump` | 25 012 235 | до нового full run |
 | `backups/recovery/pre-stage2-recovery.bundle` | проверен | все Git refs до продолжения |
+| `backups/recovery/session-20260730-161745Z/pre-second-recovery.bundle` | 314 074 | все Git refs и незакоммиченный checkpoint перед повторной recovery |
 
 В `backups/recovery/` также сохранены staged/unstaged patch и untracked inventory для
 каждого worktree. Каталог исключён из Git.
@@ -191,7 +218,9 @@ Disk warning=85%, stop=95%. Текущие 83,5% ниже warning, но близ
 - `4f8e938 fix: enforce safe autonomous collection`;
 - `e2a6371 feat: add autonomous worker observability`;
 - `6672f74 fix: jitter transient VK retries`;
-- финальный documentation commit с этим отчётом.
+- `49e86bc docs: record completed stage two launch`;
+- `797194e fix: recover expired leases during worker lifetime`;
+- финальный documentation commit повторной recovery с этим отчётом.
 
 `git push` не выполнялся.
 
