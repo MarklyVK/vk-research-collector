@@ -39,6 +39,9 @@ Privacy-команды показывают только агрегаты: `coll
 Частоту запросов, concurrency и лимиты сущностей меняют через `.env`, пересборка образа
 не нужна. Команды перечислены в `Makefile`; stage 2 описан в
 `docs/STAGE2_OPERATIONS.md`, эксплуатация сервера — в `docs/OPERATIONS_DEBIAN12.md`.
+Полный CI/CD и production bootstrap описаны в
+`docs/GITHUB_ACTIONS_DEPLOYMENT.md` и `docs/SERVER_BOOTSTRAP.md`; перенос существующей
+БД — в `docs/DATABASE_HANDOFF.md`.
 
 ## Внимание: порт PostgreSQL
 

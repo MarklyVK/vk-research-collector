@@ -12,7 +12,6 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   PYTHON_VERSION: "3.12"
@@ -86,6 +85,9 @@ jobs:
     name: Опубликовать production image
     needs: quality
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     outputs:
       image: ${{ steps.image.outputs.ref }}
     steps:
@@ -97,9 +99,11 @@ jobs:
         run: |
           set -Eeuo pipefail
           repository="${GITHUB_REPOSITORY,,}"
-          echo "name=ghcr.io/${repository}/collector" >> "$GITHUB_OUTPUT"
-          echo "ref=ghcr.io/${repository}/collector:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=ghcr.io/${repository}/collector"
+            echo "ref=ghcr.io/${repository}/collector:sha-${GITHUB_SHA}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
       - name: Войти в GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:

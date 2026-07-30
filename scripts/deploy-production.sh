@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Markdown backticks in printf formats are intentional.
 set -Eeuo pipefail
 
 umask 077
@@ -378,14 +379,19 @@ if [[ -n "$RUN_ID" ]]; then
 
   sleep "$PROGRESS_WAIT"
   FINAL_STATUS_JSON=$(compose run --rm collector collection status --run-id "$RUN_ID")
+  RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_COMPLETED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number completed || true)
   FINAL_PENDING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number pending || true)
   FINAL_RUNNING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number running || true)
   FINAL_RETRY=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number retry_wait || true)
+  FINAL_FAILED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number failed || true)
   FINAL_COMPLETED=${FINAL_COMPLETED:-0}
   FINAL_PENDING=${FINAL_PENDING:-0}
   FINAL_RUNNING=${FINAL_RUNNING:-0}
   FINAL_RETRY=${FINAL_RETRY:-0}
+  FINAL_FAILED=${FINAL_FAILED:-0}
+  [[ "$RUN_STATUS" != failed ]] || die 'Collection run перешёл в failed во время проверки прогресса.'
+  (( FINAL_FAILED <= BASELINE_FAILED )) || die 'Количество failed jobs увеличилось во время проверки прогресса.'
   if (( FINAL_COMPLETED <= BASELINE_COMPLETED && FINAL_RUNNING == 0 && FINAL_RETRY == 0 && FINAL_PENDING > 0 )); then
     die 'Worker не показал прогресс и не находится в running/retry ожидании.'
   fi

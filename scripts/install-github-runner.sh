@@ -7,9 +7,10 @@ RUNNER_USER=${RUNNER_USER:-deploy}
 RUNNER_HOME=${RUNNER_HOME:-/opt/vk-research-collector/runner}
 RUNNER_VERSION=${RUNNER_VERSION:-2.336.0}
 RUNNER_SHA256=${RUNNER_SHA256:-04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d}
-REPOSITORY_URL=${REPOSITORY_URL:-https://github.com/MarklyVK/vk-research-collector}
+EXPECTED_REPOSITORY_URL=https://github.com/MarklyVK/vk-research-collector
+REPOSITORY_URL=${REPOSITORY_URL:-$EXPECTED_REPOSITORY_URL}
 RUNNER_NAME=${RUNNER_NAME:-vk-collector-production}
-RUNNER_LABELS=${RUNNER_LABELS:-production,vk-collector}
+RUNNER_LABELS=production,vk-collector
 
 die() {
   printf 'ОШИБКА: %s\n' "$*" >&2
@@ -17,6 +18,8 @@ die() {
 }
 
 [[ $(id -u) -eq 0 ]] || die 'Запустите скрипт через sudo.'
+[[ "$REPOSITORY_URL" == "$EXPECTED_REPOSITORY_URL" ]] \
+  || die "Runner разрешено регистрировать только для $EXPECTED_REPOSITORY_URL."
 [[ "$(uname -m)" == x86_64 ]] || die 'Поддерживается только Debian x64.'
 grep -Eq '^ID=debian$' /etc/os-release || die 'Поддерживается Debian 12.'
 grep -Eq '^VERSION_ID="?12"?$' /etc/os-release || die 'Требуется Debian 12.'
@@ -57,6 +60,8 @@ unset RUNNER_TOKEN
 cd "$RUNNER_HOME"
 ./svc.sh install "$RUNNER_USER"
 ./svc.sh start
-systemctl enable "$(systemctl list-unit-files 'actions.runner*' --no-legend | awk 'NR==1 {print $1}')"
+SERVICE_UNIT=$(systemctl list-unit-files 'actions.runner*' --no-legend | awk 'NR==1 {print $1}')
+[[ -n "$SERVICE_UNIT" ]] || die 'Systemd unit GitHub Runner не найден.'
+systemctl enable "$SERVICE_UNIT"
 systemctl --no-pager status 'actions.runner*'
 printf 'Runner установлен: %s; labels: self-hosted, linux, x64, %s\n' "$RUNNER_NAME" "$RUNNER_LABELS"

@@ -64,6 +64,7 @@ docker compose exec -T postgres pg_dump -U vk_collector vk_research | gzip > vk_
 
 ## GitHub Actions
 
-Variables: `SERVER_HOST`, `SERVER_PORT=22`, `SERVER_USER`, `DEPLOY_PATH=/opt/vk-research-collector`, `POSTGRES_DB=vk_research`, `POSTGRES_USER=vk_collector`, `POSTGRES_PORT=5432`.
-
-Secrets: `DEPLOY_SSH_PRIVATE_KEY`, `POSTGRES_PASSWORD`, `POSTGRES_READER_PASSWORD`, `VK_TOKENS_B64`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. `VK_TOKENS_B64` — base64 от файла с одним токеном на строку. CI использует тестовую PostgreSQL и не требует настоящих VK-токенов.
+Production deployment выполняется repository-scoped self-hosted runner без SSH и без
+передачи runtime-секретов через GitHub. Настройка: `docs/GITHUB_ACTIONS_DEPLOYMENT.md`;
+первичный сервер: `docs/SERVER_BOOTSTRAP.md`; эксплуатация:
+`docs/PRODUCTION_RUNBOOK.md`.
