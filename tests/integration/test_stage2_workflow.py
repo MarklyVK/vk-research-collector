@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -185,6 +186,42 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                     )
                     await session.commit()
                 assert await queue.recover_expired(run_id) == 1
+
+                # Немедленный restart до истечения lease всё равно восстанавливает job
+                # в процессе долгой работы, без необходимости перезапускать worker ещё раз.
+                fast_settings = settings.model_copy(
+                    update={
+                        "collection_job_lease_seconds": 1,
+                        "collection_idle_sleep_seconds": 0.05,
+                    }
+                )
+                async with sessions() as session:
+                    recovery_run = CollectionRun(scope="pilot", status=CollectionRunStatus.PLANNED)
+                    session.add(recovery_run)
+                    await session.flush()
+                    session.add(
+                        CollectionJob(
+                            collection_run_id=recovery_run.id,
+                            job_type="refresh_group",
+                            entity_type="group",
+                            entity_id=group_id,
+                            priority=10,
+                        )
+                    )
+                    await session.commit()
+                    recovery_run_id = recovery_run.id
+                fast_queue = CollectionQueue(sessions, fast_settings)
+                assert await fast_queue.claim(recovery_run_id) is not None
+                await asyncio.wait_for(
+                    CollectionWorker(sessions, FakeVK(), fast_settings).run(
+                        recovery_run_id, until_idle=False
+                    ),
+                    timeout=4,
+                )  # type: ignore[arg-type]
+                async with sessions() as session:
+                    recovered_run = await session.get(CollectionRun, recovery_run_id)
+                    assert recovered_run is not None
+                    assert recovered_run.status == CollectionRunStatus.COMPLETED
 
                 await CollectionWorker(sessions, FakeVK(), settings).run(run_id)  # type: ignore[arg-type]
                 async with sessions() as session:

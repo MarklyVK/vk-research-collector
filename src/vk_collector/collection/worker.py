@@ -110,7 +110,17 @@ class CollectionWorker:
         tasks: set[asyncio.Task[None]] = set()
         claimed = 0
         disk_warning_sent = False
+        recovery_interval = max(
+            1.0,
+            min(60.0, self._settings.collection_job_lease_seconds / 2),
+        )
+        next_recovery_at = time.monotonic() + recovery_interval
         while stop_event is None or not stop_event.is_set():
+            if time.monotonic() >= next_recovery_at:
+                recovered = await self._queue.recover_expired(run_id)
+                if recovered:
+                    logger.warning("run=%s recovered_expired_jobs=%s", run_id, recovered)
+                next_recovery_at = time.monotonic() + recovery_interval
             disk = inspect_disk(
                 self._settings.collection_export_dir,
                 self._settings.disk_warning_percent,

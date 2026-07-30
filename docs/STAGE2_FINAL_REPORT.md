@@ -74,12 +74,20 @@ customer_acquisition=4 464, tender_support=1 382, multi-label=5.
 
 ## 11. Проверки
 
-Финальный обязательный прогон после последних изменений фиксируется в этом отчёте
-после выполнения команд: Ruff, format, mypy, local pytest, Compose config/build,
-PostgreSQL health, migration head и контейнерный pytest. Миграции чистой и рабочей БД,
-fake full path, queue lease recovery, checkpoints, restart, retries/token cooldown,
-snapshot semantics, dedupe, privacy rollback, Telegram failure isolation и capacity
-binding проверяются тестами.
+Финальный обязательный прогон после последних изменений успешен:
+
+- `ruff check .` — passed;
+- `ruff format --check .` — 67 files already formatted;
+- `mypy src` — 27 source files без ошибок;
+- local `pytest -q` — 21 passed, 2 PostgreSQL tests штатно skipped;
+- `docker compose config` и `docker compose build` — passed;
+- PostgreSQL healthy, `alembic current` — `20260728_0004 (head)`,
+  `alembic check` — no new upgrade operations;
+- Docker/PostgreSQL `pytest -q` — 23 passed.
+
+Миграции чистой и рабочей БД, fake full path, queue lease recovery, checkpoints,
+restart, retries/token cooldown, snapshot semantics, dedupe, privacy rollback,
+Telegram failure isolation и capacity binding проверены тестами.
 
 GitHub Actions содержит Ruff, format, mypy, unit/integration/fake smoke, Docker build,
 clean-DB Alembic и secret scan. Remote workflow не запускался, потому что пользователь
