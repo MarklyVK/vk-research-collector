@@ -4,6 +4,7 @@
 !.env.example
 secrets/
 .deploy-secrets/
+.deploy/
 *.pem
 *.key
 *.token
@@ -31,6 +32,8 @@ tmp/
 # PostgreSQL
 postgres_data/
 backups/
+*.dump
+*.manifest.json
 
 # Системные файлы
 .DS_Store
