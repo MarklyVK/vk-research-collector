@@ -110,6 +110,7 @@ services:
     init: true
     command: ["collection", "worker"]
     restart: unless-stopped
+    stop_grace_period: 6m
     environment:
       <<: *collector-environment
       COLLECTION_WORKER_ID: ${COLLECTION_WORKER_ID:-collector-worker-1}

@@ -21,7 +21,9 @@ ghcr.io/marklyvk/vk-research-collector/collector
 ```
 
 Tags: `sha-<полный commit SHA>`, `main`, `latest`. Deployment всегда получает только
-неизменяемый SHA-tag. `deploy` — единственный job на
+неизменяемый SHA-tag и digest, возвращённый `docker/build-push-action`. После pull
+скрипт сверяет digest и OCI label `org.opencontainers.image.revision`. `deploy` —
+единственный job на
 `[self-hosted, linux, x64, production, vk-collector]`; production verify выполняется
 внутри него. Отдельный GitHub-hosted `verify` фиксирует безопасный отчёт. Группа
 concurrency `production-deployment` и серверный `flock` исключают параллельный deploy.
@@ -44,7 +46,11 @@ GitHub environment не нуждается в VK-токенах или PostgreSQ
 /opt/vk-research-collector/secrets/vk_tokens.txt
 ```
 
-Оба файла имеют mode `600`; workflow их не создаёт и не перезаписывает.
+Оба файла имеют mode `600`; workflow их не создаёт и не перезаписывает. Token file
+принадлежит UID/GID контейнера `10001:10001`. Каталог `secrets` разрешает группе
+`vkcollector` только traversal, поэтому пользователь `deploy` может проверить наличие
+и mode файла, но не прочитать его. Каталог `exports` доступен и UID 10001, и группе
+`vkcollector`.
 
 ## Self-hosted runner
 
@@ -74,10 +80,14 @@ pull-request jobs или непроверенным workflow.
 1. Повторно подтверждает, что exact SHA принадлежит `main`.
 2. Входит в GHCR с job-scoped `GITHUB_TOKEN` только на чтение.
 3. Проверяет пользователя, файлы, mode, Compose, volume, PostgreSQL и диск.
-4. Атомарно синхронизирует только Compose, keywords и разрешённые scripts.
+4. Проверяет отсутствие tracked-изменений и обновляет production checkout только
+   fast-forward до exact SHA из GitHub checkout; untracked `.env`, `secrets` и
+   `runner/` не затрагиваются.
 5. Создаёт и проверяет `pg_dump -Fc`; оставляет пять последних predeploy backup.
-6. Скачивает SHA-image, останавливает только worker, выполняет Alembic upgrade/check.
-7. Запускает PostgreSQL и worker без `down`, проверяет health, данные и прогресс run.
+6. Скачивает SHA-image, сверяет digest/revision и останавливает только worker с
+   graceful timeout 360 секунд.
+7. Выполняет Alembic upgrade/check и запускает только worker с `--no-deps --no-build`;
+   PostgreSQL container и volume не пересоздаются.
 8. Пишет `.deploy/last-deployment.env` и GitHub Actions summary.
 
 Dry-run:
@@ -87,6 +97,7 @@ sudo -u deploy bash scripts/deploy-production.sh --dry-run \
   --source-dir "$PWD" \
   --deploy-dir /opt/vk-research-collector \
   --image ghcr.io/marklyvk/vk-research-collector/collector:sha-<FULL_SHA> \
+  --image-digest sha256:<64_HEX> \
   --git-sha <FULL_SHA>
 ```
 

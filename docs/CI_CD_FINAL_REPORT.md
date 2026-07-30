@@ -14,8 +14,9 @@ GitHub-hosted `ubuntu-latest` используют CI jobs `quality`, `postgres-
 `deploy` использует `[self-hosted, linux, x64, production, vk-collector]`.
 
 Image: `ghcr.io/marklyvk/vk-research-collector/collector`. Tags:
-`sha-<полный SHA>`, `main`, `latest`; deploy получает SHA-tag. Параллельность блокируют
-GitHub concurrency `production-deployment` и `flock` на сервере.
+`sha-<полный SHA>`, `main`, `latest`; deploy получает SHA-tag и опубликованный digest,
+после pull сверяет их с OCI revision. Параллельность блокируют GitHub concurrency
+`production-deployment` и `flock` на сервере.
 
 ## 8–12. Secrets, backup, migrations, health и rollback
 
@@ -28,8 +29,10 @@ Secrets находятся только в `/opt/vk-research-collector/.env` и
 обязательны `test -s` и `pg_restore --list`. Ротируются только predeploy backups;
 последние пять сохраняются.
 
-Worker останавливается отдельно. Выполняются `alembic current`, `alembic upgrade head`
-и `alembic check`; downgrade отсутствует. Затем проверяются container state/health,
+Worker останавливается отдельно с graceful timeout 360 секунд. Выполняются
+`alembic current`, `alembic upgrade head` и `alembic check`; downgrade отсутствует.
+Запускается только worker с `--no-deps --no-build`, поэтому production PostgreSQL
+container не пересоздаётся. Затем проверяются container state/health,
 CLI summaries, run status, failed/rejected jobs, дубли, диск и прогресс. Summary
 содержит SHA, images, backup, revision, states, run counters, DB size, disk и duration.
 

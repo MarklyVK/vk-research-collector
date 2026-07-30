@@ -9,7 +9,7 @@ RUNNER_VERSION=${RUNNER_VERSION:-2.336.0}
 RUNNER_SHA256=${RUNNER_SHA256:-04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d}
 EXPECTED_REPOSITORY_URL=https://github.com/MarklyVK/vk-research-collector
 REPOSITORY_URL=${REPOSITORY_URL:-$EXPECTED_REPOSITORY_URL}
-RUNNER_NAME=${RUNNER_NAME:-vk-collector-production}
+RUNNER_NAME=${RUNNER_NAME:-vk-collector-production-01}
 RUNNER_LABELS=production,vk-collector
 
 die() {

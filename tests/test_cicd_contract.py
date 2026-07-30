@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy-production.sh"
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE = f"ghcr.io/marklyvk/vk-research-collector/collector:sha-{FULL_SHA}"
+DIGEST = f"sha256:{'1' * 64}"
 
 pytestmark = pytest.mark.skipif(
     not DEPLOY_SCRIPT.exists(),
@@ -46,6 +47,7 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     }
     jobs = deploy["jobs"]  # type: ignore[index]
     assert set(jobs) == {"quality", "build-image", "deploy", "verify"}
+    assert set(jobs["deploy"]["needs"]) == {"quality", "build-image"}  # type: ignore[index]
     assert jobs["deploy"]["runs-on"] == [  # type: ignore[index]
         "self-hosted",
         "linux",
@@ -56,6 +58,13 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     assert jobs["quality"]["runs-on"] == jobs["build-image"]["runs-on"] == "ubuntu-latest"  # type: ignore[index]
     assert jobs["verify"]["runs-on"] == "ubuntu-latest"  # type: ignore[index]
     assert jobs["deploy"]["permissions"] == {"contents": "read", "packages": "read"}  # type: ignore[index]
+    assert jobs["build-image"]["permissions"] == {  # type: ignore[index]
+        "contents": "read",
+        "packages": "write",
+    }
+    assert jobs["build-image"]["outputs"]["digest"]  # type: ignore[index]
+    assert "--image-digest" in deploy_text
+    assert "ref=ghcr.io/${repository}/collector:sha-${GITHUB_SHA}" in deploy_text
     assert "pull_request_target" not in ci_text + deploy_text
     action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", ci_text + deploy_text)
     assert action_refs and all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
@@ -70,6 +79,7 @@ def test_production_compose_uses_sha_image_and_stable_volume_without_build() -> 
     assert services["collector"]["image"].startswith("${COLLECTOR_IMAGE:?")  # type: ignore[index]
     assert services["collector-worker"]["restart"] == "unless-stopped"  # type: ignore[index]
     base = load_yaml(ROOT / "compose.yaml")
+    assert base["services"]["collector-worker"]["stop_grace_period"] == "6m"  # type: ignore[index]
     assert "healthcheck" in base["services"]["postgres"]  # type: ignore[index]
     assert "healthcheck" in services["collector-worker"]  # type: ignore[operator]
     assert "vk_research_postgres_data" in text
@@ -90,18 +100,60 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "rollback_image",
         "collection verify",
         "collection status",
-        "compose stop collector-worker",
-        "compose up -d --remove-orphans postgres collector-worker",
+        'compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker',
+        "compose up -d --no-deps --no-build collector-worker",
         "Production PostgreSQL volume",
         "Не найден $DEPLOY_DIR/.env",
         "Не найден secrets/vk_tokens.txt",
+        "fast_forward_checkout",
+        "merge --ff-only",
+        "verify_local_image",
+        "org.opencontainers.image.revision",
+        "EXPECTED_IMAGE_DIGEST",
     )
     assert all(item in text for item in required)
     assert "alembic downgrade" not in text
     assert "down -v" not in text
     assert "docker volume rm" not in text
+    assert "docker compose build" not in text
+    assert "docker system prune" not in text
+    assert "compose up -d --remove-orphans postgres" not in text
+    assert "git reset --hard" not in text
+    assert "git clean" not in text
     assert "eval " not in text
     assert "set -x" not in text
+
+
+def test_runtime_secrets_archives_and_runner_are_not_tracked() -> None:
+    tracked = subprocess.check_output(
+        ["git", "ls-files"], cwd=ROOT, text=True, encoding="utf-8"
+    ).splitlines()
+    forbidden = re.compile(
+        r"(^|/)(\.env|secrets|backups|runner)(/|$)|\.dump$|\.manifest\.json$|\.zip$"
+    )
+    assert not [path for path in tracked if forbidden.search(path)]
+
+
+def test_operational_shell_scripts_are_executable_in_git() -> None:
+    scripts = (
+        "scripts/deploy-production.sh",
+        "scripts/install-github-runner.sh",
+        "scripts/import-server-handoff.sh",
+    )
+    output = subprocess.check_output(
+        ["git", "ls-files", "--stage", "--", *scripts],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+    )
+    modes = {line.split(maxsplit=1)[0] for line in output.splitlines()}
+    assert modes == {"100755"}
+
+
+def test_runner_installer_uses_production_runner_name_and_labels() -> None:
+    text = (ROOT / "scripts/install-github-runner.sh").read_text(encoding="utf-8")
+    assert "RUNNER_NAME=${RUNNER_NAME:-vk-collector-production-01}" in text
+    assert "RUNNER_LABELS=production,vk-collector" in text
 
 
 def test_handoff_scripts_require_checksum_explicit_replace_and_keep_workers_exclusive() -> None:
@@ -141,6 +193,7 @@ def dry_run_tree(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, target)
     (runtime / "secrets").mkdir()
+    (runtime / "exports").mkdir()
     (runtime / ".env").write_text(
         "\n".join(
             (
@@ -172,7 +225,7 @@ case "$*" in
   *" config --quiet") exit 0 ;;
   *" exec -T postgres pg_isready "*) exit 0 ;;
   *" ps -q collector-worker") exit 0 ;;
-  *" run --rm collector collection status"*)
+  *" collector collection status"*)
     printf '%s' '{"run_id":"test","status":"running","jobs":'
     printf '%s\\n' '{"completed":10,"pending":2,"running":1,"retry_wait":0,"failed":0}}'
     exit 0 ;;
@@ -205,6 +258,8 @@ def run_dry(runtime: Path, env: dict[str, str]) -> subprocess.CompletedProcess[s
             str(runtime),
             "--image",
             IMAGE,
+            "--image-digest",
+            DIGEST,
             "--git-sha",
             FULL_SHA,
         ],

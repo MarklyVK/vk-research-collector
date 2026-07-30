@@ -17,10 +17,15 @@ sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 sudo systemctl enable --now docker
 sudo useradd --create-home --shell /bin/bash deploy
-sudo usermod -aG docker deploy
-sudo install -d -o deploy -g deploy -m 0755 /opt/vk-research-collector
+sudo groupadd --system vkcollector
+sudo usermod -aG docker,vkcollector deploy
+sudo install -d -o deploy -g vkcollector -m 2770 /opt/vk-research-collector
 sudo install -d -o deploy -g deploy -m 0700 \
-  /opt/vk-research-collector/{backups,secrets,.deploy,runner}
+  /opt/vk-research-collector/{backups,.deploy,runner}
+sudo install -d -o 10001 -g vkcollector -m 2710 \
+  /opt/vk-research-collector/secrets
+sudo install -d -o 10001 -g vkcollector -m 2770 \
+  /opt/vk-research-collector/exports
 ```
 
 Перезайдите в shell пользователя `deploy`, чтобы применилось членство в `docker`.
@@ -32,14 +37,14 @@ sudo install -d -o deploy -g deploy -m 0700 \
 ```bash
 sudo install -o deploy -g deploy -m 0644 compose.yaml compose.production.yaml \
   /opt/vk-research-collector/
-sudo install -d -o deploy -g deploy -m 0755 \
-  /opt/vk-research-collector/{config,scripts,exports}
+sudo install -d -o deploy -g vkcollector -m 2755 \
+  /opt/vk-research-collector/{config,scripts}
 sudo install -o deploy -g deploy -m 0644 config/keywords.yml \
   /opt/vk-research-collector/config/keywords.yml
 sudo install -o deploy -g deploy -m 0755 scripts/postgres-init-readonly.sh \
   scripts/deploy-production.sh scripts/import-server-handoff.sh \
   /opt/vk-research-collector/scripts/
-sudo install -o deploy -g deploy -m 0600 /dev/null \
+sudo install -o 10001 -g 10001 -m 0600 /dev/null \
   /opt/vk-research-collector/secrets/vk_tokens.txt
 sudo install -o deploy -g deploy -m 0600 .env.example \
   /opt/vk-research-collector/.env
@@ -53,8 +58,15 @@ sudo install -o deploy -g deploy -m 0600 .env.example \
 ```bash
 sudo chmod 600 /opt/vk-research-collector/.env \
   /opt/vk-research-collector/secrets/vk_tokens.txt
-sudo chown deploy:deploy /opt/vk-research-collector/.env \
-  /opt/vk-research-collector/secrets/vk_tokens.txt
+sudo chown deploy:deploy /opt/vk-research-collector/.env
+sudo chown 10001:10001 /opt/vk-research-collector/secrets/vk_tokens.txt
+sudo chown 10001:vkcollector /opt/vk-research-collector/secrets \
+  /opt/vk-research-collector/exports
+sudo chmod 2710 /opt/vk-research-collector/secrets
+sudo chmod 2770 /opt/vk-research-collector/exports
+sudo -u deploy test -f /opt/vk-research-collector/secrets/vk_tokens.txt
+sudo -u deploy test ! -r /opt/vk-research-collector/secrets/vk_tokens.txt
+sudo -u deploy test -w /opt/vk-research-collector/exports
 ```
 
 ## 3. Первый production image и PostgreSQL volume

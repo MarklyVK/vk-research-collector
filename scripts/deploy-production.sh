@@ -8,12 +8,15 @@ DRY_RUN=0
 SOURCE_DIR="${GITHUB_WORKSPACE:-$(pwd)}"
 DEPLOY_DIR="${DEPLOY_ROOT:-/opt/vk-research-collector}"
 IMAGE="${COLLECTOR_IMAGE:-}"
+EXPECTED_IMAGE_DIGEST="${COLLECTOR_IMAGE_DIGEST:-}"
 GIT_SHA="${DEPLOY_GIT_SHA:-}"
 EXPECTED_USER="${DEPLOY_USER:-deploy}"
 BACKUP_KEEP="${PREDEPLOY_BACKUP_KEEP:-5}"
 PROGRESS_WAIT="${DEPLOY_PROGRESS_WAIT_SECONDS:-20}"
+WORKER_STOP_TIMEOUT="${DEPLOY_WORKER_STOP_TIMEOUT_SECONDS:-360}"
 LOCK_FILE=""
 START_EPOCH=$(date +%s)
+DEPLOY_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 BACKUP_FILE=""
 PREVIOUS_IMAGE=""
 RUN_ID=""
@@ -24,7 +27,7 @@ REPORT_STATUS=failed
 
 usage() {
   cat <<'EOF'
-Использование: deploy-production.sh [--dry-run] --image IMAGE --git-sha SHA
+Использование: deploy-production.sh [--dry-run] --image IMAGE --image-digest DIGEST --git-sha SHA
        [--source-dir PATH] [--deploy-dir PATH]
 EOF
 }
@@ -65,25 +68,40 @@ atomic_text() {
   mv -f "$temporary" "$target"
 }
 
-sync_runtime_files() {
-  local relative source target temporary
-  for relative in \
-    compose.yaml \
-    compose.production.yaml \
-    config/keywords.yml \
-    scripts/deploy-production.sh \
-    scripts/postgres-init-readonly.sh; do
-    source="$SOURCE_DIR/$relative"
-    target="$DEPLOY_DIR/$relative"
-    test -f "$source" || die "В checkout отсутствует $relative"
-    install -d -m 755 "$(dirname "$target")"
-    temporary="${target}.new.$$"
-    install -m 644 "$source" "$temporary"
-    case "$relative" in
-      scripts/*.sh) chmod 755 "$temporary" ;;
-    esac
-    mv -f "$temporary" "$target"
-  done
+fast_forward_checkout() {
+  local current_head fetched_head source_head
+  git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die 'GitHub checkout не является Git worktree.'
+  source_head=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+  [[ "$source_head" == "$GIT_SHA" ]] || die 'GitHub checkout не совпадает с DEPLOY_GIT_SHA.'
+  git -C "$DEPLOY_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die 'Production-каталог не является Git worktree.'
+  git -C "$DEPLOY_DIR" diff --quiet --ignore-submodules -- \
+    || die 'В production checkout есть незакоммиченные tracked-изменения.'
+  git -C "$DEPLOY_DIR" diff --cached --quiet --ignore-submodules -- \
+    || die 'В production checkout есть staged-изменения.'
+  current_head=$(git -C "$DEPLOY_DIR" rev-parse HEAD)
+  git -c core.hooksPath=/dev/null -C "$DEPLOY_DIR" fetch --no-tags "$SOURCE_DIR" "$GIT_SHA"
+  fetched_head=$(git -C "$DEPLOY_DIR" rev-parse FETCH_HEAD)
+  [[ "$fetched_head" == "$GIT_SHA" ]] || die 'Локальный fetch вернул неожиданный commit.'
+  git -C "$DEPLOY_DIR" merge-base --is-ancestor "$current_head" "$GIT_SHA" \
+    || die 'Production checkout нельзя обновить fast-forward до целевого commit.'
+  git -c core.hooksPath=/dev/null -C "$DEPLOY_DIR" merge --ff-only --no-edit "$GIT_SHA"
+  [[ "$(git -C "$DEPLOY_DIR" rev-parse HEAD)" == "$GIT_SHA" ]] \
+    || die 'Production checkout не обновлён до целевого commit.'
+}
+
+verify_local_image() {
+  local actual_revision repository repo_digest
+  actual_revision=$(docker image inspect "$IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+  [[ "$actual_revision" == "$GIT_SHA" ]] \
+    || die 'OCI revision скачанного image не совпадает с commit SHA.'
+  repository=${IMAGE%:sha-*}
+  repo_digest="${repository}@${EXPECTED_IMAGE_DIGEST}"
+  docker image inspect "$IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+    | grep -Fqx "$repo_digest" \
+    || die 'Digest скачанного image не совпадает с опубликованным digest.'
 }
 
 compose() {
@@ -131,6 +149,7 @@ write_report() {
     printf 'STATUS=%s\n' "$REPORT_STATUS"
     printf 'COMMIT_SHA=%s\n' "$GIT_SHA"
     printf 'IMAGE=%s\n' "${TARGET_IMAGE:-$IMAGE}"
+    printf 'IMAGE_DIGEST=%s\n' "$EXPECTED_IMAGE_DIGEST"
     printf 'PREVIOUS_IMAGE=%s\n' "$PREVIOUS_IMAGE"
     printf 'BACKUP_PATH=%s\n' "$BACKUP_FILE"
     printf 'ALEMBIC_REVISION=%s\n' "$revision"
@@ -156,6 +175,7 @@ write_report() {
       printf '| Status | `%s` |\n' "$REPORT_STATUS"
       printf '| Commit SHA | `%s` |\n' "$GIT_SHA"
       printf '| Docker image | `%s` |\n' "${TARGET_IMAGE:-$IMAGE}"
+      printf '| Image digest | `%s` |\n' "$EXPECTED_IMAGE_DIGEST"
       printf '| Previous image | `%s` |\n' "${PREVIOUS_IMAGE:-нет}"
       printf '| Backup | `%s` |\n' "${BACKUP_FILE:-не создан}"
       printf '| Alembic revision | `%s` |\n' "$revision"
@@ -178,10 +198,10 @@ rollback_image() {
     return 0
   }
   log "Healthcheck не пройден; возвращается предыдущий image: $PREVIOUS_IMAGE"
-  compose stop collector-worker >/dev/null 2>&1 || true
+  compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker >/dev/null 2>&1 || true
   IMAGE="$PREVIOUS_IMAGE"
   atomic_text "$DEPLOY_DIR/.deploy/current-image" "$PREVIOUS_IMAGE"
-  compose up -d collector-worker || true
+  compose up -d --no-deps --no-build collector-worker || true
   local state
   state=$(service_state collector-worker)
   if [[ "$state" != running/healthy && "$state" != running ]]; then
@@ -207,6 +227,7 @@ while [[ $# -gt 0 ]]; do
     --source-dir) SOURCE_DIR=${2:?}; shift 2 ;;
     --deploy-dir) DEPLOY_DIR=${2:?}; shift 2 ;;
     --image) IMAGE=${2:?}; shift 2 ;;
+    --image-digest) EXPECTED_IMAGE_DIGEST=${2:?}; shift 2 ;;
     --git-sha) GIT_SHA=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Неизвестный аргумент: $1" ;;
@@ -215,7 +236,12 @@ done
 
 [[ "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]] || die 'Нужен полный 40-символьный commit SHA.'
 [[ "$IMAGE" == *":sha-$GIT_SHA" ]] || die 'Image должен иметь неизменяемый tag sha-<полный SHA>.'
+[[ "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || die 'Нужен полный sha256 digest опубликованного image.'
 [[ "$BACKUP_KEEP" =~ ^[1-9][0-9]*$ ]] || die 'PREDEPLOY_BACKUP_KEEP должен быть положительным числом.'
+[[ "$WORKER_STOP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+  || die 'DEPLOY_WORKER_STOP_TIMEOUT_SECONDS должен быть положительным числом.'
+(( WORKER_STOP_TIMEOUT >= 30 )) || die 'Graceful stop worker должен длиться не менее 30 секунд.'
 TARGET_IMAGE=$IMAGE
 
 require_command docker
@@ -223,6 +249,8 @@ require_command flock
 require_command df
 require_command stat
 require_command sed
+require_command grep
+require_command git
 docker compose version >/dev/null
 
 CURRENT_USER=$(id -un)
@@ -234,15 +262,13 @@ exec 9>"$LOCK_FILE"
 flock -n 9 || die 'Другой production deployment уже выполняется.'
 test -f "$DEPLOY_DIR/.env" || die "Не найден $DEPLOY_DIR/.env"
 test -f "$DEPLOY_DIR/secrets/vk_tokens.txt" || die 'Не найден secrets/vk_tokens.txt'
+test -d "$DEPLOY_DIR/exports" || die 'Не найден runtime-каталог exports.'
+test -w "$DEPLOY_DIR/exports" || die 'Пользователь deploy не может записывать в exports.'
 [[ "$(stat -c '%a' "$DEPLOY_DIR/.env")" == 600 ]] || die '.env должен иметь права 600'
 [[ "$(stat -c '%a' "$DEPLOY_DIR/secrets/vk_tokens.txt")" == 600 ]] || die 'vk_tokens.txt должен иметь права 600'
 for required in compose.yaml compose.production.yaml config/keywords.yml scripts/deploy-production.sh scripts/postgres-init-readonly.sh; do
   test -f "$SOURCE_DIR/$required" || die "В checkout отсутствует $required"
 done
-
-if [[ "$DRY_RUN" -eq 0 ]]; then
-  sync_runtime_files
-fi
 
 compose config --quiet
 
@@ -287,9 +313,9 @@ if [[ -n "$PREVIOUS_IMAGE" ]]; then
   IMAGE=$PREVIOUS_IMAGE
 fi
 if [[ -n "$RUN_ID" ]]; then
-  BASELINE_STATUS_JSON=$(compose run --rm collector collection status --run-id "$RUN_ID")
+  BASELINE_STATUS_JSON=$(compose run --rm --no-deps collector collection status --run-id "$RUN_ID")
 else
-  BASELINE_STATUS_JSON=$(compose run --rm collector collection status)
+  BASELINE_STATUS_JSON=$(compose run --rm --no-deps collector collection status)
   RUN_ID=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string run_id || true)
 fi
 IMAGE=$TARGET_IMAGE
@@ -308,7 +334,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-install -d -m 700 "$DEPLOY_DIR/backups" "$DEPLOY_DIR/.deploy" "$DEPLOY_DIR/exports"
+install -d -m 700 "$DEPLOY_DIR/backups" "$DEPLOY_DIR/.deploy"
 TIMESTAMP=$(date -u +%Y%m%d-%H%M%SZ)
 BACKUP_FILE="$DEPLOY_DIR/backups/predeploy-${TIMESTAMP}-${GIT_SHA}.dump"
 log "Создаётся backup: $BACKUP_FILE"
@@ -325,18 +351,20 @@ done
 atomic_text "$DEPLOY_DIR/.deploy/previous-image" "$PREVIOUS_IMAGE"
 log 'Скачивается неизменяемый SHA image.'
 docker pull "$IMAGE"
-compose pull collector collector-worker
-atomic_text "$DEPLOY_DIR/.deploy/current-image" "$IMAGE"
+verify_local_image
 
-compose stop collector-worker
+fast_forward_checkout
+compose config --quiet
+compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker
 log 'Проверяется и применяется только Alembic upgrade.'
-compose run --rm collector alembic current
-compose run --rm collector alembic upgrade head
-compose run --rm collector alembic check
-ALEMBIC_REVISION=$(compose run --rm collector alembic current | tail -n 1 | tr -d '\r')
+compose run --rm --no-deps collector alembic current
+compose run --rm --no-deps collector alembic upgrade head
+compose run --rm --no-deps collector alembic check
+ALEMBIC_REVISION=$(compose run --rm --no-deps collector alembic current | tail -n 1 | tr -d '\r')
 
 ROLLBACK_ALLOWED=1
-compose up -d --remove-orphans postgres collector-worker
+atomic_text "$DEPLOY_DIR/.deploy/current-image" "$IMAGE"
+compose up -d --no-deps --no-build collector-worker
 
 HEALTH_OK=0
 for _ in $(seq 1 12); do
@@ -351,12 +379,18 @@ done
 [[ "$HEALTH_OK" -eq 1 ]] || die "Healthcheck не пройден: postgres=$POSTGRES_STATE, worker=$WORKER_STATE"
 
 compose ps
-compose logs --no-color --tail=100 collector-worker
-compose run --rm collector classification summary
-compose run --rm collector collection summary
+compose logs --no-color --since="$DEPLOY_STARTED_AT" --tail=300 collector-worker
+compose run --rm --no-deps collector classification summary
+compose run --rm --no-deps collector collection summary
+
+WORKER_CONTAINER=$(compose ps -q collector-worker)
+[[ -n "$WORKER_CONTAINER" ]] || die 'Container collector-worker не найден после запуска.'
+[[ "$(docker inspect --format '{{.Config.Image}}' "$WORKER_CONTAINER")" == "$IMAGE" ]] \
+  || die 'Worker запущен не из целевого immutable image.'
+verify_local_image
 
 if [[ -n "$RUN_ID" ]]; then
-  FINAL_STATUS_JSON=$(compose run --rm collector collection status --run-id "$RUN_ID")
+  FINAL_STATUS_JSON=$(compose run --rm --no-deps collector collection status --run-id "$RUN_ID")
   printf '%s\n' "$FINAL_STATUS_JSON"
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_FAILED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number failed || true)
@@ -365,7 +399,7 @@ if [[ -n "$RUN_ID" ]]; then
   (( FINAL_FAILED <= BASELINE_FAILED )) || die 'Количество failed jobs увеличилось.'
 
   set +e
-  VERIFY_JSON=$(compose run --rm collector collection verify --run-id "$RUN_ID" 2>&1)
+  VERIFY_JSON=$(compose run --rm --no-deps collector collection verify --run-id "$RUN_ID" 2>&1)
   VERIFY_CODE=$?
   set -e
   printf '%s\n' "$VERIFY_JSON"
@@ -378,7 +412,7 @@ if [[ -n "$RUN_ID" ]]; then
   fi
 
   sleep "$PROGRESS_WAIT"
-  FINAL_STATUS_JSON=$(compose run --rm collector collection status --run-id "$RUN_ID")
+  FINAL_STATUS_JSON=$(compose run --rm --no-deps collector collection status --run-id "$RUN_ID")
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_COMPLETED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number completed || true)
   FINAL_PENDING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number pending || true)
