@@ -1,7 +1,7 @@
 """Единый реестр поддерживаемых предметных областей."""
 
 from enum import StrEnum
-from typing import Literal, cast
+from typing import Literal
 
 type SubjectName = Literal[
     "food_delivery",
@@ -24,6 +24,7 @@ SUBJECT_NAMES: tuple[SubjectName, ...] = (
     "tender_support",
     "food_service",
 )
+SUBJECT_NAME_BY_VALUE: dict[str, SubjectName] = {name: name for name in SUBJECT_NAMES}
 
 SUBJECT_TITLES: dict[SubjectName, str] = {
     "food_delivery": "Доставка еды",
@@ -45,7 +46,8 @@ SUBJECT_DESCRIPTIONS: dict[SubjectName, str] = {
 
 def ensure_subject(value: str) -> SubjectName:
     """Проверить машинное имя и вернуть его с точным типом."""
-    if value not in SUBJECT_NAMES:
+    subject = SUBJECT_NAME_BY_VALUE.get(value)
+    if subject is None:
         allowed = ", ".join(SUBJECT_NAMES)
         raise ValueError(f"Неизвестная предметная область {value!r}; разрешены: {allowed}")
-    return cast(SubjectName, value)
+    return subject
