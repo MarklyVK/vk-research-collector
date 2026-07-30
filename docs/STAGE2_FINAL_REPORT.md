@@ -255,3 +255,20 @@ docker compose run --rm collector collection resume --run-id 9be2813e-e1de-4ac9-
 ```powershell
 docker compose up -d collector-worker
 ```
+
+## Дополнение 30.07.2026: expansion food_service
+
+Добавлены единый реестр четырёх областей, 28 поисковых фраз «Общепит», migration
+`20260730_0005`, per-run search statistics, merge-only reclassification с audit history,
+фиксированный независимый аудит и incremental planning вне snapshot основного run.
+
+Создан backup `stage2-food-service-migration-20260730-175811Z.dump` (178 051 201 байт),
+проверенный `pg_restore --list`. Migration прошла на чистой БД, восстановленной копии
+с 37 407 группами и рабочей БД; повторный upgrade и `alembic check` успешны. Основной
+run сохранил 36 780 jobs, дубли и rejected jobs отсутствуют.
+
+Подготовлен runtime snapshot reclassification operation
+`food-service-20260730-d78d7615475b`: 37 407 групп, SHA-256
+`30664c236d1a054f4d1467255acc71c0ba2e73c4e33a29f3d2cc9b8b66e5720c`. Семантических
+решений завершено 0, поэтому новый search, аудит, импорт и incremental run намеренно
+не запускались. Полная готовность expansion пока не заявляется.

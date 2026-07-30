@@ -118,7 +118,26 @@ Plan-key и capacity report содержат одинаковую collection-к�
 проверяется `pg_restore --list` и не коммитится.
 
 После сбоя `collector-worker` запускается Docker Compose автоматически и выбирает только
-full run с `capacity_gate=passed`. Ручной путь — `collection resume`, затем
+full или incremental run с `capacity_gate=passed`. Ручной путь — `collection resume`, затем
 `collection run --run-id ... --until-idle`; checkpoint исключает дубли уже сохранённых
 страниц. На Windows это требует запущенного Docker Desktop; на Debian Docker включается
 через systemd.
+
+## Расширение food_service
+
+```mermaid
+flowchart LR
+    S["Snapshot 37 407 групп"] --> R["Семантическая reclassification"]
+    R --> A["Независимый аудит, seed 20260730"]
+    A --> I["Merge-only import и audit history"]
+    I --> V["Отдельный VK search: food_service"]
+    V --> C["Классификация новых групп по 4 labels"]
+    C --> G["Capacity gate"]
+    G --> N["Incremental collection run"]
+    O["Основной run snapshot"] -->|"исключение уже включённых group IDs"| N
+```
+
+Единый реестр областей расположен в `vk_collector.subjects`. PostgreSQL CHECK
+ограничивает `search_keywords.subject` и `group_labels.label`. `search_run_groups`
+даёт per-run дедупликацию и статистику known/new, а `classification_reviews` хранит
+неизменяемую историю повторных решений.

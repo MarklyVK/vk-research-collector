@@ -43,6 +43,25 @@ Privacy-команды показывают только агрегаты: `coll
 `docs/GITHUB_ACTIONS_DEPLOYMENT.md` и `docs/SERVER_BOOTSTRAP.md`; перенос существующей
 БД — в `docs/DATABASE_HANDOFF.md`.
 
+## Предметные области
+
+Поддерживаются четыре машинных имени: `food_delivery`, `customer_acquisition`,
+`tender_support`, `food_service`. «Общепит» означает действующие заведения, которые
+непосредственно готовят и продают еду или напитки посетителям; категория не заменяет
+`food_delivery` и допускает multi-label.
+
+```bash
+docker compose run --rm collector groups search --subject food_service
+docker compose run --rm collector classification summary --subject food_service
+docker compose run --rm collector classification reclassification-prepare
+docker compose run --rm collector classification reclassification-validate \
+  /app/exports/food-service-reclassification/decisions.json
+```
+
+Reclassification должна завершиться и пройти независимый аудит до отдельного поиска и
+incremental collection run. Текущий основной run
+`9be2813e-e1de-4ac9-bc07-7d92ac82438c` остаётся неизменяемым snapshot старого approved-набора.
+
 ## Внимание: порт PostgreSQL
 
 > **Публикация `0.0.0.0:5432` небезопасна.** Production deploy делает это только по явному решению владельца. Обязательно ограничьте порт firewall. Рекомендуемый вариант — `POSTGRES_BIND_ADDRESS=127.0.0.1` и SSH tunnel: `ssh -L 15432:127.0.0.1:5432 user@server`.

@@ -15,6 +15,13 @@ privacy-операция.
 | `group_memberships` | PK bigint; FK group/user; UQ group+user | first/last seen, current, snapshot/source run; indexes user и group/current | Upsert; деактивация лишь после полного snapshot |
 | `user_group_subscriptions` | PK bigint; FK user; UQ user+VK group ID | first/last seen, current, snapshot/source run | По умолчанию не планируется; отдельный gate |
 | `collection_job_errors` | PK bigint; FK run/job CASCADE | token fingerprint, endpoint, category, VK/HTTP code, attempt, sanitized message, time | Append-only диагностическая история с retention |
+| `search_run_groups` | UQ run+group | `was_new`, first seen | Дедуплицированная статистика known/new для отдельного search run |
+| `classification_reviews` | UQ operation+group | previous/final approved и labels, confidence, reason, source | Неизменяемый аудит reclassification; прежние labels не удаляются |
+
+`group_labels.label` и `search_keywords.subject` являются строками под PostgreSQL
+CHECK, а не PostgreSQL enum. Migration `20260730_0005` расширяет оба ограничения
+значением `food_service`, добавляет search counters и две аудит-таблицы. Downgrade
+останавливается, если `food_service` уже используется, чтобы не потерять данные.
 
 ## Минимизация профиля
 

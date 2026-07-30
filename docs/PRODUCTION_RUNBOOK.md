@@ -45,3 +45,21 @@ deployment на self-hosted runner. Predeploy backup:
 
 Запрещены `docker compose down -v`, `docker volume rm`, автоматический Alembic
 downgrade и одновременный local/server worker.
+
+## Deploy migration 0005 и expansion food_service
+
+Deploy обязан создать и проверить predeploy backup до `alembic upgrade head`.
+Migration не удаляет и не переименовывает прежние labels; автоматический downgrade при
+наличии `food_service` запрещён. После deploy проверить:
+
+```bash
+docker compose -f compose.yaml -f compose.production.yaml run --rm collector alembic current
+docker compose -f compose.yaml -f compose.production.yaml run --rm collector alembic check
+docker compose -f compose.yaml -f compose.production.yaml run --rm collector \
+  classification summary --subject food_service
+docker compose -f compose.yaml -f compose.production.yaml run --rm collector \
+  collection status --run-id 9be2813e-e1de-4ac9-bc07-7d92ac82438c
+```
+
+Deploy не создаёт search или incremental run автоматически. Их разрешает оператор
+только после полной reclassification, импорта, независимого аудита и capacity gate.
