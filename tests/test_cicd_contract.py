@@ -21,6 +21,11 @@ DEPLOY_SCRIPT = ROOT / "scripts" / "deploy-production.sh"
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE = f"ghcr.io/marklyvk/vk-research-collector/collector:sha-{FULL_SHA}"
 
+pytestmark = pytest.mark.skipif(
+    not DEPLOY_SCRIPT.exists(),
+    reason="Contract-тесты выполняются из checkout; deployment files не входят в runtime image",
+)
+
 
 def load_yaml(path: Path) -> dict[str, object]:
     return yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
@@ -97,6 +102,24 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
     assert "docker volume rm" not in text
     assert "eval " not in text
     assert "set -x" not in text
+
+
+def test_handoff_scripts_require_checksum_explicit_replace_and_keep_workers_exclusive() -> None:
+    export = (ROOT / "scripts/export-server-handoff.ps1").read_text(encoding="utf-8")
+    import_ = (ROOT / "scripts/import-server-handoff.sh").read_text(encoding="utf-8")
+    assert "stop collector-worker" in export
+    assert "Get-FileHash" in export and "SHA256" in export
+    assert "ConvertTo-Json" in export and "scp" in export
+    assert "up -d collector-worker" not in export
+    assert "--confirm-replace-database" in import_
+    assert "sha256sum --check" in import_
+    assert "pg_restore --list" in import_
+    assert "server-before-handoff" in import_
+    assert "alembic upgrade head" in import_
+    assert "collection verify" in import_
+    assert import_.index("collection verify") < import_.index("compose up -d collector-worker")
+    assert "down -v" not in import_
+    assert "docker volume rm" not in import_
 
 
 @pytest.fixture

@@ -39,7 +39,9 @@ jobs:
       - name: Mypy
         run: mypy src
       - name: Unit tests
-        run: pytest -q tests/unit tests/test_classification_schemas.py tests/test_config.py
+        run: >-
+          pytest -q tests/unit tests/test_classification_schemas.py tests/test_config.py
+          tests/test_cicd_contract.py
       - name: Поиск случайно добавленных секретов
         shell: bash
         run: |
