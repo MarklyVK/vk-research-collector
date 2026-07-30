@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-AllowedLabel = Literal["food_delivery", "customer_acquisition", "tender_support"]
+from vk_collector.subjects import SubjectName
+
+AllowedLabel = SubjectName
 Confidence = Annotated[float, Field(ge=0, le=1)]
 
 
@@ -39,6 +41,10 @@ class FullResult(BaseModel):
     def labels_are_unique(self) -> FullResult:
         if len(self.labels) != len(set(self.labels)):
             raise ValueError("Метки одной группы не должны повторяться")
+        if self.approved and not self.labels:
+            raise ValueError("У approved-группы должна быть хотя бы одна метка")
+        if not self.approved and self.labels:
+            raise ValueError("У rejected-группы список меток должен быть пустым")
         return self
 
 
