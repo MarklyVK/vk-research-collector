@@ -141,6 +141,41 @@ service_state() {
   fi
 }
 
+install_telegram_monitor_units() {
+  local unit_source unit_dir runtime_dir unit
+  unit_source="$DEPLOY_DIR/deploy/systemd"
+  unit_dir="${HOME:?}/.config/systemd/user"
+  runtime_dir="/run/user/$(id -u)"
+  test -S "$runtime_dir/bus" \
+    || die 'User systemd manager deploy недоступен. Один раз выполните: sudo loginctl enable-linger deploy'
+  install -d -m 700 "$unit_dir" "$DEPLOY_DIR/.deploy/telegram-monitor"
+  for unit in \
+    vk-collector-telegram-health.service \
+    vk-collector-telegram-health.timer \
+    vk-collector-telegram-daily.service \
+    vk-collector-telegram-daily.timer; do
+    test -f "$unit_source/$unit" || die "Не найден systemd unit: $unit"
+    install -C -m 644 "$unit_source/$unit" "$unit_dir/$unit"
+  done
+  systemd-analyze verify \
+    "$unit_source/vk-collector-telegram-health.service" \
+    "$unit_source/vk-collector-telegram-health.timer" \
+    "$unit_source/vk-collector-telegram-daily.service" \
+    "$unit_source/vk-collector-telegram-daily.timer"
+  XDG_RUNTIME_DIR="$runtime_dir" systemctl --user daemon-reload
+  XDG_RUNTIME_DIR="$runtime_dir" systemctl --user enable --now \
+    vk-collector-telegram-health.timer \
+    vk-collector-telegram-daily.timer
+  XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-active \
+    vk-collector-telegram-health.timer >/dev/null
+  XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-active \
+    vk-collector-telegram-daily.timer >/dev/null
+  XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-enabled \
+    vk-collector-telegram-health.timer >/dev/null
+  XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-enabled \
+    vk-collector-telegram-daily.timer >/dev/null
+}
+
 write_report() {
   local duration revision worker_state postgres_state status_json completed pending running retry failed db_size disk_usage
   duration=$(($(date +%s) - START_EPOCH))
@@ -178,6 +213,11 @@ write_report() {
     printf 'DISK_USAGE=%s\n' "$disk_usage"
     printf 'DURATION_SECONDS=%s\n' "$duration"
   } > "$DEPLOY_DIR/.deploy/last-deployment.env"
+  if [[ "$REPORT_STATUS" == success ]]; then
+    cp -f "$DEPLOY_DIR/.deploy/last-deployment.env" \
+      "$DEPLOY_DIR/.deploy/last-successful-deployment.env"
+    chmod 600 "$DEPLOY_DIR/.deploy/last-successful-deployment.env"
+  fi
 
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
@@ -264,6 +304,8 @@ require_command stat
 require_command sed
 require_command grep
 require_command git
+require_command systemctl
+require_command systemd-analyze
 docker compose version >/dev/null
 
 CURRENT_USER=$(id -un)
@@ -279,7 +321,17 @@ test -d "$DEPLOY_DIR/exports" || die 'Не найден runtime-каталог e
 test -w "$DEPLOY_DIR/exports" || die 'Пользователь deploy не может записывать в exports.'
 [[ "$(stat -c '%a' "$DEPLOY_DIR/.env")" == 600 ]] || die '.env должен иметь права 600'
 [[ "$(stat -c '%a' "$DEPLOY_DIR/secrets/vk_tokens.txt")" == 600 ]] || die 'vk_tokens.txt должен иметь права 600'
-for required in compose.yaml compose.production.yaml config/keywords.yml scripts/deploy-production.sh scripts/postgres-init-readonly.sh; do
+for required in \
+  compose.yaml \
+  compose.production.yaml \
+  config/keywords.yml \
+  scripts/deploy-production.sh \
+  scripts/postgres-init-readonly.sh \
+  scripts/telegram-monitor.py \
+  deploy/systemd/vk-collector-telegram-health.service \
+  deploy/systemd/vk-collector-telegram-health.timer \
+  deploy/systemd/vk-collector-telegram-daily.service \
+  deploy/systemd/vk-collector-telegram-daily.timer; do
   test -f "$SOURCE_DIR/$required" || die "В checkout отсутствует $required"
 done
 
@@ -454,5 +506,6 @@ stop_worker_on_critical_disk "$DISK_AFTER" post-deployment
 REPORT_STATUS=success
 ROLLBACK_ALLOWED=0
 write_report
+install_telegram_monitor_units
 log "Deployment $GIT_SHA завершён успешно."
 trap - EXIT

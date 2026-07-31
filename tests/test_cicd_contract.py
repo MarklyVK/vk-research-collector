@@ -46,7 +46,7 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
         "cancel-in-progress": "false",
     }
     jobs = deploy["jobs"]  # type: ignore[index]
-    assert set(jobs) == {"quality", "build-image", "deploy", "verify"}
+    assert set(jobs) == {"quality", "build-image", "deploy", "verify", "notify-failure"}
     assert set(jobs["deploy"]["needs"]) == {"quality", "build-image"}  # type: ignore[index]
     assert jobs["deploy"]["runs-on"] == [  # type: ignore[index]
         "self-hosted",
@@ -57,6 +57,14 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     ]
     assert jobs["quality"]["runs-on"] == jobs["build-image"]["runs-on"] == "ubuntu-latest"  # type: ignore[index]
     assert jobs["verify"]["runs-on"] == "ubuntu-latest"  # type: ignore[index]
+    assert jobs["notify-failure"]["runs-on"] == "ubuntu-latest"  # type: ignore[index]
+    assert set(jobs["notify-failure"]["needs"]) == {  # type: ignore[index]
+        "quality",
+        "build-image",
+        "deploy",
+        "verify",
+    }
+    assert jobs["notify-failure"]["permissions"] == {"contents": "read"}  # type: ignore[index]
     assert jobs["deploy"]["permissions"] == {"contents": "read", "packages": "read"}  # type: ignore[index]
     assert jobs["build-image"]["permissions"] == {  # type: ignore[index]
         "contents": "read",
@@ -64,6 +72,8 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     }
     assert jobs["build-image"]["outputs"]["digest"]  # type: ignore[index]
     assert "--image-digest" in deploy_text
+    assert "TELEGRAM_BOT_TOKEN" in deploy_text
+    assert "--workflow-failure" in deploy_text
     assert "ref=ghcr.io/${repository}/collector:sha-${GITHUB_SHA}" in deploy_text
     assert "pull_request_target" not in ci_text + deploy_text
     action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", ci_text + deploy_text)
@@ -114,6 +124,8 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "stop_worker_on_critical_disk",
         "DISK_AFTER_BACKUP",
         "DISK_AFTER_PULL",
+        "install_telegram_monitor_units",
+        "systemctl --user enable --now",
     )
     assert all(item in text for item in required)
     assert "alembic downgrade" not in text
@@ -143,6 +155,8 @@ def test_operational_shell_scripts_are_executable_in_git() -> None:
         "scripts/deploy-production.sh",
         "scripts/install-github-runner.sh",
         "scripts/import-server-handoff.sh",
+        "scripts/setup-telegram-monitor.sh",
+        "scripts/telegram-monitor.py",
     )
     output = subprocess.check_output(
         ["git", "ls-files", "--stage", "--", *scripts],
@@ -158,6 +172,34 @@ def test_runner_installer_uses_production_runner_name_and_labels() -> None:
     text = (ROOT / "scripts/install-github-runner.sh").read_text(encoding="utf-8")
     assert "RUNNER_NAME=${RUNNER_NAME:-vk-collector-production-01}" in text
     assert "RUNNER_LABELS=production,vk-collector" in text
+
+
+def test_telegram_systemd_and_secret_contract() -> None:
+    units = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (ROOT / "deploy" / "systemd").glob("vk-collector-telegram-*")
+    }
+    assert {
+        "vk-collector-telegram-health.service",
+        "vk-collector-telegram-health.timer",
+        "vk-collector-telegram-daily.service",
+        "vk-collector-telegram-daily.timer",
+    } == set(units)
+    assert "OnBootSec=2min" in units["vk-collector-telegram-health.timer"]
+    assert "OnUnitActiveSec=5min" in units["vk-collector-telegram-health.timer"]
+    assert "OnCalendar=*-*-* 09:00:00 Europe/Moscow" in units["vk-collector-telegram-daily.timer"]
+    assert all(
+        "Persistent=true" in units[name]
+        for name in (
+            "vk-collector-telegram-health.timer",
+            "vk-collector-telegram-daily.timer",
+        )
+    )
+    assert not any("TELEGRAM_BOT_TOKEN=" in text for text in units.values())
+    assert not any("/var/run/docker.sock" in text for text in units.values())
+    setup = (ROOT / "scripts/setup-telegram-monitor.sh").read_text(encoding="utf-8")
+    assert "read -rsp" in setup
+    assert "unset TELEGRAM_BOT_TOKEN" in setup
 
 
 def test_handoff_scripts_require_checksum_explicit_replace_and_keep_workers_exclusive() -> None:
@@ -192,6 +234,11 @@ def dry_run_tree(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         "config/keywords.yml",
         "scripts/deploy-production.sh",
         "scripts/postgres-init-readonly.sh",
+        "scripts/telegram-monitor.py",
+        "deploy/systemd/vk-collector-telegram-health.service",
+        "deploy/systemd/vk-collector-telegram-health.timer",
+        "deploy/systemd/vk-collector-telegram-daily.service",
+        "deploy/systemd/vk-collector-telegram-daily.timer",
     ):
         target = runtime / relative
         target.parent.mkdir(parents=True, exist_ok=True)

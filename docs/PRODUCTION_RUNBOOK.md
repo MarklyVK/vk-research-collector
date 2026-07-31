@@ -18,6 +18,29 @@ df -h /opt/vk-research-collector
 
 Compose автоматически читает `.env`; shell-команда получает точный ID отдельно.
 
+## Telegram monitor
+
+Health check выполняется каждые пять минут, daily report — в `09:00 Europe/Moscow`.
+Проверка timers:
+
+```bash
+uid=$(id -u deploy)
+sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user status \
+  vk-collector-telegram-health.timer vk-collector-telegram-daily.timer
+sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user list-timers --all
+```
+
+Ручной безопасный test alert и daily report:
+
+```bash
+sudo -u deploy /usr/bin/python3 scripts/telegram-monitor.py --test-alert
+sudo -u deploy /usr/bin/python3 scripts/telegram-monitor.py --daily
+```
+
+Первичная настройка выполняется только после создания бота через официальный
+`@BotFather`: `sudo ./scripts/setup-telegram-monitor.sh`. Подробности, thresholds,
+dedup/recovery и журнал — в [`TELEGRAM_MONITORING.md`](TELEGRAM_MONITORING.md).
+
 ## Автоматический deploy
 
 Push в `main` запускает повторный CI, сборку/push image на GitHub-hosted runner и
@@ -31,6 +54,10 @@ deployment на self-hosted runner. Predeploy backup:
 `server-before-handoff-*` скрипт не ротирует. При 85% диска deploy прекращается до
 pull. После backup и pull пороги проверяются повторно. При 95% дополнительно
 останавливается worker. PostgreSQL остаётся запущенным.
+
+Deployment также проверяет versioned Telegram unit-файлы, обновляет user units
+`deploy`, выполняет `daemon-reload` и оставляет оба timer active/enabled. Для работы
+после перезагрузки один раз должен быть включён `loginctl enable-linger deploy`.
 
 ## Ошибки
 

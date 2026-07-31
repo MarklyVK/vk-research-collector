@@ -1,0 +1,21 @@
+[Unit]
+Description=VK Collector Telegram production health check
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/vk-research-collector
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/flock --nonblock /opt/vk-research-collector/.deploy/telegram-monitor/monitor.lock /usr/bin/python3 /opt/vk-research-collector/scripts/telegram-monitor.py --health
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=/opt/vk-research-collector/.deploy/telegram-monitor
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+TimeoutStartSec=4min

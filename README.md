@@ -850,10 +850,23 @@ docker compose run --rm collector [ГРУППА] [КОМАНДА] [АРГУМЕ�
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `TELEGRAM_ENABLED` | `false` | Включить операционные уведомления |
-| `TELEGRAM_BOT_TOKEN` | пусто | Bot token, только runtime secret |
+| `TELEGRAM_BOT_TOKEN` | пусто | Устаревающий inline fallback; production setup очищает его |
+| `TELEGRAM_BOT_TOKEN_FILE` | `secrets/telegram_bot_token.txt` | Отдельный runtime secret, owner `deploy`, mode `600` |
 | `TELEGRAM_CHAT_ID` | пусто | Получатель уведомлений |
+| `TELEGRAM_TIMEZONE` | `Europe/Moscow` | Зона ежедневной сводки |
+| `TELEGRAM_ALERT_REPEAT_SECONDS` | `10800` | Повтор продолжающейся проблемы |
+| `TELEGRAM_STALL_MINUTES` | `30` | Порог отсутствия collection progress |
+| `TELEGRAM_DISK_WARNING_PERCENT` | `85` | Порог Telegram warning по диску |
+| `TELEGRAM_DISK_CRITICAL_PERCENT` | `95` | Порог Telegram critical по диску |
+| `TELEGRAM_RAM_WARNING_AVAILABLE_MB` | `100` | Минимум доступной RAM |
+| `TELEGRAM_COLLECTION_RUN_ID` | пусто | Явный приоритетный run для monitor |
 | `DISK_WARNING_PERCENT` | `85` | Порог предупреждения и запрета тяжёлых операций |
 | `DISK_STOP_PERCENT` | `95` | Критический порог остановки |
+
+Production monitor выполняет read-only проверки каждые пять минут, отправляет recovery
+и ежедневную сводку ровно в `09:00 Europe/Moscow`. Token безопасно настраивается через
+`sudo ./scripts/setup-telegram-monitor.sh`; полная эксплуатация и список проверок
+описаны в [`docs/TELEGRAM_MONITORING.md`](docs/TELEGRAM_MONITORING.md).
 
 ### Worker и lease
 
@@ -1411,6 +1424,7 @@ data не должны попадать в Git.
 | [`docs/SERVER_BOOTSTRAP.md`](docs/SERVER_BOOTSTRAP.md) | Первичная production-настройка |
 | [`docs/PRODUCTION_RUNBOOK.md`](docs/PRODUCTION_RUNBOOK.md) | Ежедневные production-операции |
 | [`docs/GITHUB_ACTIONS_DEPLOYMENT.md`](docs/GITHUB_ACTIONS_DEPLOYMENT.md) | CI/CD и self-hosted runner |
+| [`docs/TELEGRAM_MONITORING.md`](docs/TELEGRAM_MONITORING.md) | Alerts, daily report, setup и systemd timers |
 | [`docs/DEPLOYMENT_ROLLBACK.md`](docs/DEPLOYMENT_ROLLBACK.md) | Image rollback и восстановление БД |
 | [`docs/DATABASE_HANDOFF.md`](docs/DATABASE_HANDOFF.md) | Перенос рабочей PostgreSQL |
 

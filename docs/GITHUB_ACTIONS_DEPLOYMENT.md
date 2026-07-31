@@ -28,6 +28,12 @@ Tags: `sha-<полный commit SHA>`, `main`, `latest`. Deployment всегда
 внутри него. Отдельный GitHub-hosted `verify` фиксирует безопасный отчёт. Группа
 concurrency `production-deployment` и серверный `flock` исключают параллельный deploy.
 
+GitHub-hosted `notify-failure` запускается через `always()`, если `quality`,
+`build-image`, `deploy` или `verify` не завершились успешно. Он получает
+`TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` только из Environment `production`;
+self-hosted runner эти secrets не получает. Безопасная настройка через stdin описана
+в [`TELEGRAM_MONITORING.md`](TELEGRAM_MONITORING.md).
+
 Все сторонние actions закреплены на полных commit SHA. Build args и workflow secrets
 не содержат runtime-секреты.
 

@@ -251,3 +251,36 @@ jobs:
             echo "| Duration | \`${DURATION_SECONDS:-неизвестно} s\` |"
           } >> "$GITHUB_STEP_SUMMARY"
           test "$DEPLOY_RESULT" = success
+
+  notify-failure:
+    name: Уведомить Telegram о сбое
+    needs: [quality, build-image, deploy, verify]
+    if: >-
+      ${{ always() && (
+        needs.quality.result != 'success' ||
+        needs.build-image.result != 'success' ||
+        needs.deploy.result != 'success' ||
+        needs.verify.result != 'success'
+      ) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+    steps:
+      - name: Получить exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Установить Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Отправить безопасное failure-уведомление
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FAILED_JOBS: >-
+            quality=${{ needs.quality.result }},
+            build-image=${{ needs.build-image.result }},
+            deploy=${{ needs.deploy.result }},
+            verify=${{ needs.verify.result }}
+        run: PYTHONPATH=src python -m vk_collector.monitoring.telegram_monitor --workflow-failure

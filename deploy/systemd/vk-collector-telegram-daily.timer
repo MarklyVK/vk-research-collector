@@ -1,0 +1,11 @@
+[Unit]
+Description=VK Collector Telegram daily report at 09:00 Moscow
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Europe/Moscow
+AccuracySec=1min
+Persistent=true
+Unit=vk-collector-telegram-daily.service
+
+[Install]
+WantedBy=timers.target

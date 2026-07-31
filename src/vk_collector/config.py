@@ -34,7 +34,16 @@ class Settings(BaseSettings):
     database_url: str | None = None
     telegram_enabled: bool = False
     telegram_bot_token: SecretStr = SecretStr("")
+    telegram_bot_token_file: Path = Path("/run/secrets/telegram_bot_token.txt")
     telegram_chat_id: str = ""
+    telegram_timezone: str = "Europe/Moscow"
+    telegram_daily_time: str = "09:00"
+    telegram_health_interval_seconds: int = Field(default=300, ge=60)
+    telegram_alert_repeat_seconds: int = Field(default=10_800, ge=60)
+    telegram_stall_minutes: int = Field(default=30, ge=5)
+    telegram_disk_warning_percent: int = Field(default=85, ge=1, le=100)
+    telegram_disk_critical_percent: int = Field(default=95, ge=1, le=100)
+    telegram_ram_warning_available_mb: int = Field(default=100, ge=1)
     disk_warning_percent: int = 85
     disk_stop_percent: int = 95
     collection_worker_id: str = "collector-1"
@@ -79,6 +88,17 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.postgres_user}:{password}@"
             f"{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def telegram_token(self) -> str:
+        """Вернуть runtime token из env или отдельного файла, не логируя его."""
+        inline = self.telegram_bot_token.get_secret_value().strip()
+        if inline:
+            return inline
+        try:
+            return self.telegram_bot_token_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return ""
 
 
 class Keyword(BaseModel):

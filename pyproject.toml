@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 collector = "vk_collector.cli.app:app"
+telegram-monitor = "vk_collector.monitoring.telegram_monitor:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vk_collector"]
