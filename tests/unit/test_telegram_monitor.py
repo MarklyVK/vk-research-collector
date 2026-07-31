@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from vk_collector.monitoring.telegram_monitor import (
     Issue,
     MonitorSettings,
     _deliver,
+    _host_resources,
     evaluate_snapshot,
     format_alert,
     format_daily_report,
@@ -169,6 +171,24 @@ def test_resource_thresholds(
     snapshot["resources"]["memory_available"] = ram * 1024**2
     issues = evaluate_snapshot(snapshot, {"alerts": {}, "metrics": {}}, settings(tmp_path), now=now)
     assert expected in {(issue.key, issue.severity) for issue in issues}
+
+
+def test_disk_usage_matches_df_semantics_with_reserved_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FileSystem:
+        f_frsize = 1024
+        f_bsize = 1024
+        f_blocks = 1000
+        f_bfree = 200
+        f_bavail = 100
+
+    monkeypatch.setattr(os, "statvfs", lambda _: FileSystem(), raising=False)
+    resources = _host_resources(tmp_path)
+    assert resources["disk_used"] == 800 * 1024
+    assert resources["disk_free"] == 100 * 1024
+    assert resources["disk_percent"] == 88.9
 
 
 def test_stalled_collection_uses_persisted_progress_and_ignores_active_running_jobs(

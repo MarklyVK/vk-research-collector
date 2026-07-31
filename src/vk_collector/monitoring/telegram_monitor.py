@@ -355,7 +355,7 @@ WITH chosen AS (
   SELECT
     count(*) FILTER (WHERE e.created_at >= now() - interval '24 hours')::bigint AS errors_24h,
     count(*) FILTER (WHERE e.created_at >= now() - interval '24 hours'
-      AND e.error_category ~* '(auth|token|permission)')::bigint AS auth_24h,
+      AND e.error_category ~* '(auth|token)')::bigint AS auth_24h,
     count(*) FILTER (WHERE e.created_at >= now() - interval '24 hours'
       AND e.error_category ~* '(rate|limit|flood)')::bigint AS rate_24h
   FROM collection_job_errors e JOIN chosen r ON r.id = e.collection_run_id
@@ -448,6 +448,19 @@ def _expected_alembic_head(root: Path) -> str:
 
 def _host_resources(root: Path) -> dict[str, Any]:
     disk = shutil.disk_usage(root)
+    disk_total = disk.total
+    disk_used = disk.used
+    disk_free = disk.free
+    disk_percent = round(disk.used * 100 / disk.total, 1) if disk.total else 0.0
+    statvfs = getattr(os, "statvfs", None)
+    if callable(statvfs):
+        filesystem = statvfs(root)
+        fragment_size = int(filesystem.f_frsize or filesystem.f_bsize)
+        disk_total = int(filesystem.f_blocks) * fragment_size
+        disk_used = (int(filesystem.f_blocks) - int(filesystem.f_bfree)) * fragment_size
+        disk_free = int(filesystem.f_bavail) * fragment_size
+        usable = disk_used + disk_free
+        disk_percent = round(disk_used * 100 / usable, 1) if usable else 0.0
     memory: dict[str, int] = {}
     try:
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -459,10 +472,10 @@ def _host_resources(root: Path) -> dict[str, Any]:
     swap_total = memory.get("SwapTotal", 0)
     swap_free = memory.get("SwapFree", 0)
     return {
-        "disk_total": disk.total,
-        "disk_used": disk.used,
-        "disk_free": disk.free,
-        "disk_percent": round(disk.used * 100 / disk.total, 1) if disk.total else 0.0,
+        "disk_total": disk_total,
+        "disk_used": disk_used,
+        "disk_free": disk_free,
+        "disk_percent": disk_percent,
         "memory_total": memory.get("MemTotal", 0),
         "memory_available": memory.get("MemAvailable", 0),
         "swap_total": swap_total,
