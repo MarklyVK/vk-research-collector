@@ -906,7 +906,7 @@ Production monitor выполняет read-only проверки каждые п
 |---|---|---|
 | `COLLECTION_SUBSCRIPTIONS_ENABLED` | `false` | Включить публичные подписки; требует отдельного capacity gate |
 | `COLLECTION_SUBSCRIPTIONS_MAX_PER_USER` | `50` | Максимум подписок пользователя, не более 100 |
-| `COLLECTION_SUBSCRIPTIONS_PAGE_SIZE` | `50` | Размер страницы, не более 100 |
+| `COLLECTION_SUBSCRIPTIONS_PAGE_SIZE` | `50` | Размер страницы VK, не более 1000; запрос ограничивается остатком лимита 50/100 |
 | `COLLECTION_SUBSCRIPTION_PILOT_USERS` | `500` | Максимальный размер Pilot A |
 | `COLLECTION_SUBSCRIPTION_PILOT_MIN_USERS` | `100` | Минимальное наблюдение для разрешающего Gate A |
 | `COLLECTION_SUBSCRIPTION_POSTS_PILOT_COMMUNITIES` | `500` | Максимальный размер Pilot B |

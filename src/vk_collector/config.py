@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
     collection_subscriptions_enabled: bool = False
     collection_subscriptions_max_per_user: int = Field(default=50, ge=1, le=100)
-    collection_subscriptions_page_size: int = Field(default=50, ge=1, le=100)
+    collection_subscriptions_page_size: int = Field(default=50, ge=1, le=1000)
     collection_subscriptions_users_per_run: int = Field(default=10000, ge=1)
     collection_subscriptions_ttl_days: int = Field(default=30, ge=1)
     collection_subscription_pilot_users: int = Field(default=500, ge=1, le=500)

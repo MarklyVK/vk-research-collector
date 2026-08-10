@@ -425,8 +425,12 @@ fi
 fast_forward_checkout
 compose config --quiet
 compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker
+# До начала upgrade схема не менялась: любой pre-migration сбой должен вернуть старый worker.
+ROLLBACK_ALLOWED=1
 log 'Проверяется и применяется только Alembic upgrade.'
 compose run --rm --no-deps collector alembic current
+# После начала forward migration старый image нельзя возвращать до успешного upgrade/check.
+ROLLBACK_ALLOWED=0
 compose run --rm --no-deps collector alembic upgrade head
 compose run --rm --no-deps collector alembic check
 ALEMBIC_REVISION=$(compose run --rm --no-deps collector alembic current | tail -n 1 | tr -d '\r')

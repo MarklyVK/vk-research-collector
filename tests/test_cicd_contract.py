@@ -133,6 +133,11 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
     assert "docker volume rm" not in text
     assert "docker compose build" not in text
     assert "docker system prune" not in text
+    stop = text.index('compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker')
+    preflight = text.index("compose run --rm --no-deps collector alembic current", stop)
+    upgrade = text.index("compose run --rm --no-deps collector alembic upgrade head", preflight)
+    assert text.index("ROLLBACK_ALLOWED=1", stop) < preflight
+    assert preflight < text.index("ROLLBACK_ALLOWED=0", preflight) < upgrade
     assert "compose up -d --remove-orphans postgres" not in text
     assert "git reset --hard" not in text
     assert "git clean" not in text
