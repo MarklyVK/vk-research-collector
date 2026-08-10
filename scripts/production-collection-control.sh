@@ -73,6 +73,19 @@ restart_worker() {
   fi
 }
 
+grant_collector_backup_read() {
+  local backup=$1 backup_dir
+  backup_dir=$(dirname "$backup")
+  chmod 0700 "$backup_dir"
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:10001:r "$backup"
+    log 'Worker получил постоянный read-only ACL только на проверенный backup.'
+  else
+    chmod o+r "$backup"
+    log 'setfacl отсутствует: backup directory закрыт 0700, файлу добавлено чтение для container UID.'
+  fi
+}
+
 report() {
   local worker_state postgres_state current_commit
   postgres_state=$(service_state postgres)
@@ -176,7 +189,7 @@ SQL
 }
 
 start_subscriptions() {
-  local active_runs latest_backup report_path production_allowed plan_output run_id
+  local active_runs gate_applied latest_backup report_path production_allowed plan_output run_id
   active_runs=$(psql_query -Atqc \
     "SELECT count(*) FROM collection_runs WHERE status::text IN ('planned','running','waiting_method_limit')")
   [[ "$active_runs" == 0 ]] \
@@ -187,6 +200,7 @@ start_subscriptions() {
   [[ -n "$latest_backup" && -s "$latest_backup" ]] || die 'Нет непустого backup для Gate A.'
   compose exec -T postgres pg_restore --list < "$latest_backup" >/dev/null \
     || die 'Последний backup не прошёл pg_restore --list.'
+  grant_collector_backup_read "$latest_backup"
 
   log 'Фиксирую безопасный лимит подписок: 50 на пользователя и включаю phase A.'
   set_env_value COLLECTION_SUBSCRIPTIONS_ENABLED true
@@ -198,28 +212,45 @@ start_subscriptions() {
   WORKER_STOPPED=1
   trap restart_worker EXIT
 
-  log 'Запускаю Pilot A подписок (capacity gate не обходится).'
-  collector collection subscriptions pilot
   report_path="$DEPLOY_DIR/exports/stage2-pilot/subscription-gate-a.json"
-  [[ -s "$report_path" ]] || die "Pilot A не создал отчёт: $report_path"
-  production_allowed=$(python3 -c \
-    'import json,sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["production_allowed"]).lower())' \
-    "$report_path")
-  [[ "$production_allowed" == true ]] \
-    || die 'Pilot A завершён, но capacity report не разрешает production run.'
+  gate_applied=0
+  run_id=$(psql_query -Atqc \
+    "SELECT id FROM collection_runs WHERE scope='subscriptions' AND status::text='paused_capacity_limit' ORDER BY created_at DESC LIMIT 1")
+  if [[ -n "$run_id" && -s "$report_path" ]]; then
+    log "Пробую применить уже измеренный Gate A к незапущенному run $run_id."
+    if collector collection capacity-apply \
+      --run-id "$run_id" \
+      --source /app/exports/stage2-pilot/subscription-gate-a.json \
+      --backup "/app/backups/$(basename "$latest_backup")"; then
+      gate_applied=1
+    else
+      log 'Существующий report не подошёл; выполняю новый измеряемый Pilot A.'
+    fi
+  fi
 
-  log 'Создаю production cohort подписок.'
-  plan_output=$(collector collection subscriptions plan)
-  printf '%s\n' "$plan_output"
-  run_id=$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-    <<< "$plan_output" | tail -n 1)
-  [[ -n "$run_id" ]] || die 'Не удалось получить run ID из production plan.'
+  if [[ "$gate_applied" -eq 0 ]]; then
+    log 'Запускаю Pilot A подписок (capacity gate не обходится).'
+    collector collection subscriptions pilot
+    [[ -s "$report_path" ]] || die "Pilot A не создал отчёт: $report_path"
+    production_allowed=$(python3 -c \
+      'import json,sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["production_allowed"]).lower())' \
+      "$report_path")
+    [[ "$production_allowed" == true ]] \
+      || die 'Pilot A завершён, но capacity report не разрешает production run.'
 
-  log "Применяю проверенный Gate A к run $run_id."
-  collector collection capacity-apply \
-    --run-id "$run_id" \
-    --source /app/exports/stage2-pilot/subscription-gate-a.json \
-    --backup "/app/backups/$(basename "$latest_backup")"
+    log 'Создаю production cohort подписок.'
+    plan_output=$(collector collection subscriptions plan)
+    printf '%s\n' "$plan_output"
+    run_id=$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+      <<< "$plan_output" | tail -n 1)
+    [[ -n "$run_id" ]] || die 'Не удалось получить run ID из production plan.'
+
+    log "Применяю проверенный Gate A к run $run_id."
+    collector collection capacity-apply \
+      --run-id "$run_id" \
+      --source /app/exports/stage2-pilot/subscription-gate-a.json \
+      --backup "/app/backups/$(basename "$latest_backup")"
+  fi
 
   restart_worker
   trap - EXIT
@@ -241,7 +272,7 @@ done
 
 [[ "$ACTION" == report || "$ACTION" == start-subscriptions ]] \
   || die "Неизвестное действие: $ACTION"
-for command in docker flock realpath sed awk find sort df grep mktemp python3; do
+for command in docker flock realpath sed awk find sort df grep mktemp python3 chmod chown; do
   command -v "$command" >/dev/null 2>&1 || die "Не найдена команда: $command"
 done
 docker compose version >/dev/null
