@@ -375,7 +375,29 @@ WITH chosen AS (
       WHERE g.classification_status = 'rejected')::bigint AS rejected_jobs
 ), active AS (
   SELECT count(*)::bigint AS active_runs FROM collection_runs
-  WHERE status IN ('planned', 'running')
+  WHERE status IN ('planned', 'running', 'waiting_method_limit')
+), endpoint AS (
+  SELECT
+    (SELECT count(*) FROM vk_token_method_states
+      WHERE blocked_until > now())::bigint AS blocked_token_methods,
+    (SELECT min(blocked_until) FROM vk_token_method_states
+      WHERE blocked_until > now()) AS next_method_retry_at,
+    (SELECT count(*) FROM user_subscription_states
+      WHERE privacy_denied)::bigint AS private_subscriptions,
+    (SELECT count(*) FROM user_subscription_states
+      WHERE last_success_at IS NOT NULL)::bigint AS subscription_users,
+    (SELECT count(*) FROM user_group_subscriptions)::bigint AS subscription_links,
+    (SELECT count(*) FROM vk_communities)::bigint AS communities,
+    (SELECT count(DISTINCT community_vk_id) FROM group_posts)::bigint AS communities_with_posts,
+    (SELECT count(*) FROM collection_jobs
+      WHERE job_type = 'collect_subscription_group_posts'
+      AND status IN ('pending', 'retry_wait'))::bigint AS subscription_post_jobs_pending,
+    (SELECT count(*) FROM collection_jobs
+      WHERE job_type = 'collect_subscription_group_posts'
+      AND status = 'completed')::bigint AS subscription_post_jobs_completed,
+    (SELECT count(*) FROM collection_jobs
+      WHERE job_type = 'collect_subscription_group_posts'
+      AND status = 'skipped')::bigint AS subscription_post_jobs_skipped
 )
 SELECT json_build_object(
   'run_id', r.id::text,
@@ -401,10 +423,21 @@ SELECT json_build_object(
   'uniqueness_constraints', v.uniqueness_constraints,
   'rejected_jobs', v.rejected_jobs,
   'active_runs', a.active_runs,
+  'blocked_token_methods', x.blocked_token_methods,
+  'next_method_retry_at', x.next_method_retry_at,
+  'private_subscriptions', x.private_subscriptions,
+  'subscription_users', x.subscription_users,
+  'subscription_links', x.subscription_links,
+  'communities', x.communities,
+  'communities_with_posts', x.communities_with_posts,
+  'subscription_post_jobs_pending', x.subscription_post_jobs_pending,
+  'subscription_post_jobs_completed', x.subscription_post_jobs_completed,
+  'subscription_post_jobs_skipped', x.subscription_post_jobs_skipped,
   'database_bytes', pg_database_size(current_database()),
   'alembic_revision', (SELECT version_num FROM alembic_version LIMIT 1)
 )
-FROM chosen r CROSS JOIN totals t CROSS JOIN errors e CROSS JOIN verify v CROSS JOIN active a;
+FROM chosen r CROSS JOIN totals t CROSS JOIN errors e CROSS JOIN verify v
+CROSS JOIN active a CROSS JOIN endpoint x;
 """
     result = runner.compose(
         [
@@ -770,6 +803,16 @@ def evaluate_snapshot(
                     "warning",
                     "Collection run поставлен на паузу",
                     "подтвердить, что пауза ожидаема",
+                    (f"Run: {run_id}",),
+                )
+            )
+        elif status == "waiting_method_limit":
+            issues.append(
+                Issue(
+                    "collection.method_limit_wait",
+                    "warning",
+                    "Collection run ожидает снятия endpoint limit",
+                    "проверить collection method-limits и next retry",
                     (f"Run: {run_id}",),
                 )
             )
