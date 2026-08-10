@@ -1,0 +1,72 @@
+name: Production storage cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Сначала preview; apply удаляет только allowlist-цели
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - apply
+      confirmation:
+        description: Для apply введите DELETE_OLD_BACKUPS
+        required: false
+        type: string
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Проверить и очистить production storage
+    runs-on: [self-hosted, linux, x64, production, vk-collector]
+    timeout-minutes: 45
+    environment:
+      name: production
+    steps:
+      - name: Получить проверенный main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Подтвердить commit и режим
+        shell: bash
+        env:
+          CLEANUP_MODE: ${{ inputs.mode }}
+          CLEANUP_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          if [[ "$CLEANUP_MODE" == apply ]]; then
+            test "$CLEANUP_CONFIRMATION" = DELETE_OLD_BACKUPS
+          else
+            test "$CLEANUP_MODE" = preview
+          fi
+      - name: Выполнить preview или allowlist cleanup
+        id: cleanup
+        shell: bash
+        env:
+          CLEANUP_MODE: ${{ inputs.mode }}
+          DEPLOY_ROOT: /opt/vk-research-collector
+        run: |
+          set -Eeuo pipefail
+          args=(--deploy-dir "$DEPLOY_ROOT")
+          [[ "$CLEANUP_MODE" == apply ]] && args+=(--apply)
+          report="$RUNNER_TEMP/production-storage-${GITHUB_RUN_ID}.log"
+          bash scripts/cleanup-production-storage.sh "${args[@]}" | tee "$report"
+          {
+            echo '## Production storage cleanup'
+            echo
+            echo '```text'
+            tail -n 80 "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
