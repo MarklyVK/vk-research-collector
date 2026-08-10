@@ -1,3 +1,5 @@
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -5,6 +7,11 @@ import pytest
 import yaml
 from pydantic import SecretStr, ValidationError
 
+from vk_collector.collection.capacity import (
+    build_capacity_report,
+    validate_capacity_report,
+    write_capacity_report,
+)
 from vk_collector.collection.notifications import notify
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.safety import inspect_disk, sanitize_message
@@ -78,6 +85,107 @@ def test_collection_configuration_captures_capacity_limits() -> None:
     assert small.collection_configuration() != large.collection_configuration()
     assert small.collection_configuration()["posts_max_per_group"] == 100
     assert small.collection_configuration()["members_max_per_group"] == 200
+    assert small.collection_configuration()["subscription_posts_ttl_days"] == 30
+
+
+def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) -> None:
+    configuration: dict[str, object] = {
+        "subscriptions_max_per_user": 50,
+        "subscriptions_users_per_run": 10_000,
+    }
+    report = build_capacity_report(
+        phase="A",
+        run_id=uuid.uuid4(),
+        configuration=configuration,
+        limits={
+            "pilot_users": 500,
+            "subscriptions_per_user": 50,
+            "subscriptions_preview_limit": 100,
+            "production_users": 10_000,
+        },
+        measured={
+            "duration_seconds": 1.0,
+            "api_requests": 500,
+            "processed_jobs": 500,
+            "completed_entities": 490,
+            "skipped_entities": 10,
+            "failed_entities": 0,
+            "database_bytes_before": 1024,
+            "database_bytes_after": 2048,
+            "database_growth_bytes": 1024,
+        },
+        projected={"database_bytes": 2048},
+        production_allowed=True,
+    )
+    target = tmp_path / "gate-a.json"
+    write_capacity_report(target, report)
+    assert not list(tmp_path.glob("*.tmp"))
+    assert (
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+        == report
+    )
+    with pytest.raises(ValueError, match="другой конфигурации"):
+        validate_capacity_report(
+            target,
+            phase="A",
+            configuration={
+                "subscriptions_max_per_user": 100,
+                "subscriptions_users_per_run": 10_000,
+            },
+            max_age_days=30,
+        )
+
+
+def test_capacity_report_rejects_stale_corrupt_and_theoretical_preview(tmp_path: Path) -> None:
+    configuration: dict[str, object] = {
+        "subscriptions_max_per_user": 50,
+        "subscriptions_users_per_run": 10_000,
+    }
+    limits = {
+        "subscriptions_per_user": 50,
+        "subscriptions_preview_limit": 100,
+        "production_users": 10_000,
+    }
+    measured = {
+        "duration_seconds": 1,
+        "api_requests": 1,
+        "processed_jobs": 1,
+        "completed_entities": 1,
+        "skipped_entities": 0,
+        "failed_entities": 0,
+        "database_bytes_before": 1,
+        "database_bytes_after": 2,
+        "database_growth_bytes": 1,
+    }
+    target = tmp_path / "gate-a.json"
+    stale = build_capacity_report(
+        phase="A",
+        run_id=uuid.uuid4(),
+        configuration=configuration,
+        limits=limits,
+        measured=measured,
+        projected={"database_bytes": 1024},
+        production_allowed=True,
+        measured_at=datetime.now(UTC) - timedelta(days=31),
+    )
+    write_capacity_report(target, stale)
+    with pytest.raises(ValueError, match="устарел"):
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+    target.write_text("{broken", encoding="utf-8")
+    with pytest.raises(ValueError, match="не читается"):
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+    preview = build_capacity_report(
+        phase="A",
+        run_id=uuid.uuid4(),
+        configuration=configuration,
+        limits=limits,
+        measured=measured,
+        projected={"database_bytes": 1024},
+        production_allowed=False,
+    )
+    write_capacity_report(target, preview)
+    with pytest.raises(ValueError, match="не разрешает"):
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
 
 
 def test_compose_defines_restartable_autonomous_worker() -> None:

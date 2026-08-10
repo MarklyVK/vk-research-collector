@@ -64,6 +64,9 @@ resume- и privacy-проверок. Полная готовность допо�
 Worker выбирает задания weighted round-robin между типами и пропускает временно
 недоступные методы. Ожидание method limit не расходует попытку задания; если временно
 недоступны все нужные методы, run получает `waiting_method_limit` и `next_wakeup_at`.
+После `next_probe_at` одна проба резервируется транзакционно; `blocked_until` остаётся
+долгим пределом. Ограничения нескольких разных methods в настраиваемом окне дают
+сохраняемый короткий global cooldown, но повторы одного method не эскалируют.
 
 Отдельный planner детерминированно выбирает существующих доступных `vk_users` из
 membership approved-групп независимо от TTL профиля. `groups.get` вызывается с
@@ -76,3 +79,9 @@ membership approved-групп независимо от TTL профиля. `gr
 `collect_subscription_group_posts` на run. Оно сохраняет до 20 последних постов и
 нормализованные метаданные вложений без binary/raw JSON. Оба новых scope имеют
 независимые pilot/capacity gates и до их прохождения выключены.
+
+Gate A, Gate B и два production scope всегда используют отдельные immutable run.
+Разрешающий JSON report содержит schema version, run ID, UTC-время, точные limits,
+configuration hash, measured/projected значения, лимит 7 GiB и
+`production_allowed=true`. Отсутствующий, повреждённый, устаревший или несовпадающий
+report блокирует run до чтения токенов и claim задания.

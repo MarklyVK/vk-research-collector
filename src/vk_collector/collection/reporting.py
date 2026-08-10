@@ -13,6 +13,7 @@ from vk_collector.database.models import (
     CollectionJobError,
     CollectionRun,
     CollectionRunStatus,
+    CommunityPostCollectionState,
     GroupCandidate,
     GroupMembership,
     GroupPost,
@@ -40,12 +41,14 @@ async def latest_run_id(
 async def latest_runnable_run_id(
     sessions: async_sessionmaker[AsyncSession],
 ) -> uuid.UUID | None:
-    """Найти последний разрешённый full/incremental run для автономного worker."""
+    """Найти последний разрешённый production run для автономного worker."""
     async with sessions() as session:
         run_id: uuid.UUID | None = await session.scalar(
             select(CollectionRun.id)
             .where(
-                CollectionRun.scope.in_(["full", "incremental"]),
+                CollectionRun.scope.in_(
+                    ["full", "incremental", "subscriptions", "subscription_posts"]
+                ),
                 CollectionRun.status.in_(
                     [
                         CollectionRunStatus.PLANNED,
@@ -131,6 +134,88 @@ async def run_summary(
             "next_wakeup_at": run.next_wakeup_at.isoformat() if run.next_wakeup_at else None,
             "blocked_token_methods": method_limits,
             "next_method_retry_at": next_method_retry.isoformat() if next_method_retry else None,
+            "capacity_gate": run.configuration.get("capacity_gate", "not_required"),
+            "phase": run.configuration.get("phase"),
+            "processed_users": int(
+                await session.scalar(
+                    select(func.count(UserSubscriptionState.user_id)).where(
+                        UserSubscriptionState.last_run_id == target,
+                        UserSubscriptionState.last_success_at.is_not(None),
+                    )
+                )
+                or 0
+            ),
+            "private_users": int(
+                await session.scalar(
+                    select(func.count(UserSubscriptionState.user_id)).where(
+                        UserSubscriptionState.last_run_id == target,
+                        UserSubscriptionState.privacy_denied.is_(True),
+                    )
+                )
+                or 0
+            ),
+            "skipped_users": sum(
+                count
+                for job_type, status, count in job_types
+                if job_type == "collect_user_subscriptions" and status == JobStatus.SKIPPED
+            ),
+            "skipped_walls": sum(
+                count
+                for job_type, status, count in job_types
+                if job_type == "collect_subscription_group_posts" and status == JobStatus.SKIPPED
+            ),
+            "subscription_links": int(
+                await session.scalar(
+                    select(func.count(UserGroupSubscription.id)).where(
+                        UserGroupSubscription.source_run_id == target
+                    )
+                )
+                or 0
+            ),
+            "unique_communities": int(
+                await session.scalar(
+                    select(func.count(distinct(UserGroupSubscription.vk_group_id))).where(
+                        UserGroupSubscription.source_run_id == target
+                    )
+                )
+                or 0
+            ),
+            "post_ttl_states": int(
+                await session.scalar(
+                    select(func.count(CommunityPostCollectionState.community_vk_id)).where(
+                        CommunityPostCollectionState.last_run_id == target
+                    )
+                )
+                or 0
+            ),
+            "post_jobs": sum(
+                count
+                for job_type, _status, count in job_types
+                if job_type == "collect_subscription_group_posts"
+            ),
+            "posts": int(
+                await session.scalar(
+                    select(func.count(GroupPost.id))
+                    .join(
+                        CommunityPostCollectionState,
+                        CommunityPostCollectionState.community_vk_id == GroupPost.community_vk_id,
+                    )
+                    .where(CommunityPostCollectionState.last_run_id == target)
+                )
+                or 0
+            ),
+            "attachments": int(
+                await session.scalar(
+                    select(func.count(PostAttachment.id))
+                    .join(GroupPost, GroupPost.id == PostAttachment.post_id)
+                    .join(
+                        CommunityPostCollectionState,
+                        CommunityPostCollectionState.community_vk_id == GroupPost.community_vk_id,
+                    )
+                    .where(CommunityPostCollectionState.last_run_id == target)
+                )
+                or 0
+            ),
         }
 
 
@@ -145,6 +230,7 @@ async def global_summary(sessions: async_sessionmaker[AsyncSession]) -> dict[str
             "subscriptions": UserGroupSubscription,
             "communities": VKCommunity,
             "subscription_states": UserSubscriptionState,
+            "community_post_states": CommunityPostCollectionState,
             "token_states": VKTokenState,
             "token_method_states": VKTokenMethodState,
             "runs": CollectionRun,
@@ -238,7 +324,19 @@ async def database_metrics(
             await session.scalar(select(func.pg_database_size(func.current_database()))) or 0
         )
         counts = await global_summary_from_session(session)
-        return {"database_bytes": size, **counts}
+        relations = {}
+        for table in (
+            "vk_communities",
+            "user_group_subscriptions",
+            "user_subscription_states",
+            "community_post_collection_states",
+            "group_posts",
+            "post_attachments",
+        ):
+            relations[f"relation_{table}_bytes"] = int(
+                await session.scalar(select(func.pg_total_relation_size(table))) or 0
+            )
+        return {"database_bytes": size, **counts, **relations}
 
 
 async def global_summary_from_session(session: AsyncSession) -> dict[str, int]:
@@ -277,7 +375,7 @@ async def capacity_gate_passed(
         run = await session.get(CollectionRun, run_id)
         return bool(
             run
-            and run.scope in {"full", "incremental"}
+            and run.scope in {"full", "incremental", "subscriptions", "subscription_posts"}
             and run.configuration.get("capacity_gate") == "passed"
             and run.status
             in {

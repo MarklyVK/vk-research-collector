@@ -6,9 +6,13 @@
 - PostgreSQL транзакционно координирует общий per-token RPS между CLI и worker.
 - Код 6 ставит глобальный короткий cooldown; 9 и 29 блокируют только token+method с
   экспоненциальным ростом до max; 5/27/28 отключают токен целиком.
+- После `next_probe_at` PostgreSQL под блокировкой строки резервирует одну пробу. Успех
+  очищает блок, повторный 9/29 увеличивает backoff. События разных методов в заданном
+  окне дают сохраняемый короткий global cooldown; повторы одного метода не эскалируют.
 - Weighted round-robin проходит шесть job types. Недоступный method не блокирует другие,
   method deferral не расходует attempt, run получает `waiting_method_limit` и wakeup.
-- Direct planner выбирает существующих публичных users по `vk_id`, учитывает TTL,
+- Direct planner выбирает существующих публичных users по `vk_id`, независимо от TTL
+  профиля и с учётом собственного subscription TTL,
   фиксирует hash snapshot и создаёт jobs идемпотентно.
 - `groups.get extended=1` сохраняет 50 (или 100) community objects, связи и checkpoint
   одной транзакцией. Код 260 фиксируется как private terminal skip. Усечённый snapshot
@@ -28,6 +32,11 @@ Migration `20260810_0006_endpoint_aware_subscriptions.py` добавляет:
 - FK subscription → community;
 - `group_posts.community_vk_id`, nullable candidate FK с `ON DELETE SET NULL` и индекс.
 
+Migration `20260810_0007_subscription_safety.py` добавляет
+`community_post_collection_states`: общий для candidate/subscription path TTL,
+last attempt/success, run, error/private/unavailable и collected count. Backfill не
+переписывает posts и оставляет существующие communities доступными к безопасному refresh.
+
 Backfill выполняется SQL-порциями по 10 000. На рабочей локальной копии связано
 698 915 posts и создано 51 334 canonical communities; orphan subscriptions/posts и
 дубли owner+post/user+community равны нулю. Повторный upgrade идемпотентен. Чистая БД
@@ -42,34 +51,37 @@ bytes, что превышает safe limit 7 GiB. Поэтому `production_al
 
 ## Безопасный запуск
 
-```bash
-make backup PURPOSE=before-subscriptions-pilot
-docker compose run --rm collector alembic upgrade head
-docker compose run --rm collector collection subscriptions capacity-preview
-docker compose run --rm collector collection subscriptions pilot
-docker compose run --rm collector collection subscriptions run --run-id RUN_ID --max-jobs 500
-docker compose run --rm collector collection subscriptions status --run-id RUN_ID
-```
-
-Production cohort разрешается только после двух реальных JSON reports и backup:
+Gate A, production subscriptions, Gate B и production posts — четыре разных run.
+Изменение flag/TTL/лимита требует нового run и нового совпадающего report:
 
 ```bash
 COLLECTION_SUBSCRIPTIONS_ENABLED=true \
 COLLECTION_SUBSCRIPTIONS_MAX_PER_USER=50 \
-docker compose run --rm collector collection subscriptions plan
+COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=false \
+docker compose run --rm collector collection subscriptions pilot
 
-docker compose run --rm collector collection subscriptions run --run-id RUN_ID
+docker compose run --rm collector collection subscriptions plan
+docker compose run --rm collector collection capacity-apply \
+  --run-id SUBSCRIPTIONS_RUN_ID --source /app/exports/stage2-pilot/subscription-gate-a.json
+docker compose run --rm collector collection subscriptions run --run-id SUBSCRIPTIONS_RUN_ID
 ```
 
-Posts включаются отдельным rollout только после Gate B:
+Затем включается posts scope и выполняется отдельный Gate B:
 
 ```bash
 COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=true \
-docker compose run --rm collector collection subscriptions run --run-id RUN_ID
+docker compose run --rm collector collection subscriptions posts-pilot \
+  --source-run-id PILOT_A_RUN_ID
+docker compose run --rm collector collection subscriptions posts-plan \
+  --source-run-id SUBSCRIPTIONS_RUN_ID
+docker compose run --rm collector collection capacity-apply \
+  --run-id POSTS_RUN_ID --source /app/exports/stage2-pilot/subscription-gate-b.json
+docker compose run --rm collector collection subscriptions run --run-id POSTS_RUN_ID
 ```
 
 ## Ограничения
 
-Реальные VK tokens, real pilot и production deployment не запускались. Теоретический
-Gate B не проходит лимит диска, поэтому массовый сбор posts сейчас запрещён. Reset
+Реальные VK tokens, Pilot A/B и production deployment в этой реализации не запускались.
+Сгенерированных измеренных разрешающих reports нет, поэтому оба production gate закрыты.
+Теоретический Gate B превышает лимит диска и ничего не разрешает. Reset
 method limits точечный и требует `--yes`; массового reset токенов/data нет.

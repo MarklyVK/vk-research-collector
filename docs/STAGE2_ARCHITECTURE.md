@@ -117,8 +117,9 @@ Plan-key и capacity report содержат одинаковую collection-к�
 лимитов блокирует worker до обращения к VK. Backup создаётся перед schema/pilot/main run,
 проверяется `pg_restore --list` и не коммитится.
 
-После сбоя `collector-worker` запускается Docker Compose автоматически и выбирает только
-full или incremental run с `capacity_gate=passed`. Ручной путь — `collection resume`, затем
+После сбоя `collector-worker` запускается Docker Compose автоматически и выбирает
+full/incremental/subscriptions/subscription_posts run только с `capacity_gate=passed`.
+Pilot автономно не выбирается. Ручной путь — `collection resume`, затем
 `collection run --run-id ... --until-idle`; checkpoint исключает дубли уже сохранённых
 страниц. На Windows это требует запущенного Docker Desktop; на Debian Docker включается
 через systemd.
@@ -165,3 +166,9 @@ approved membership -> vk_user -> groups.get extended=1
 Subscription communities не попадают в поисковую классификацию. `group_posts`
 ссылается на `vk_communities`; необязательная обратная связь с `group_candidates`
 сохраняется для совместимости.
+
+`next_probe_at` — не декоративное поле: после его наступления worker транзакционно
+переносит его вперёд и получает единственный probe lease, хотя `blocked_until` ещё не
+истёк. Успех очищает method state, повторный limit увеличивает backoff. Run в
+`waiting_method_limit` остаётся видим автономному worker и возвращается в `running`
+после `next_wakeup_at`; method deferral уменьшает обратно технический claim attempt.

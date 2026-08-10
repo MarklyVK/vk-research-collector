@@ -10,6 +10,8 @@ Endpoint-aware расширение добавляет `vk_token_states` и `vk_
 `vk_communities.vk_id`. `group_posts.community_vk_id` получает FK на тот же реестр,
 а прежний `group_id` становится nullable с `ON DELETE SET NULL`. Backfill выполняется
 SQL-порциями и проверяет NULL/orphan rows до усиления constraints.
+Migration `20260810_0007` добавляет `community_post_collection_states` с PK/FK на
+`vk_communities`: это единый TTL/error checkpoint обоих путей wall-сбора.
 
 | Таблица | Назначение и ключи | Основные поля и индексы | Обновление / ожидаемый объём |
 |---|---|---|---|
@@ -21,6 +23,7 @@ SQL-порциями и проверяет NULL/orphan rows до усилени�
 | `vk_users` | PK = публичный VK ID | имя, фамилия, screen name, закрытость/deactivated, first/last seen, refreshed at | Публичный минимальный профиль; потенциально миллионы |
 | `group_memberships` | PK bigint; FK group/user; UQ group+user | first/last seen, current, snapshot/source run; indexes user и group/current | Upsert; деактивация лишь после полного snapshot |
 | `user_group_subscriptions` | PK bigint; FK user; UQ user+VK group ID | first/last seen, current, snapshot/source run | По умолчанию не планируется; отдельный gate |
+| `community_post_collection_states` | PK/FK community | attempt/success/next schedule, run, error/private/unavailable, count | Upsert после candidate и subscription wall path; управляет общим TTL |
 | `collection_job_errors` | PK bigint; FK run/job CASCADE | token fingerprint, endpoint, category, VK/HTTP code, attempt, sanitized message, time | Append-only диагностическая история с retention |
 | `search_run_groups` | UQ run+group | `was_new`, first seen | Дедуплицированная статистика known/new для отдельного search run |
 | `classification_reviews` | UQ operation+group | previous/final approved и labels, confidence, reason, source | Неизменяемый аудит reclassification; прежние labels не удаляются |

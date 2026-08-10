@@ -144,6 +144,58 @@ async def test_method_cooldown_grows_and_is_capped() -> None:
     assert await pool.method_cooldown(lease, 9) == 55
 
 
+@pytest.mark.asyncio
+async def test_next_probe_allows_exactly_one_attempt_before_long_block_expires() -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=100,
+        probe_seconds=10,
+    )
+    lease = await pool.acquire("groups.get")
+    await pool.method_cooldown(lease, 9)
+    with pytest.raises(VKMethodUnavailable):
+        await pool.acquire("groups.get")
+    time.value = 10
+    probe = await pool.acquire("groups.get")
+    assert probe.is_probe
+    with pytest.raises(VKMethodUnavailable):
+        await pool.acquire("groups.get")
+    await pool.mark_success(probe)
+    assert not (await pool.acquire("groups.get")).is_probe
+
+
+@pytest.mark.asyncio
+async def test_code_6_uses_pool_configured_17_second_cooldown() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200, json={"error": {"error_code": 6, "error_msg": "too many requests"}}
+            )
+        return httpx.Response(200, json={"response": []})
+
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        global_rps_cooldown=17,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        await VKClient(pool, http_client=http).call("users.get", {})
+    assert time.sleeps == [17]
+
+
 @async_test
 async def test_auth_error_switches_token_without_leaking_it() -> None:
     seen: list[str] = []

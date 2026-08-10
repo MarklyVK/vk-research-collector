@@ -22,6 +22,7 @@ from vk_collector.database.models import (
     CollectionJobError,
     CollectionRun,
     CollectionRunStatus,
+    CommunityPostCollectionState,
     GroupCandidate,
     GroupCollectionState,
     GroupMembership,
@@ -311,6 +312,11 @@ class CollectionWorker:
                     job.id, JobStatus.SKIPPED, error_type=category, error_message=message
                 )
             elif exc.code in TERMINAL_VK_CODES:
+                if job.job_type in {
+                    "collect_group_posts",
+                    "collect_subscription_group_posts",
+                }:
+                    await self._mark_post_failure(job, exc.code, message, terminal=True)
                 await self._queue.finish(
                     job.id, JobStatus.SKIPPED, error_type=category, error_message=message
                 )
@@ -359,6 +365,8 @@ class CollectionWorker:
         )
 
     async def _retry_or_fail(self, job: ClaimedJob, category: str, message: str) -> None:
+        if job.job_type in {"collect_group_posts", "collect_subscription_group_posts"}:
+            await self._mark_post_failure(job, None, message, terminal=False)
         if job.attempt_count >= len(RETRY_DELAYS):
             await self._queue.finish(
                 job.id, JobStatus.FAILED, error_type=category, error_message=message
@@ -546,18 +554,52 @@ class CollectionWorker:
             if not items or offset >= total or len(items) < count:
                 break
         async with self._sessions() as session:
+            now = datetime.now(UTC)
             await session.execute(
                 insert(GroupCollectionState)
                 .values(
                     group_id=group.id,
                     posts_checkpoint={"offset": offset},
-                    last_posts_success_at=datetime.now(UTC),
+                    last_posts_success_at=now,
                 )
                 .on_conflict_do_update(
                     index_elements=[GroupCollectionState.group_id],
                     set_={
                         "posts_checkpoint": {"offset": offset},
-                        "last_posts_success_at": datetime.now(UTC),
+                        "last_posts_success_at": now,
+                    },
+                )
+            )
+            await session.execute(
+                insert(CommunityPostCollectionState)
+                .values(
+                    community_vk_id=group.vk_id,
+                    last_attempt_at=now,
+                    last_success_at=now,
+                    next_scheduled_at=now
+                    + timedelta(days=self._settings.collection_subscription_group_posts_ttl_days),
+                    last_run_id=job.run_id,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    collected_count=offset,
+                    wall_private=False,
+                    unavailable=False,
+                )
+                .on_conflict_do_update(
+                    index_elements=[CommunityPostCollectionState.community_vk_id],
+                    set_={
+                        "last_attempt_at": now,
+                        "last_success_at": now,
+                        "next_scheduled_at": now
+                        + timedelta(
+                            days=self._settings.collection_subscription_group_posts_ttl_days
+                        ),
+                        "last_run_id": job.run_id,
+                        "last_error_code": None,
+                        "last_error_reason": None,
+                        "collected_count": offset,
+                        "wall_private": False,
+                        "unavailable": False,
                     },
                 )
             )
@@ -833,22 +875,6 @@ class CollectionWorker:
                             },
                         )
                     )
-                    if (
-                        self._settings.collection_subscription_group_posts_enabled
-                        and not value.get("deactivated")
-                        and not bool(value.get("is_closed", False))
-                    ):
-                        await session.execute(
-                            insert(CollectionJob)
-                            .values(
-                                collection_run_id=job.run_id,
-                                job_type="collect_subscription_group_posts",
-                                entity_type="community",
-                                entity_id=group_id,
-                                priority=60,
-                            )
-                            .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
-                        )
                 offset += len(raw_items) if isinstance(raw_items, list) else 0
                 await session.execute(
                     insert(UserSubscriptionState)
@@ -1046,6 +1072,90 @@ class CollectionWorker:
                 {"offset": len(items), "total": int(response.get("count", 0))},
                 1,
                 len(items),
+            )
+            await session.execute(
+                insert(CommunityPostCollectionState)
+                .values(
+                    community_vk_id=community.vk_id,
+                    last_attempt_at=now,
+                    last_success_at=now,
+                    next_scheduled_at=now
+                    + timedelta(days=self._settings.collection_subscription_group_posts_ttl_days),
+                    last_run_id=job.run_id,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    collected_count=len(items),
+                    wall_private=False,
+                    unavailable=False,
+                )
+                .on_conflict_do_update(
+                    index_elements=[CommunityPostCollectionState.community_vk_id],
+                    set_={
+                        "last_attempt_at": now,
+                        "last_success_at": now,
+                        "next_scheduled_at": now
+                        + timedelta(
+                            days=self._settings.collection_subscription_group_posts_ttl_days
+                        ),
+                        "last_run_id": job.run_id,
+                        "last_error_code": None,
+                        "last_error_reason": None,
+                        "collected_count": len(items),
+                        "wall_private": False,
+                        "unavailable": False,
+                    },
+                )
+            )
+            await session.commit()
+
+    async def _mark_post_failure(
+        self,
+        job: ClaimedJob,
+        error_code: int | None,
+        reason: str,
+        *,
+        terminal: bool,
+    ) -> None:
+        community_id = job.entity_id
+        if job.job_type == "collect_group_posts":
+            try:
+                community_id = (await self._group(job.entity_id)).vk_id
+            except ValueError:
+                return
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            await session.execute(
+                insert(CommunityPostCollectionState)
+                .values(
+                    community_vk_id=community_id,
+                    last_attempt_at=now,
+                    next_scheduled_at=now
+                    + timedelta(days=self._settings.collection_subscription_group_posts_ttl_days)
+                    if terminal
+                    else None,
+                    last_run_id=job.run_id,
+                    last_error_code=error_code,
+                    last_error_reason=reason[:255],
+                    wall_private=terminal and error_code in {7, 15},
+                    unavailable=terminal and error_code in {18, 30},
+                )
+                .on_conflict_do_update(
+                    index_elements=[CommunityPostCollectionState.community_vk_id],
+                    set_={
+                        "last_attempt_at": now,
+                        "next_scheduled_at": now
+                        + timedelta(
+                            days=self._settings.collection_subscription_group_posts_ttl_days
+                        )
+                        if terminal
+                        else None,
+                        "last_run_id": job.run_id,
+                        "last_error_code": error_code,
+                        "last_error_reason": reason[:255],
+                        "wall_private": terminal and error_code in {7, 15},
+                        "unavailable": terminal and error_code in {18, 30},
+                    },
+                )
             )
             await session.commit()
 

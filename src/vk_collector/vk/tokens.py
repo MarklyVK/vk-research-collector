@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from vk_collector.database.models import VKTokenMethodState, VKTokenState
@@ -45,6 +45,7 @@ class TokenLease:
     fingerprint: str
     method: str
     issued_at: float
+    is_probe: bool = False
 
 
 @dataclass(slots=True)
@@ -54,6 +55,7 @@ class _MethodState:
     consecutive_quota_hits: int = 0
     last_error_code: int | None = None
     last_success_at: float | None = None
+    next_probe_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -138,7 +140,18 @@ class TokenPool:
                     method_state = state.methods.get(method)
                     blocked_until = method_state.blocked_until if method_state else 0.0
                     if blocked_until > now:
-                        method_retry.append(blocked_until)
+                        if method_state is not None and method_state.next_probe_at <= now:
+                            method_state.next_probe_at = now + self._probe_seconds
+                            state.next_request_at = now + self._interval
+                            self._cursor = (index + 1) % len(self._states)
+                            return TokenLease(
+                                state.value, state.fingerprint, method, now, is_probe=True
+                            )
+                        method_retry.append(
+                            min(blocked_until, method_state.next_probe_at)
+                            if method_state is not None and method_state.next_probe_at > now
+                            else blocked_until
+                        )
                         continue
                     ready_at = max(state.next_request_at, state.global_blocked_until)
                     if ready_at <= now:
@@ -213,6 +226,7 @@ class TokenPool:
             duration = min(self._method_max, initial * (2 ** (hits - 1)))
             now = self._clock()
             method_state.blocked_until = max(method_state.blocked_until, now + duration)
+            method_state.next_probe_at = min(method_state.blocked_until, now + self._probe_seconds)
             method_state.last_error_code = error_code
             state.limit_events = [
                 event for event in state.limit_events if event[0] >= now - self._escalation_window
@@ -226,6 +240,7 @@ class TokenPool:
         if self._sessions is not None:
             async with self._sessions() as session:
                 now_dt = datetime.now(UTC)
+                token_row = await session.get(VKTokenState, lease.fingerprint, with_for_update=True)
                 row = await session.scalar(
                     select(VKTokenMethodState)
                     .where(
@@ -269,6 +284,25 @@ class TokenPool:
                         },
                     )
                 )
+                distinct_methods = int(
+                    await session.scalar(
+                        select(func.count(func.distinct(VKTokenMethodState.method))).where(
+                            VKTokenMethodState.token_fingerprint == lease.fingerprint,
+                            VKTokenMethodState.last_error_at
+                            >= now_dt - timedelta(seconds=self._escalation_window),
+                            VKTokenMethodState.last_error_code.in_([9, 29]),
+                        )
+                    )
+                    or 0
+                )
+                if token_row is not None and distinct_methods >= self._escalation_methods:
+                    escalated_until = now_dt + timedelta(seconds=self._global_rps_cooldown)
+                    token_row.global_blocked_until = (
+                        escalated_until
+                        if token_row.global_blocked_until is None
+                        else max(token_row.global_blocked_until, escalated_until)
+                    )
+                    token_row.last_error_at = now_dt
                 await session.commit()
                 blocked_until = self._clock() + duration
         return blocked_until
@@ -282,6 +316,8 @@ class TokenPool:
             method_state.consecutive_quota_hits = 0
             method_state.last_error_code = None
             method_state.last_success_at = self._clock()
+            method_state.blocked_until = 0.0
+            method_state.next_probe_at = 0.0
         if self._sessions is not None:
             async with self._sessions() as session:
                 now_dt = datetime.now(UTC)
@@ -315,6 +351,8 @@ class TokenPool:
                 blocked = select(VKTokenMethodState.token_fingerprint).where(
                     VKTokenMethodState.method == method,
                     VKTokenMethodState.blocked_until > now,
+                    (VKTokenMethodState.next_probe_at.is_(None))
+                    | (VKTokenMethodState.next_probe_at > now),
                 )
                 count = await session.scalar(
                     select(VKTokenState.token_fingerprint)
@@ -335,7 +373,10 @@ class TokenPool:
             return any(
                 not state.disabled
                 and state.global_blocked_until <= now_clock
-                and state.methods.get(method, _MethodState()).blocked_until <= now_clock
+                and (
+                    state.methods.get(method, _MethodState()).blocked_until <= now_clock
+                    or state.methods.get(method, _MethodState()).next_probe_at <= now_clock
+                )
                 for state in self._states
             )
 
@@ -350,7 +391,10 @@ class TokenPool:
                         select(
                             VKTokenState.next_request_at,
                             VKTokenState.global_blocked_until,
-                            VKTokenMethodState.blocked_until,
+                            func.least(
+                                VKTokenMethodState.blocked_until,
+                                VKTokenMethodState.next_probe_at,
+                            ),
                         )
                         .outerjoin(
                             VKTokenMethodState,
@@ -379,7 +423,13 @@ class TokenPool:
                 max(
                     state.next_request_at,
                     state.global_blocked_until,
-                    state.methods.get(method, _MethodState()).blocked_until,
+                    min(
+                        state.methods.get(method, _MethodState()).blocked_until,
+                        state.methods.get(method, _MethodState()).next_probe_at,
+                    )
+                    if state.methods.get(method, _MethodState()).blocked_until > self._clock()
+                    and state.methods.get(method, _MethodState()).next_probe_at > self._clock()
+                    else state.methods.get(method, _MethodState()).blocked_until,
                 )
                 for state in self._states
                 if not state.disabled
@@ -476,7 +526,28 @@ class TokenPool:
                         and method_row.blocked_until is not None
                         and method_row.blocked_until > now_dt
                     ):
-                        method_retry.append(method_row.blocked_until)
+                        if (
+                            method_row.next_probe_at is not None
+                            and method_row.next_probe_at <= now_dt
+                        ):
+                            method_row.next_probe_at = now_dt + timedelta(
+                                seconds=self._probe_seconds
+                            )
+                            row.next_request_at = now_dt + timedelta(seconds=self._interval)
+                            self._cursor = (index + 1) % len(self._states)
+                            await session.commit()
+                            return TokenLease(
+                                local.value,
+                                local.fingerprint,
+                                method,
+                                self._clock(),
+                                is_probe=True,
+                            )
+                        method_retry.append(
+                            min(method_row.blocked_until, method_row.next_probe_at)
+                            if method_row.next_probe_at is not None
+                            else method_row.blocked_until
+                        )
                         continue
                     ready_at = max(
                         value

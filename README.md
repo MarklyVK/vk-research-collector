@@ -1282,29 +1282,46 @@ Runtime secrets остаются только на сервере:
 
 ### Endpoint-aware подписки пользователей (выключены по умолчанию)
 
-Новый контур не запускается автоматически. Перед pilot сделайте проверенный backup,
-примените migration и оставьте оба feature flag в `false`:
+Новый контур не запускается автоматически. Каждый этап создаёт новый immutable run;
+после создания run нельзя менять влияющие на него flags/лимиты. Перед Pilot A сделайте
+backup, примените migration, включите только scope подписок и зафиксируйте лимит 50:
 
 ```bash
 make backup PURPOSE=before-subscriptions-pilot
 docker compose run --rm collector alembic upgrade head
 docker compose run --rm collector collection subscriptions capacity-preview
+export COLLECTION_SUBSCRIPTIONS_ENABLED=true
+export COLLECTION_SUBSCRIPTIONS_MAX_PER_USER=50
+export COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=false
 docker compose run --rm collector collection subscriptions pilot
-docker compose run --rm collector collection subscriptions run --run-id RUN_ID --max-jobs 500
-docker compose run --rm collector collection subscriptions status --run-id RUN_ID
 ```
 
-После измеренного Gate A разрешается отдельный cohort до 10 000 users с лимитом 50.
-Лимит 100 оценивается отдельным повторным pilot. Gate B (20 posts на уникальную
-community) включается только после Gate A и собственного capacity report:
+`pilot` сам выполняет до 500 jobs и атомарно пишет
+`subscription-gate-a.json`. Если report измеренный, свежий и разрешающий, создайте
+отдельный production run, примените Gate A и выполните его:
 
 ```bash
-COLLECTION_SUBSCRIPTIONS_ENABLED=true \
-COLLECTION_SUBSCRIPTIONS_MAX_PER_USER=50 \
 docker compose run --rm collector collection subscriptions plan
+docker compose run --rm collector collection capacity-apply \
+  --run-id SUBSCRIPTIONS_RUN_ID \
+  --source /app/exports/stage2-pilot/subscription-gate-a.json
+docker compose run --rm collector collection subscriptions run \
+  --run-id SUBSCRIPTIONS_RUN_ID
+```
 
-COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=true \
-docker compose run --rm collector collection subscriptions run --run-id RUN_ID
+Gate B — ещё один pilot и ещё один run. После включения posts нельзя продолжать
+`SUBSCRIPTIONS_RUN_ID`, потому что его configuration неизменяема:
+
+```bash
+export COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=true
+docker compose run --rm collector collection subscriptions posts-pilot \
+  --source-run-id PILOT_A_RUN_ID
+docker compose run --rm collector collection subscriptions posts-plan \
+  --source-run-id SUBSCRIPTIONS_RUN_ID
+docker compose run --rm collector collection capacity-apply \
+  --run-id POSTS_RUN_ID \
+  --source /app/exports/stage2-pilot/subscription-gate-b.json
+docker compose run --rm collector collection subscriptions run --run-id POSTS_RUN_ID
 ```
 
 Перед production cohort обязательны backup, свободное место по реальному JSON report и

@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)
     vk_method_limit_probe_seconds: int = Field(default=900, ge=1)
     vk_global_rps_cooldown_seconds: int = Field(default=60, ge=1)
+    vk_limit_escalation_window_seconds: int = Field(default=60, ge=1)
+    vk_limit_escalation_distinct_methods: int = Field(default=3, ge=2)
     classification_batch_size: int = Field(default=100, ge=1)
     export_dir: Path = Path("/app/exports/classification")
     postgres_db: str = "vk_research"
@@ -75,6 +77,7 @@ class Settings(BaseSettings):
     collection_subscription_group_posts_enabled: bool = False
     collection_subscription_group_posts_max: int = Field(default=20, ge=1, le=20)
     collection_subscription_group_posts_ttl_days: int = Field(default=30, ge=1)
+    collection_capacity_report_max_age_days: int = Field(default=30, ge=1)
     collection_pilot_seed: int = 20260728
     collection_pilot_groups_per_category: int = Field(default=10, ge=1)
     collection_export_dir: Path = Path("/app/exports/stage2-pilot")

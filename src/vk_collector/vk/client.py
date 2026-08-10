@@ -32,14 +32,12 @@ class VKClient:
         http_client: httpx.AsyncClient | None = None,
         sleep: Sleep = asyncio.sleep,
         retry_delays: Sequence[float] = (60, 300, 900, 3600, 21600),
-        cooldown_seconds: float = 60.0,
         jitter: Jitter | None = None,
     ) -> None:
         self._pool = token_pool
         self._api_version = api_version
         self._sleep = sleep
         self._retry_delays = tuple(retry_delays)
-        self._cooldown_seconds = cooldown_seconds
         self._jitter = jitter or (lambda delay: random.uniform(0.9, 1.1) * delay)
         self._http = http_client or httpx.AsyncClient(
             base_url="https://api.vk.com/method/", timeout=timeout
@@ -94,7 +92,7 @@ class VKClient:
                 await self._pool.disable(lease, f"VK auth error {code}")
                 continue
             if code in GLOBAL_RATE_LIMIT_ERRORS:
-                await self._pool.global_cooldown(lease, self._cooldown_seconds)
+                await self._pool.global_cooldown(lease)
                 continue
             if code in METHOD_LIMIT_ERRORS:
                 await self._pool.method_cooldown(lease, code)

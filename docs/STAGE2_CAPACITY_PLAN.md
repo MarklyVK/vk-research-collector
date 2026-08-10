@@ -10,6 +10,12 @@ communities, рост БД и длительность. Gate B берёт уни
 оба прогноза укладываются в safe disk limit. Отсутствие реального pilot означает
 техническую готовность к pilot, но не готовность к production rollout.
 
+Reports записываются атомарно и применяются только к точному configuration hash в
+течение `COLLECTION_CAPACITY_REPORT_MAX_AGE_DAYS`. Теоретический preview всегда имеет
+`production_allowed=false`. Порядок rollout: новый Pilot A run → новый subscriptions
+run → новый Pilot B run → новый subscription_posts run. После изменения flags, TTL,
+лимита или cohort size создаются новый run и новый report; старый run не продолжается.
+
 ## До pilot
 
 Известно 12 260 целевых approved-групп. Ни число доступных постов/участников, ни

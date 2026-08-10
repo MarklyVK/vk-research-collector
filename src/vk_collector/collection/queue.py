@@ -19,11 +19,14 @@ from vk_collector.database.models import (
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
+    CommunityPostCollectionState,
     GroupCandidate,
     GroupLabel,
     GroupMembership,
     JobStatus,
+    UserGroupSubscription,
     UserSubscriptionState,
+    VKCommunity,
     VKUser,
 )
 from vk_collector.subjects import SUBJECT_NAMES
@@ -104,8 +107,6 @@ class CollectionQueue:
             scopes.append("members")
         if self._settings.collection_users_enabled:
             scopes.append("users")
-        if self._settings.collection_subscriptions_enabled:
-            scopes.append("subscriptions")
         return tuple(scopes)
 
     def collection_configuration(self) -> dict[str, object]:
@@ -123,10 +124,14 @@ class CollectionQueue:
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
             "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,
             "subscriptions_ttl_days": self._settings.collection_subscriptions_ttl_days,
+            "subscriptions_enabled": self._settings.collection_subscriptions_enabled,
             "subscription_posts_enabled": (
                 self._settings.collection_subscription_group_posts_enabled
             ),
             "subscription_posts_max": self._settings.collection_subscription_group_posts_max,
+            "subscription_posts_ttl_days": (
+                self._settings.collection_subscription_group_posts_ttl_days
+            ),
         }
 
     async def incremental_group_ids(self, baseline_run_id: uuid.UUID) -> list[int]:
@@ -459,6 +464,7 @@ class CollectionQueue:
                     ).encode()
                 ).hexdigest(),
                 "pilot": pilot,
+                "phase": "A",
                 "user_ids_hash": id_hash,
                 "user_count": len(ids),
                 "collection": self.collection_configuration(),
@@ -473,8 +479,18 @@ class CollectionQueue:
                 return existing.id
             run = CollectionRun(
                 scope="subscriptions_pilot" if pilot else "subscriptions",
-                status=CollectionRunStatus.PLANNED,
+                status=(
+                    CollectionRunStatus.COMPLETED
+                    if not ids
+                    else CollectionRunStatus.PLANNED
+                    if pilot
+                    else CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                ),
                 configuration=configuration,
+                finished_at=now if not ids else None,
+                error_message="Нет подходящих пользователей; запуск завершён без API-вызовов"
+                if not ids
+                else None,
             )
             session.add(run)
             await session.flush()
@@ -491,6 +507,112 @@ class CollectionQueue:
                                 "priority": 50,
                             }
                             for user_id in ids[start : start + 1000]
+                        ]
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+            run.total_jobs = len(ids)
+            await session.commit()
+            return run.id
+
+    async def plan_subscription_posts(
+        self,
+        *,
+        pilot: bool = False,
+        source_run_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        """Создать отдельный неизменяемый run последних 20 постов communities."""
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            if pilot:
+                if source_run_id is None:
+                    source_run_id = await session.scalar(
+                        select(CollectionRun.id)
+                        .where(
+                            CollectionRun.scope == "subscriptions_pilot",
+                            CollectionRun.status == CollectionRunStatus.COMPLETED,
+                        )
+                        .order_by(CollectionRun.created_at.desc())
+                        .limit(1)
+                    )
+                if source_run_id is None:
+                    raise ValueError("Для Pilot B нужен завершённый Pilot A")
+                source_run = await session.get(CollectionRun, source_run_id)
+                if (
+                    source_run is None
+                    or source_run.scope != "subscriptions_pilot"
+                    or source_run.status != CollectionRunStatus.COMPLETED
+                ):
+                    raise ValueError("Pilot B принимает только успешно завершённый Pilot A")
+            fresh = select(CommunityPostCollectionState.community_vk_id).where(
+                CommunityPostCollectionState.next_scheduled_at > now,
+            )
+            query = (
+                select(VKCommunity.vk_id)
+                .join(
+                    UserGroupSubscription,
+                    UserGroupSubscription.vk_group_id == VKCommunity.vk_id,
+                )
+                .where(
+                    UserGroupSubscription.is_current.is_(True),
+                    VKCommunity.deactivated.is_(None),
+                    VKCommunity.is_closed.is_(False),
+                    VKCommunity.vk_id.not_in(fresh),
+                )
+                .distinct()
+                .order_by(VKCommunity.vk_id)
+            )
+            if pilot and source_run_id is not None:
+                query = query.where(UserGroupSubscription.source_run_id == source_run_id)
+            ids = list((await session.scalars(query)).all())
+            configuration = {
+                "pilot": pilot,
+                "phase": "B",
+                "source_run_id": str(source_run_id) if source_run_id else None,
+                "community_count": len(ids),
+                "collection": self.collection_configuration(),
+                "capacity_gate": "pilot" if pilot else "pilot_required",
+            }
+            configuration["plan_key"] = hashlib.sha256(
+                json.dumps({**configuration, "community_ids": ids}, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            existing = await session.scalar(
+                select(CollectionRun).where(
+                    CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+                )
+            )
+            if existing is not None:
+                return existing.id
+            run = CollectionRun(
+                scope="subscription_posts_pilot" if pilot else "subscription_posts",
+                status=(
+                    CollectionRunStatus.COMPLETED
+                    if not ids
+                    else CollectionRunStatus.PLANNED
+                    if pilot
+                    else CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                ),
+                configuration=configuration,
+                finished_at=now if not ids else None,
+                error_message="Нет communities для сбора постов; запуск завершён без API-вызовов"
+                if not ids
+                else None,
+            )
+            session.add(run)
+            await session.flush()
+            for start in range(0, len(ids), 1000):
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        [
+                            {
+                                "collection_run_id": run.id,
+                                "job_type": "collect_subscription_group_posts",
+                                "entity_type": "community",
+                                "entity_id": community_id,
+                                "priority": 60,
+                            }
+                            for community_id in ids[start : start + 1000]
                         ]
                     )
                     .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")

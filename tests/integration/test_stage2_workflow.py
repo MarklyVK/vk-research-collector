@@ -19,12 +19,15 @@ from vk_collector.database.models import (
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
+    CommunityPostCollectionState,
     GroupCandidate,
     GroupLabel,
     GroupMembership,
     GroupPost,
     JobStatus,
     UserGroupSubscription,
+    VKTokenMethodState,
+    VKTokenState,
     VKUser,
 )
 from vk_collector.database.session import create_database_engine
@@ -138,12 +141,51 @@ async def test_endpoint_state_survives_new_pool_and_does_not_block_other_method(
                 sleep=clock.sleep,
                 sessions=sessions,
                 flood_initial_cooldown=60,
+                probe_seconds=10,
+                escalation_methods=2,
             )
             with pytest.raises(VKMethodUnavailable):
                 await restarted_pool.acquire("groups.get")
             wall_lease = await restarted_pool.acquire("wall.get")
             assert wall_lease.method == "wall.get"
             assert token not in repr(wall_lease)
+
+            # PostgreSQL резервирует ровно одну probe-попытку между worker-процессами.
+            async with sessions() as session:
+                await session.execute(
+                    update(VKTokenMethodState)
+                    .where(
+                        VKTokenMethodState.token_fingerprint == lease.fingerprint,
+                        VKTokenMethodState.method == "groups.get",
+                    )
+                    .values(next_probe_at=datetime.now(UTC) - timedelta(seconds=1))
+                )
+                await session.commit()
+            probe = await restarted_pool.acquire("groups.get")
+            assert probe.is_probe
+            competing_pool = TokenPool(
+                [token],
+                rps=100,
+                clock=clock,
+                sleep=clock.sleep,
+                sessions=sessions,
+                flood_initial_cooldown=60,
+                probe_seconds=10,
+                escalation_methods=2,
+            )
+            with pytest.raises(VKMethodUnavailable):
+                await competing_pool.acquire("groups.get")
+            await restarted_pool.mark_success(probe)
+
+            # Два разных endpoint-limit события дают короткую persisted escalation.
+            wall = await restarted_pool.acquire("wall.get")
+            await restarted_pool.method_cooldown(wall, 9)
+            members = await restarted_pool.acquire("groups.getMembers")
+            await restarted_pool.method_cooldown(members, 29)
+            async with sessions() as session:
+                token_state = await session.get(VKTokenState, lease.fingerprint)
+                assert token_state is not None
+                assert token_state.global_blocked_until is not None
             await outer.rollback()
     finally:
         await engine.dispose()
@@ -317,6 +359,40 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                         )
                         == 1
                     )
+
+                # Posts планируются отдельным run и общий TTL исключает немедленный rerun.
+                async with sessions() as session:
+                    pilot_a = CollectionRun(
+                        scope="subscriptions_pilot",
+                        status=CollectionRunStatus.COMPLETED,
+                        finished_at=datetime.now(UTC),
+                    )
+                    session.add(pilot_a)
+                    await session.flush()
+                    await session.execute(
+                        update(UserGroupSubscription)
+                        .where(UserGroupSubscription.user_id == 9_000_000_001)
+                        .values(source_run_id=pilot_a.id)
+                    )
+                    await session.commit()
+                    pilot_a_run_id = pilot_a.id
+                posts_run_id = await queue.plan_subscription_posts(
+                    pilot=True, source_run_id=pilot_a_run_id
+                )
+                await CollectionWorker(sessions, FakeVK(), settings).run(posts_run_id)  # type: ignore[arg-type]
+                async with sessions() as session:
+                    post_state = await session.get(CommunityPostCollectionState, 777)
+                    assert post_state is not None
+                    assert post_state.collected_count == 1
+                    assert post_state.next_scheduled_at is not None
+                fresh_posts_run_id = await queue.plan_subscription_posts(
+                    pilot=True, source_run_id=pilot_a_run_id
+                )
+                async with sessions() as session:
+                    fresh_posts_run = await session.get(CollectionRun, fresh_posts_run_id)
+                    assert fresh_posts_run is not None
+                    assert fresh_posts_run.status == CollectionRunStatus.COMPLETED
+                    assert fresh_posts_run.total_jobs == 0
 
                 # Новый run с теми же сущностями обновляет строки, но не создаёт дублей.
                 async with sessions() as session:

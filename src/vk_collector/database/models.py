@@ -638,6 +638,28 @@ class UserSubscriptionState(Base):
     next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class CommunityPostCollectionState(Base):
+    __tablename__ = "community_post_collection_states"
+    __table_args__ = (Index("ix_community_post_states_next", "next_scheduled_at"),)
+
+    community_vk_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("vk_communities.vk_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+    last_error_code: Mapped[int | None] = mapped_column(Integer)
+    last_error_reason: Mapped[str | None] = mapped_column(String(255))
+    collected_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    wall_private: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    unavailable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+
 class VKTokenState(Base):
     __tablename__ = "vk_token_states"
 
