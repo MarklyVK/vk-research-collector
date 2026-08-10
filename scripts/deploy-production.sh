@@ -112,6 +112,15 @@ compose() {
     "$@"
 }
 
+compose_cli() {
+  # Production runner uses a Compose release where `run --no-build` is not
+  # available.  Refuse to run unless the exact selected image already exists;
+  # with pull_policy=never Compose then uses it and cannot pull or build a tag.
+  docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || die "Локальный image для production CLI отсутствует: $IMAGE"
+  compose run --rm --no-deps collector "$@"
+}
+
 stop_worker_on_critical_disk() {
   local used=$1 stage=$2
   if (( used < DISK_STOP )); then
@@ -255,8 +264,14 @@ rollback_image() {
   IMAGE="$PREVIOUS_IMAGE"
   atomic_text "$DEPLOY_DIR/.deploy/current-image" "$PREVIOUS_IMAGE"
   compose up -d --no-deps --no-build collector-worker || true
-  local state
-  state=$(service_state collector-worker)
+  local state=unknown
+  for _ in $(seq 1 12); do
+    state=$(service_state collector-worker)
+    if [[ "$state" == running/healthy || "$state" == running ]]; then
+      return 0
+    fi
+    sleep 5
+  done
   if [[ "$state" != running/healthy && "$state" != running ]]; then
     log 'Rollback image не восстановил worker. Возможна несовместимость миграции; восстановите backup вручную.'
   fi
@@ -375,17 +390,7 @@ if [[ -n "$PREVIOUS_IMAGE" ]]; then
     ROLLBACK_ALLOWED=1
   fi
 fi
-if [[ -n "$RUN_ID" ]]; then
-  BASELINE_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status --run-id "$RUN_ID")
-else
-  BASELINE_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status)
-  RUN_ID=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string run_id || true)
-fi
 IMAGE=$TARGET_IMAGE
-BASELINE_COMPLETED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number completed || true)
-BASELINE_FAILED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number failed || true)
-BASELINE_COMPLETED=${BASELINE_COMPLETED:-0}
-BASELINE_FAILED=${BASELINE_FAILED:-0}
 
 log "Preflight: user=$CURRENT_USER, disk=${DISK_USED}%, worker=$WORKER_BEFORE, run=${RUN_ID:-absent}"
 log "Текущий image: ${PREVIOUS_IMAGE:-absent}; целевой image: $IMAGE"
@@ -420,6 +425,16 @@ atomic_text "$DEPLOY_DIR/.deploy/previous-image" "$PREVIOUS_IMAGE"
 log 'Скачивается неизменяемый SHA image.'
 docker pull "$IMAGE"
 verify_local_image
+if [[ -n "$RUN_ID" ]]; then
+  BASELINE_STATUS_JSON=$(compose_cli collection status --run-id "$RUN_ID")
+else
+  BASELINE_STATUS_JSON=$(compose_cli collection status)
+  RUN_ID=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string run_id || true)
+fi
+BASELINE_COMPLETED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number completed || true)
+BASELINE_FAILED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number failed || true)
+BASELINE_COMPLETED=${BASELINE_COMPLETED:-0}
+BASELINE_FAILED=${BASELINE_FAILED:-0}
 DISK_AFTER_PULL=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
 stop_worker_on_critical_disk "$DISK_AFTER_PULL" post-pull
 if (( DISK_AFTER_PULL >= DISK_WARNING )); then
@@ -432,12 +447,12 @@ compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker
 # До начала upgrade схема не менялась: любой pre-migration сбой должен вернуть старый worker.
 ROLLBACK_ALLOWED=1
 log 'Проверяется и применяется только Alembic upgrade.'
-compose run --rm --no-deps --no-build collector alembic current
+compose_cli alembic current
 # После начала forward migration старый image нельзя возвращать до успешного upgrade/check.
 ROLLBACK_ALLOWED=0
-compose run --rm --no-deps --no-build collector alembic upgrade head
-compose run --rm --no-deps --no-build collector alembic check
-ALEMBIC_REVISION=$(compose run --rm --no-deps --no-build collector alembic current | tail -n 1 | tr -d '\r')
+compose_cli alembic upgrade head
+compose_cli alembic check
+ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
 
 ROLLBACK_ALLOWED=1
 atomic_text "$DEPLOY_DIR/.deploy/current-image" "$IMAGE"
@@ -457,8 +472,8 @@ done
 
 compose ps
 compose logs --no-color --since="$DEPLOY_STARTED_AT" --tail=300 collector-worker
-compose run --rm --no-deps --no-build collector classification summary
-compose run --rm --no-deps --no-build collector collection summary
+compose_cli classification summary
+compose_cli collection summary
 
 WORKER_CONTAINER=$(compose ps -q collector-worker)
 [[ -n "$WORKER_CONTAINER" ]] || die 'Container collector-worker не найден после запуска.'
@@ -467,7 +482,7 @@ WORKER_CONTAINER=$(compose ps -q collector-worker)
 verify_local_image
 
 if [[ -n "$RUN_ID" ]]; then
-  FINAL_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status --run-id "$RUN_ID")
+  FINAL_STATUS_JSON=$(compose_cli collection status --run-id "$RUN_ID")
   printf '%s\n' "$FINAL_STATUS_JSON"
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_FAILED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number failed || true)
@@ -476,7 +491,7 @@ if [[ -n "$RUN_ID" ]]; then
   (( FINAL_FAILED <= BASELINE_FAILED )) || die 'Количество failed jobs увеличилось.'
 
   set +e
-  VERIFY_JSON=$(compose run --rm --no-deps --no-build collector collection verify --run-id "$RUN_ID" 2>&1)
+  VERIFY_JSON=$(compose_cli collection verify --run-id "$RUN_ID" 2>&1)
   VERIFY_CODE=$?
   set -e
   printf '%s\n' "$VERIFY_JSON"
@@ -489,7 +504,7 @@ if [[ -n "$RUN_ID" ]]; then
   fi
 
   sleep "$PROGRESS_WAIT"
-  FINAL_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status --run-id "$RUN_ID")
+  FINAL_STATUS_JSON=$(compose_cli collection status --run-id "$RUN_ID")
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_COMPLETED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number completed || true)
   FINAL_PENDING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number pending || true)

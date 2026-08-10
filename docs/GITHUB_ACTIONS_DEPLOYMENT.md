@@ -93,7 +93,7 @@ pull-request jobs или непроверенным workflow.
    predeploy backup, а manual/handoff backups не ротирует.
 6. Скачивает SHA-image, сверяет digest/revision и останавливает только worker с
    graceful timeout 360 секунд.
-7. Выполняет Alembic upgrade/check и запускает только worker с `--no-deps --no-build`;
+7. Выполняет Alembic upgrade/check из заранее проверенного exact image и запускает только worker с `--no-deps --no-build`;
    PostgreSQL container и volume не пересоздаются.
 8. Пишет `.deploy/last-deployment.env` и GitHub Actions summary.
 

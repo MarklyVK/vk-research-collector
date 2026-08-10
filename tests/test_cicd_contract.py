@@ -112,7 +112,9 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "collection status",
         'compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker',
         "compose ps -aq collector-worker",
-        "compose run --rm --no-deps --no-build collector",
+        "compose_cli",
+        'docker image inspect "$IMAGE"',
+        "compose run --rm --no-deps collector",
         "compose up -d --no-deps --no-build collector-worker",
         "Production PostgreSQL volume",
         "Не найден $DEPLOY_DIR/.env",
@@ -134,13 +136,11 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
     assert "down -v" not in text
     assert "docker volume rm" not in text
     assert "docker compose build" not in text
-    assert "compose run --rm --no-deps collector" not in text
+    assert "compose run --rm --no-deps --no-build collector" not in text
     assert "docker system prune" not in text
     stop = text.index('compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker')
-    preflight = text.index("compose run --rm --no-deps --no-build collector alembic current", stop)
-    upgrade = text.index(
-        "compose run --rm --no-deps --no-build collector alembic upgrade head", preflight
-    )
+    preflight = text.index("compose_cli alembic current", stop)
+    upgrade = text.index("compose_cli alembic upgrade head", preflight)
     assert text.index("ROLLBACK_ALLOWED=1", stop) < preflight
     assert preflight < text.index("ROLLBACK_ALLOWED=0", preflight) < upgrade
     assert "compose up -d --remove-orphans postgres" not in text
