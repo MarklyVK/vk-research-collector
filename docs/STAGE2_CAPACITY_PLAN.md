@@ -1,5 +1,15 @@
 # План ёмкости второго этапа
 
+## Независимые gates подписок
+
+Gate A измеряет детерминированный pilot примерно на 500 users: сначала лимит 50,
+затем preview 100. JSON report содержит API requests, subscription rows, unique
+communities, рост БД и длительность. Gate B берёт уникальные communities Pilot A и
+измеряет до 20 posts, attachments, skipped, рост БД и длительность. Массовый запуск
+разрешается cohort-порциями (по умолчанию до 10 000 users) только после backup и если
+оба прогноза укладываются в safe disk limit. Отсутствие реального pilot означает
+техническую готовность к pilot, но не готовность к production rollout.
+
 ## До pilot
 
 Известно 12 260 целевых approved-групп. Ни число доступных постов/участников, ни

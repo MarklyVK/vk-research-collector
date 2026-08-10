@@ -4,6 +4,13 @@
 данные не очищаются автоматически; удаление пользователя — отдельная транзакционная
 privacy-операция.
 
+Endpoint-aware расширение добавляет `vk_token_states` и `vk_token_method_states`
+(только fingerprint и timestamps), канонический реестр `vk_communities` и
+`user_subscription_states`. `user_group_subscriptions.vk_group_id` получает FK на
+`vk_communities.vk_id`. `group_posts.community_vk_id` получает FK на тот же реестр,
+а прежний `group_id` становится nullable с `ON DELETE SET NULL`. Backfill выполняется
+SQL-порциями и проверяет NULL/orphan rows до усиления constraints.
+
 | Таблица | Назначение и ключи | Основные поля и индексы | Обновление / ожидаемый объём |
 |---|---|---|---|
 | `collection_runs` | Один план/запуск, PK UUID | scope, status, configuration JSONB, counters, timestamps; index status+created | Счётчики агрегируются по jobs; десятки/сотни строк |

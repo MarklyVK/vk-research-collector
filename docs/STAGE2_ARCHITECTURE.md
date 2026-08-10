@@ -141,3 +141,27 @@ flowchart LR
 ограничивает `search_keywords.subject` и `group_labels.label`. `search_run_groups`
 даёт per-run дедупликацию и статистику known/new, а `classification_reviews` хранит
 неизменяемую историю повторных решений.
+
+## Endpoint-aware scheduler
+
+`VKClient.call(method, params)` получает lease только для точного `method`. Секрет живёт
+только в lease процесса; PostgreSQL хранит fingerprint, глобальное состояние токена и
+отдельные method states. Выдача RPS координируется транзакционной блокировкой строки
+token state, поэтому параллельные CLI/worker процессы не превышают общий лимит.
+
+Типы jobs отображаются на методы без объединения в семейства. Scheduler циклически
+обходит `refresh_group`, `collect_group_posts`, `collect_group_members`,
+`refresh_user_profile`, `collect_user_subscriptions` и
+`collect_subscription_group_posts`; priority применяется только внутри типа.
+
+Канонический поток данных:
+
+```text
+approved membership -> vk_user -> groups.get extended=1
+  -> vk_communities + user_group_subscriptions
+  -> unique collect_subscription_group_posts -> group_posts + post_attachments
+```
+
+Subscription communities не попадают в поисковую классификацию. `group_posts`
+ссылается на `vk_communities`; необязательная обратная связь с `group_candidates`
+сохраняется для совместимости.
