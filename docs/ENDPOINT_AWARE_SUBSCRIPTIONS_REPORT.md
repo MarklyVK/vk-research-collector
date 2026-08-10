@@ -62,7 +62,9 @@ docker compose run --rm collector collection subscriptions pilot
 
 docker compose run --rm collector collection subscriptions plan
 docker compose run --rm collector collection capacity-apply \
-  --run-id SUBSCRIPTIONS_RUN_ID --source /app/exports/stage2-pilot/subscription-gate-a.json
+  --run-id SUBSCRIPTIONS_RUN_ID \
+  --source /app/exports/stage2-pilot/subscription-gate-a.json \
+  --backup /app/backups/BEFORE_SUBSCRIPTIONS.dump
 docker compose run --rm collector collection subscriptions run --run-id SUBSCRIPTIONS_RUN_ID
 ```
 
@@ -75,7 +77,9 @@ docker compose run --rm collector collection subscriptions posts-pilot \
 docker compose run --rm collector collection subscriptions posts-plan \
   --source-run-id SUBSCRIPTIONS_RUN_ID
 docker compose run --rm collector collection capacity-apply \
-  --run-id POSTS_RUN_ID --source /app/exports/stage2-pilot/subscription-gate-b.json
+  --run-id POSTS_RUN_ID \
+  --source /app/exports/stage2-pilot/subscription-gate-b.json \
+  --backup /app/backups/BEFORE_SUBSCRIPTION_POSTS.dump
 docker compose run --rm collector collection subscriptions run --run-id POSTS_RUN_ID
 ```
 

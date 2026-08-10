@@ -38,16 +38,16 @@
 - [x] Коды 9 и 29 блокируют только точную пару token+method; другие методы токена работают.
 - [x] Код 6 создаёт настраиваемый короткий global cooldown, auth errors отключают токен.
 - [x] Method state не содержит секрет и восстанавливается из PostgreSQL после restart.
-- [ ] Fair scheduler не допускает starvation и не claim-ит поток jobs недоступного метода.
+- [x] Fair scheduler не допускает starvation и не claim-ит поток jobs недоступного метода.
 - [x] Method deferral не расходует `max_attempts`; run автоматически выходит из
   `waiting_method_limit` после `next_wakeup_at`.
-- [ ] Direct planner идемпотентно создаёт subscription jobs существующим доступным users.
+- [x] Direct planner идемпотентно создаёт subscription jobs существующим доступным users.
 - [x] `groups.get extended=1` сохраняет до 50 или 100 объектов и публичные метаданные.
-- [ ] Private subscriptions (260) и недоступные сущности (15/18/30) terminal skipped.
+- [x] Private subscriptions (260) и недоступные сущности (15/18/30) terminal skipped.
 - [x] `vk_communities` не создаёт и не меняет `group_candidates`; связи не дублируются.
 - [x] Усечённый subscription snapshot не деактивирует прежние связи.
 - [x] На уникальную community создаётся одна job и сохраняется не более 20 постов.
 - [x] Candidate и subscription community используют один канонический post без дублей.
 - [x] Миграция существующих subscription rows и около 700 тысяч posts выполняется порциями.
 - [ ] Gate A (users/links/metadata) и Gate B (posts/attachments/indexes) дают JSON reports.
-- [ ] Новые массовые scopes остаются выключены до backup, pilot и успешного capacity gate.
+- [x] Новые массовые scopes остаются выключены до backup, pilot и успешного capacity gate.

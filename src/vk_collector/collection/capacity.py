@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 SAFE_DISK_LIMIT_BYTES = 7 * 1024**3
 CapacityPhase = Literal["A", "B"]
 
@@ -108,6 +108,10 @@ def validate_capacity_report(
         "database_bytes_before",
         "database_bytes_after",
         "database_growth_bytes",
+        "relation_growth_bytes",
+        "planned_entities",
+        "observed_entities",
+        "disk_free_bytes_after",
     }
     if not isinstance(measured, dict) or not required_measured.issubset(measured):
         raise ValueError("Capacity report не содержит обязательные measured показатели")
@@ -116,22 +120,69 @@ def validate_capacity_report(
     if phase == "A" and (
         limits.get("subscriptions_per_user") != configuration.get("subscriptions_max_per_user")
         or limits.get("production_users") != configuration.get("subscriptions_users_per_run")
+        or limits.get("pilot_users") != configuration.get("subscription_pilot_users")
+        or limits.get("minimum_pilot_users") != configuration.get("subscription_pilot_min_users")
         or limits.get("subscriptions_preview_limit") != 100
     ):
         raise ValueError("Capacity Gate A содержит несовпадающие limits")
     if phase == "B" and (
         limits.get("posts_per_community") != configuration.get("subscription_posts_max")
         or limits.get("post_ttl_days") != configuration.get("subscription_posts_ttl_days")
+        or limits.get("pilot_communities")
+        != configuration.get("subscription_posts_pilot_communities")
+        or limits.get("minimum_pilot_communities")
+        != configuration.get("subscription_posts_pilot_min_communities")
     ):
         raise ValueError("Capacity Gate B содержит несовпадающие limits")
     projected_bytes = projected.get("database_bytes") if isinstance(projected, dict) else None
+    projected_growth = (
+        projected.get("database_growth_bytes") if isinstance(projected, dict) else None
+    )
     safe_limit = payload.get("safe_disk_limit_bytes")
+    database_growth = measured.get("database_growth_bytes")
+    relation_growth = measured.get("relation_growth_bytes")
+    observed_entities = measured.get("observed_entities")
+    planned_entities = measured.get("planned_entities")
+    completed_entities = measured.get("completed_entities")
+    skipped_entities = measured.get("skipped_entities")
+    failed_entities = measured.get("failed_entities")
+    disk_free = measured.get("disk_free_bytes_after")
+    minimum_entities = (
+        limits.get("minimum_pilot_users")
+        if phase == "A"
+        else limits.get("minimum_pilot_communities")
+    )
     if (
         payload.get("production_allowed") is not True
         or not isinstance(projected_bytes, int)
         or not isinstance(safe_limit, int)
         or safe_limit != SAFE_DISK_LIMIT_BYTES
         or projected_bytes > safe_limit
+        or not isinstance(projected_growth, int)
+        or projected_growth <= 0
+        or not isinstance(disk_free, int)
+        or projected_growth > disk_free
+        or not isinstance(database_growth, int)
+        or not isinstance(relation_growth, int)
+        or max(database_growth, relation_growth) <= 0
+        or not isinstance(planned_entities, int)
+        or not isinstance(observed_entities, int)
+        or not isinstance(completed_entities, int)
+        or not isinstance(skipped_entities, int)
+        or not isinstance(failed_entities, int)
+        or min(
+            planned_entities,
+            observed_entities,
+            completed_entities,
+            skipped_entities,
+            failed_entities,
+        )
+        < 0
+        or completed_entities + skipped_entities != observed_entities
+        or observed_entities + failed_entities > planned_entities
+        or failed_entities != 0
+        or not isinstance(minimum_entities, int)
+        or observed_entities < minimum_entities
     ):
         raise ValueError(f"Capacity Gate {phase} не разрешает production run")
     return payload

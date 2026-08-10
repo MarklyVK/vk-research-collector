@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import signal
@@ -561,6 +562,10 @@ async def _execute_collection(
                     configuration=expected,
                     max_age_days=settings.collection_capacity_report_max_age_days,
                 )
+                backup = run.configuration.get("verified_backup")
+                if not isinstance(backup, dict) or not isinstance(backup.get("path"), str):
+                    raise ValueError("Subscription run запрещён без проверенного backup")
+                _validated_backup_metadata(Path(backup["path"]), expected=backup)
             elif run.scope == "subscription_posts":
                 if not settings.collection_subscription_group_posts_enabled:
                     raise ValueError(
@@ -580,6 +585,10 @@ async def _execute_collection(
                     configuration=expected,
                     max_age_days=settings.collection_capacity_report_max_age_days,
                 )
+                backup = run.configuration.get("verified_backup")
+                if not isinstance(backup, dict) or not isinstance(backup.get("path"), str):
+                    raise ValueError("Subscription posts run запрещён без проверенного backup")
+                _validated_backup_metadata(Path(backup["path"]), expected=backup)
             expected_configuration = run.configuration.get("collection")
             if expected_configuration != queue.collection_configuration():
                 raise ValueError(
@@ -768,10 +777,14 @@ async def _plan_subscription_posts(pilot: bool, source_run_id: uuid.UUID | None)
 
 @subscriptions_app.command("posts-plan")
 def subscription_posts_plan(
-    source_run_id: Annotated[uuid.UUID | None, typer.Option("--source-run-id")] = None,
+    source_run_id: Annotated[uuid.UUID, typer.Option("--source-run-id")],
 ) -> None:
     """Создать отдельный production-plan постов после Gate B."""
-    run_id = asyncio.run(_plan_subscription_posts(False, source_run_id))
+    try:
+        run_id = asyncio.run(_plan_subscription_posts(False, source_run_id))
+    except ValueError as exc:
+        typer.echo(f"Production plan постов отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     typer.echo(f"План постов подписок создан или переиспользован: {run_id}")
 
 
@@ -1053,6 +1066,35 @@ def _write_json(target: Path, payload: dict[str, Any]) -> None:
     temporary.replace(target)
 
 
+def _validated_backup_metadata(
+    backup: Path,
+    *,
+    expected: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Проверить формат и fingerprint PostgreSQL custom-format backup."""
+    digest = hashlib.sha256()
+    try:
+        stat = backup.stat()
+        with backup.open("rb") as stream:
+            header = stream.read(5)
+            digest.update(header)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError(f"Backup не читается: {exc}") from exc
+    if not backup.is_file() or stat.st_size <= 5 or header != b"PGDMP":
+        raise ValueError("Нужен непустой PostgreSQL backup формата pg_dump -Fc")
+    metadata: dict[str, object] = {
+        "path": str(backup.resolve()),
+        "size_bytes": stat.st_size,
+        "modified_ns": stat.st_mtime_ns,
+        "sha256": digest.hexdigest(),
+    }
+    if expected is not None and metadata != expected:
+        raise ValueError("Проверенный backup отсутствует или изменился после capacity-apply")
+    return metadata
+
+
 async def _run_subscription_pilot(
     phase: Literal["A", "B"],
     *,
@@ -1065,12 +1107,12 @@ async def _run_subscription_pilot(
     sessions = create_session_factory(engine)
     try:
         queue = CollectionQueue(sessions, settings)
+        before = await database_metrics(sessions)
         run_id = (
             await queue.plan_subscriptions(pilot=True)
             if phase == "A"
             else await queue.plan_subscription_posts(pilot=True, source_run_id=source_run_id)
         )
-        before = await database_metrics(sessions)
         started_at = time.monotonic()
         _, processed = await _execute_collection(
             run_id,
@@ -1082,7 +1124,13 @@ async def _run_subscription_pilot(
         duration_seconds = time.monotonic() - started_at
         after = await database_metrics(sessions)
         summary = await run_summary(sessions, run_id)
-        delta = max(0, after["database_bytes"] - before["database_bytes"])
+        database_growth = max(0, after["database_bytes"] - before["database_bytes"])
+        relation_growth = sum(
+            max(0, after[key] - before[key])
+            for key in before
+            if key.startswith("relation_") and key in after
+        )
+        measured_growth = max(database_growth, relation_growth)
         configuration = queue.collection_configuration()
         selected = int(
             summary.get("jobs_by_type", {})
@@ -1097,30 +1145,58 @@ async def _run_subscription_pilot(
         target_entities = (
             settings.collection_subscriptions_users_per_run
             if phase == "A"
-            else int(after.get("communities", 0))
+            else int(after.get("subscription_communities", 0))
         )
-        projected_growth = int(delta / selected * target_entities * 1.30) if selected > 0 else None
+        projected_growth = (
+            int(measured_growth / selected * target_entities * 1.30)
+            if selected > 0 and measured_growth > 0
+            else None
+        )
         projected_database = (
-            before["database_bytes"] + projected_growth if projected_growth is not None else None
+            after["database_bytes"] + projected_growth if projected_growth is not None else None
         )
         completed = summary["status"] == "completed"
+        jobs = summary.get("jobs", {})
+        planned_entities = sum(int(value) for value in jobs.values())
+        skipped_entities = int(jobs.get("skipped", 0))
+        failed_entities = int(jobs.get("failed", 0))
+        observed_entities = selected + skipped_entities
+        minimum_entities = (
+            settings.collection_subscription_pilot_min_users
+            if phase == "A"
+            else settings.collection_subscription_posts_pilot_min_communities
+        )
+        disk = inspect_disk(
+            settings.collection_export_dir,
+            settings.disk_warning_percent,
+            settings.disk_stop_percent,
+        )
         production_allowed = bool(
             completed
             and max_jobs is None
+            and failed_entities == 0
+            and observed_entities >= minimum_entities
+            and measured_growth > 0
+            and isinstance(projected_growth, int)
             and isinstance(projected_database, int)
             and projected_database <= 7 * 1024**3
+            and projected_growth <= disk.free_bytes
         )
         measured: dict[str, int | float] = {
             "duration_seconds": duration_seconds,
             "api_requests": int(summary.get("api_requests", 0)),
             "processed_jobs": processed,
+            "planned_entities": planned_entities,
+            "observed_entities": observed_entities,
             "completed_entities": selected,
-            "skipped_entities": int(summary.get("jobs", {}).get("skipped", 0)),
-            "failed_entities": int(summary.get("jobs", {}).get("failed", 0)),
+            "skipped_entities": skipped_entities,
+            "failed_entities": failed_entities,
             "private_entities": int(summary.get("private_users", 0)),
             "database_bytes_before": before["database_bytes"],
             "database_bytes_after": after["database_bytes"],
-            "database_growth_bytes": delta,
+            "database_growth_bytes": database_growth,
+            "relation_growth_bytes": relation_growth,
+            "disk_free_bytes_after": disk.free_bytes,
             "subscription_links_before": before.get("subscriptions", 0),
             "subscription_links_after": after.get("subscriptions", 0),
             "unique_communities_before": before.get("communities", 0),
@@ -1145,13 +1221,18 @@ async def _run_subscription_pilot(
             )
         limits = (
             {
-                "pilot_users": 500,
+                "pilot_users": settings.collection_subscription_pilot_users,
+                "minimum_pilot_users": settings.collection_subscription_pilot_min_users,
                 "subscriptions_per_user": settings.collection_subscriptions_max_per_user,
                 "subscriptions_preview_limit": 100,
                 "production_users": settings.collection_subscriptions_users_per_run,
             }
             if phase == "A"
             else {
+                "pilot_communities": (settings.collection_subscription_posts_pilot_communities),
+                "minimum_pilot_communities": (
+                    settings.collection_subscription_posts_pilot_min_communities
+                ),
                 "posts_per_community": settings.collection_subscription_group_posts_max,
                 "post_ttl_days": settings.collection_subscription_group_posts_ttl_days,
             }
@@ -1252,7 +1333,11 @@ def collection_pilot() -> None:
     typer.echo(f"Capacity gate: {capacity['decision']}")
 
 
-async def _apply_capacity(run_id: uuid.UUID, source: Path) -> dict[str, Any]:
+async def _apply_capacity(
+    run_id: uuid.UUID,
+    source: Path,
+    backup: Path | None = None,
+) -> dict[str, Any]:
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1268,7 +1353,11 @@ async def _apply_capacity(run_id: uuid.UUID, source: Path) -> dict[str, Any]:
             expected = run.configuration.get("collection")
             if not isinstance(expected, dict):
                 raise ValueError("Collection run содержит повреждённую конфигурацию")
+            backup_metadata: dict[str, object] | None = None
             if run.scope in {"subscriptions", "subscription_posts"}:
+                if backup is None:
+                    raise ValueError("Для subscription capacity gate обязателен --backup")
+                backup_metadata = _validated_backup_metadata(backup)
                 phase: Literal["A", "B"] = "A" if run.scope == "subscriptions" else "B"
                 payload = validate_capacity_report(
                     source,
@@ -1312,6 +1401,7 @@ async def _apply_capacity(run_id: uuid.UUID, source: Path) -> dict[str, Any]:
                 "projected_database_bytes": projected,
                 "safe_limit_bytes": safe_limit,
                 "capacity_report": str(source.resolve()),
+                **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
             }
             run.status = CollectionRunStatus.PLANNED
             run.error_message = None
@@ -1328,12 +1418,19 @@ def apply_capacity_gate(
         Path | None,
         typer.Option("--source", help="Проверенный capacity-estimate.json."),
     ] = None,
+    backup: Annotated[
+        Path | None,
+        typer.Option(
+            "--backup",
+            help="Проверенный pg_dump -Fc; обязателен для subscription Gate A/B.",
+        ),
+    ] = None,
 ) -> None:
     """Разрешить full run только по измеренному успешному capacity report."""
     settings = get_settings()
     target = source or settings.collection_export_dir / "capacity-estimate.json"
     try:
-        payload = asyncio.run(_apply_capacity(run_id, target))
+        payload = asyncio.run(_apply_capacity(run_id, target, backup))
     except ValueError as exc:
         typer.echo(f"Capacity gate отклонён: {exc}", err=True)
         raise typer.Exit(code=2) from exc

@@ -326,6 +326,9 @@ async def database_metrics(
         counts = await global_summary_from_session(session)
         relations = {}
         for table in (
+            "collection_runs",
+            "collection_jobs",
+            "collection_job_errors",
             "vk_communities",
             "user_group_subscriptions",
             "user_subscription_states",
@@ -336,7 +339,20 @@ async def database_metrics(
             relations[f"relation_{table}_bytes"] = int(
                 await session.scalar(select(func.pg_total_relation_size(table))) or 0
             )
-        return {"database_bytes": size, **counts, **relations}
+        subscription_communities = int(
+            await session.scalar(
+                select(func.count(distinct(UserGroupSubscription.vk_group_id))).where(
+                    UserGroupSubscription.is_current.is_(True)
+                )
+            )
+            or 0
+        )
+        return {
+            "database_bytes": size,
+            "subscription_communities": subscription_communities,
+            **counts,
+            **relations,
+        }
 
 
 async def global_summary_from_session(session: AsyncSession) -> dict[str, int]:
@@ -382,5 +398,6 @@ async def capacity_gate_passed(
                 CollectionRunStatus.PLANNED,
                 CollectionRunStatus.RUNNING,
                 CollectionRunStatus.PAUSED,
+                CollectionRunStatus.WAITING_METHOD_LIMIT,
             }
         )

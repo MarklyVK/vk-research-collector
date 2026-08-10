@@ -169,6 +169,14 @@ Subscription communities не попадают в поисковую класс�
 
 `next_probe_at` — не декоративное поле: после его наступления worker транзакционно
 переносит его вперёд и получает единственный probe lease, хотя `blocked_until` ещё не
-истёк. Успех очищает method state, повторный limit увеличивает backoff. Run в
+истёк. Probe не обходит `global_blocked_until` и общий per-token RPS slot. Успех очищает
+method state, повторный limit увеличивает backoff. Run в
 `waiting_method_limit` остаётся видим автономному worker и возвращается в `running`
 после `next_wakeup_at`; method deferral уменьшает обратно технический claim attempt.
+
+Subscription planner исключает как свежие успешные состояния, так и privacy/access
+состояния до `next_scheduled_at`. После наступления TTL или даты повтора завершённый
+исторический run не переиспользуется: создаётся новый immutable run. Capacity Gate A/B
+принимает только реальный pilot с минимальным числом наблюдений, положительным ростом,
+нулём failed jobs и прогнозом в пределах 7 GiB и свободного места. Production run также
+привязан к неизменному backup по пути, размеру, mtime и SHA-256.

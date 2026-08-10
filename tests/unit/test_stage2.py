@@ -7,6 +7,7 @@ import pytest
 import yaml
 from pydantic import SecretStr, ValidationError
 
+from vk_collector.cli.app import _validated_backup_metadata
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
@@ -92,6 +93,8 @@ def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) ->
     configuration: dict[str, object] = {
         "subscriptions_max_per_user": 50,
         "subscriptions_users_per_run": 10_000,
+        "subscription_pilot_users": 500,
+        "subscription_pilot_min_users": 100,
     }
     report = build_capacity_report(
         phase="A",
@@ -99,6 +102,7 @@ def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) ->
         configuration=configuration,
         limits={
             "pilot_users": 500,
+            "minimum_pilot_users": 100,
             "subscriptions_per_user": 50,
             "subscriptions_preview_limit": 100,
             "production_users": 10_000,
@@ -107,14 +111,18 @@ def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) ->
             "duration_seconds": 1.0,
             "api_requests": 500,
             "processed_jobs": 500,
+            "planned_entities": 500,
+            "observed_entities": 500,
             "completed_entities": 490,
             "skipped_entities": 10,
             "failed_entities": 0,
             "database_bytes_before": 1024,
             "database_bytes_after": 2048,
             "database_growth_bytes": 1024,
+            "relation_growth_bytes": 1024,
+            "disk_free_bytes_after": 10_000,
         },
-        projected={"database_bytes": 2048},
+        projected={"database_bytes": 2048, "database_growth_bytes": 1024},
         production_allowed=True,
     )
     target = tmp_path / "gate-a.json"
@@ -131,6 +139,8 @@ def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) ->
             configuration={
                 "subscriptions_max_per_user": 100,
                 "subscriptions_users_per_run": 10_000,
+                "subscription_pilot_users": 500,
+                "subscription_pilot_min_users": 100,
             },
             max_age_days=30,
         )
@@ -140,9 +150,13 @@ def test_capacity_report_rejects_stale_corrupt_and_theoretical_preview(tmp_path:
     configuration: dict[str, object] = {
         "subscriptions_max_per_user": 50,
         "subscriptions_users_per_run": 10_000,
+        "subscription_pilot_users": 500,
+        "subscription_pilot_min_users": 100,
     }
     limits = {
         "subscriptions_per_user": 50,
+        "pilot_users": 500,
+        "minimum_pilot_users": 100,
         "subscriptions_preview_limit": 100,
         "production_users": 10_000,
     }
@@ -150,12 +164,16 @@ def test_capacity_report_rejects_stale_corrupt_and_theoretical_preview(tmp_path:
         "duration_seconds": 1,
         "api_requests": 1,
         "processed_jobs": 1,
-        "completed_entities": 1,
+        "planned_entities": 100,
+        "observed_entities": 100,
+        "completed_entities": 100,
         "skipped_entities": 0,
         "failed_entities": 0,
         "database_bytes_before": 1,
         "database_bytes_after": 2,
         "database_growth_bytes": 1,
+        "relation_growth_bytes": 1,
+        "disk_free_bytes_after": 10_000,
     }
     target = tmp_path / "gate-a.json"
     stale = build_capacity_report(
@@ -164,7 +182,7 @@ def test_capacity_report_rejects_stale_corrupt_and_theoretical_preview(tmp_path:
         configuration=configuration,
         limits=limits,
         measured=measured,
-        projected={"database_bytes": 1024},
+        projected={"database_bytes": 1024, "database_growth_bytes": 1},
         production_allowed=True,
         measured_at=datetime.now(UTC) - timedelta(days=31),
     )
@@ -180,12 +198,67 @@ def test_capacity_report_rejects_stale_corrupt_and_theoretical_preview(tmp_path:
         configuration=configuration,
         limits=limits,
         measured=measured,
-        projected={"database_bytes": 1024},
+        projected={"database_bytes": 1024, "database_growth_bytes": 1},
         production_allowed=False,
     )
     write_capacity_report(target, preview)
     with pytest.raises(ValueError, match="не разрешает"):
         validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+
+    zero_growth = build_capacity_report(
+        phase="A",
+        run_id=uuid.uuid4(),
+        configuration=configuration,
+        limits=limits,
+        measured={**measured, "database_growth_bytes": 0, "relation_growth_bytes": 0},
+        projected={"database_bytes": 1024, "database_growth_bytes": 1},
+        production_allowed=True,
+    )
+    write_capacity_report(target, zero_growth)
+    with pytest.raises(ValueError, match="не разрешает"):
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+
+    insufficient_sample = build_capacity_report(
+        phase="A",
+        run_id=uuid.uuid4(),
+        configuration=configuration,
+        limits=limits,
+        measured={
+            **measured,
+            "planned_entities": 99,
+            "observed_entities": 99,
+            "completed_entities": 99,
+        },
+        projected={"database_bytes": 1024, "database_growth_bytes": 1},
+        production_allowed=True,
+    )
+    write_capacity_report(target, insufficient_sample)
+    with pytest.raises(ValueError, match="не разрешает"):
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+
+    insufficient_disk = build_capacity_report(
+        phase="A",
+        run_id=uuid.uuid4(),
+        configuration=configuration,
+        limits=limits,
+        measured={**measured, "disk_free_bytes_after": 1},
+        projected={"database_bytes": 1024, "database_growth_bytes": 2},
+        production_allowed=True,
+    )
+    write_capacity_report(target, insufficient_disk)
+    with pytest.raises(ValueError, match="не разрешает"):
+        validate_capacity_report(target, phase="A", configuration=configuration, max_age_days=30)
+
+
+def test_verified_backup_must_remain_the_same_pg_dump(tmp_path: Path) -> None:
+    backup = tmp_path / "before-subscriptions.dump"
+    backup.write_bytes(b"PGDMP\x01safe-test")
+    metadata = _validated_backup_metadata(backup)
+    assert len(str(metadata["sha256"])) == 64
+    assert _validated_backup_metadata(backup, expected=metadata) == metadata
+    backup.write_bytes(b"PGDMP\x01changed-test")
+    with pytest.raises(ValueError, match="изменился"):
+        _validated_backup_metadata(backup, expected=metadata)
 
 
 def test_compose_defines_restartable_autonomous_worker() -> None:

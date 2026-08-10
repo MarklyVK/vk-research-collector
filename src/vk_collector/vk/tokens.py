@@ -141,12 +141,16 @@ class TokenPool:
                     blocked_until = method_state.blocked_until if method_state else 0.0
                     if blocked_until > now:
                         if method_state is not None and method_state.next_probe_at <= now:
-                            method_state.next_probe_at = now + self._probe_seconds
-                            state.next_request_at = now + self._interval
-                            self._cursor = (index + 1) % len(self._states)
-                            return TokenLease(
-                                state.value, state.fingerprint, method, now, is_probe=True
-                            )
+                            ready_at = max(state.next_request_at, state.global_blocked_until)
+                            if ready_at <= now:
+                                method_state.next_probe_at = now + self._probe_seconds
+                                state.next_request_at = now + self._interval
+                                self._cursor = (index + 1) % len(self._states)
+                                return TokenLease(
+                                    state.value, state.fingerprint, method, now, is_probe=True
+                                )
+                            global_retry.append(ready_at)
+                            continue
                         method_retry.append(
                             min(blocked_until, method_state.next_probe_at)
                             if method_state is not None and method_state.next_probe_at > now
@@ -162,6 +166,7 @@ class TokenPool:
                 # Если хотя бы один токен годится для method, ждём только короткий global/RPS slot.
                 method_capable = any(
                     state.methods.get(method, _MethodState()).blocked_until <= now
+                    or state.methods.get(method, _MethodState()).next_probe_at <= now
                     for state in enabled
                 )
                 if not method_capable:
@@ -514,6 +519,7 @@ class TokenPool:
                     raise VKTokensUnavailable("Все VK-токены отключены")
                 method_retry: list[datetime] = []
                 global_retry: list[datetime] = []
+                method_capable = False
                 for distance in range(len(self._states)):
                     index = (self._cursor + distance) % len(self._states)
                     local = self._states[index]
@@ -530,25 +536,35 @@ class TokenPool:
                             method_row.next_probe_at is not None
                             and method_row.next_probe_at <= now_dt
                         ):
-                            method_row.next_probe_at = now_dt + timedelta(
-                                seconds=self._probe_seconds
+                            method_capable = True
+                            ready_at = max(
+                                value
+                                for value in (row.next_request_at, row.global_blocked_until, now_dt)
+                                if value is not None
                             )
-                            row.next_request_at = now_dt + timedelta(seconds=self._interval)
-                            self._cursor = (index + 1) % len(self._states)
-                            await session.commit()
-                            return TokenLease(
-                                local.value,
-                                local.fingerprint,
-                                method,
-                                self._clock(),
-                                is_probe=True,
-                            )
+                            if ready_at <= now_dt:
+                                method_row.next_probe_at = now_dt + timedelta(
+                                    seconds=self._probe_seconds
+                                )
+                                row.next_request_at = now_dt + timedelta(seconds=self._interval)
+                                self._cursor = (index + 1) % len(self._states)
+                                await session.commit()
+                                return TokenLease(
+                                    local.value,
+                                    local.fingerprint,
+                                    method,
+                                    self._clock(),
+                                    is_probe=True,
+                                )
+                            global_retry.append(ready_at)
+                            continue
                         method_retry.append(
                             min(method_row.blocked_until, method_row.next_probe_at)
                             if method_row.next_probe_at is not None
                             else method_row.blocked_until
                         )
                         continue
+                    method_capable = True
                     ready_at = max(
                         value
                         for value in (row.next_request_at, row.global_blocked_until, now_dt)
@@ -560,9 +576,8 @@ class TokenPool:
                         await session.commit()
                         return TokenLease(local.value, local.fingerprint, method, self._clock())
                     global_retry.append(ready_at)
-                capable = len(method_retry) < len(enabled)
                 await session.commit()
-                if not capable:
+                if not method_capable:
                     delay = max(0.0, (min(method_retry) - now_dt).total_seconds())
                     raise VKMethodUnavailable(method, self._clock() + delay, None)
                 wait_for = (

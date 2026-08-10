@@ -124,6 +124,10 @@ class CollectionQueue:
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
             "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,
             "subscriptions_ttl_days": self._settings.collection_subscriptions_ttl_days,
+            "subscription_pilot_users": self._settings.collection_subscription_pilot_users,
+            "subscription_pilot_min_users": (
+                self._settings.collection_subscription_pilot_min_users
+            ),
             "subscriptions_enabled": self._settings.collection_subscriptions_enabled,
             "subscription_posts_enabled": (
                 self._settings.collection_subscription_group_posts_enabled
@@ -131,6 +135,12 @@ class CollectionQueue:
             "subscription_posts_max": self._settings.collection_subscription_group_posts_max,
             "subscription_posts_ttl_days": (
                 self._settings.collection_subscription_group_posts_ttl_days
+            ),
+            "subscription_posts_pilot_communities": (
+                self._settings.collection_subscription_posts_pilot_communities
+            ),
+            "subscription_posts_pilot_min_communities": (
+                self._settings.collection_subscription_posts_pilot_min_communities
             ),
         }
 
@@ -417,10 +427,17 @@ class CollectionQueue:
         """Идемпотентно спланировать enrichment уже существующих доступных users."""
         now = datetime.now(UTC)
         cutoff = now - timedelta(days=self._settings.collection_subscriptions_ttl_days)
-        limit = 500 if pilot else self._settings.collection_subscriptions_users_per_run
+        limit = (
+            self._settings.collection_subscription_pilot_users
+            if pilot
+            else self._settings.collection_subscriptions_users_per_run
+        )
         async with self._sessions() as session:
             fresh = select(UserSubscriptionState.user_id).where(
-                UserSubscriptionState.last_success_at >= cutoff
+                or_(
+                    UserSubscriptionState.next_scheduled_at > now,
+                    UserSubscriptionState.last_success_at >= cutoff,
+                )
             )
             ids = list(
                 (
@@ -447,18 +464,14 @@ class CollectionQueue:
             id_hash = hashlib.sha256(
                 ",".join(str(value) for value in ids).encode("ascii")
             ).hexdigest()
+            collection_configuration = self.collection_configuration()
             configuration = {
                 "plan_key": hashlib.sha256(
                     json.dumps(
                         {
                             "user_hash": id_hash,
-                            "limit": self._settings.collection_subscriptions_max_per_user,
-                            "posts_limit": self._settings.collection_subscription_group_posts_max,
-                            "ttl": self._settings.collection_subscriptions_ttl_days,
-                            "posts_enabled": (
-                                self._settings.collection_subscription_group_posts_enabled
-                            ),
                             "pilot": pilot,
+                            "collection": collection_configuration,
                         },
                         sort_keys=True,
                     ).encode()
@@ -467,13 +480,27 @@ class CollectionQueue:
                 "phase": "A",
                 "user_ids_hash": id_hash,
                 "user_count": len(ids),
-                "collection": self.collection_configuration(),
+                "collection": collection_configuration,
                 "capacity_gate": "pilot_required" if not pilot else "pilot",
             }
-            existing = await session.scalar(
-                select(CollectionRun).where(
-                    CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+            existing_query = select(CollectionRun).where(
+                CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+            )
+            if ids:
+                existing_query = existing_query.where(
+                    CollectionRun.status.in_(
+                        [
+                            CollectionRunStatus.PLANNED,
+                            CollectionRunStatus.RUNNING,
+                            CollectionRunStatus.PAUSED,
+                            CollectionRunStatus.PAUSED_NO_TOKENS,
+                            CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                            CollectionRunStatus.WAITING_METHOD_LIMIT,
+                        ]
+                    )
                 )
+            existing = await session.scalar(
+                existing_query.order_by(CollectionRun.created_at.desc()).limit(1)
             )
             if existing is not None:
                 return existing.id
@@ -524,26 +551,34 @@ class CollectionQueue:
         """Создать отдельный неизменяемый run последних 20 постов communities."""
         now = datetime.now(UTC)
         async with self._sessions() as session:
-            if pilot:
-                if source_run_id is None:
-                    source_run_id = await session.scalar(
-                        select(CollectionRun.id)
-                        .where(
-                            CollectionRun.scope == "subscriptions_pilot",
-                            CollectionRun.status == CollectionRunStatus.COMPLETED,
-                        )
-                        .order_by(CollectionRun.created_at.desc())
-                        .limit(1)
+            if pilot and source_run_id is None:
+                source_run_id = await session.scalar(
+                    select(CollectionRun.id)
+                    .where(
+                        CollectionRun.scope == "subscriptions_pilot",
+                        CollectionRun.status == CollectionRunStatus.COMPLETED,
                     )
-                if source_run_id is None:
-                    raise ValueError("Для Pilot B нужен завершённый Pilot A")
+                    .order_by(CollectionRun.created_at.desc())
+                    .limit(1)
+                )
+            if not pilot and source_run_id is None:
+                raise ValueError(
+                    "Для production posts нужен завершённый production subscriptions run"
+                )
+            if source_run_id is not None:
                 source_run = await session.get(CollectionRun, source_run_id)
+                expected_scope = "subscriptions_pilot" if pilot else "subscriptions"
                 if (
                     source_run is None
-                    or source_run.scope != "subscriptions_pilot"
+                    or source_run.scope != expected_scope
                     or source_run.status != CollectionRunStatus.COMPLETED
                 ):
-                    raise ValueError("Pilot B принимает только успешно завершённый Pilot A")
+                    label = "Pilot B" if pilot else "Production posts"
+                    raise ValueError(
+                        f"{label} принимает только завершённый run scope={expected_scope}"
+                    )
+            elif pilot:
+                raise ValueError("Для Pilot B нужен завершённый Pilot A")
             fresh = select(CommunityPostCollectionState.community_vk_id).where(
                 CommunityPostCollectionState.next_scheduled_at > now,
             )
@@ -562,8 +597,10 @@ class CollectionQueue:
                 .distinct()
                 .order_by(VKCommunity.vk_id)
             )
-            if pilot and source_run_id is not None:
+            if source_run_id is not None:
                 query = query.where(UserGroupSubscription.source_run_id == source_run_id)
+            if pilot:
+                query = query.limit(self._settings.collection_subscription_posts_pilot_communities)
             ids = list((await session.scalars(query)).all())
             configuration = {
                 "pilot": pilot,
@@ -576,10 +613,24 @@ class CollectionQueue:
             configuration["plan_key"] = hashlib.sha256(
                 json.dumps({**configuration, "community_ids": ids}, sort_keys=True).encode("utf-8")
             ).hexdigest()
-            existing = await session.scalar(
-                select(CollectionRun).where(
-                    CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+            existing_query = select(CollectionRun).where(
+                CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+            )
+            if ids:
+                existing_query = existing_query.where(
+                    CollectionRun.status.in_(
+                        [
+                            CollectionRunStatus.PLANNED,
+                            CollectionRunStatus.RUNNING,
+                            CollectionRunStatus.PAUSED,
+                            CollectionRunStatus.PAUSED_NO_TOKENS,
+                            CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                            CollectionRunStatus.WAITING_METHOD_LIMIT,
+                        ]
+                    )
                 )
+            existing = await session.scalar(
+                existing_query.order_by(CollectionRun.created_at.desc()).limit(1)
             )
             if existing is not None:
                 return existing.id

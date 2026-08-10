@@ -10,6 +10,7 @@ on:
       - "feat/**"
       - "fix/**"
       - "chore/**"
+      - "codex/**"
   workflow_dispatch:
 
 permissions:

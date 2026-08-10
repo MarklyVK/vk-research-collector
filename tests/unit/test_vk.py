@@ -169,6 +169,27 @@ async def test_next_probe_allows_exactly_one_attempt_before_long_block_expires()
 
 
 @pytest.mark.asyncio
+async def test_probe_respects_global_cooldown_and_shared_rps_slot() -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=0.05,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=100,
+        probe_seconds=10,
+        global_rps_cooldown=50,
+    )
+    lease = await pool.acquire("groups.get")
+    await pool.method_cooldown(lease, 9)
+    await pool.global_cooldown(lease)
+    time.value = 10
+    probe = await pool.acquire("groups.get")
+    assert probe.is_probe
+    assert time.value == 50
+
+
+@pytest.mark.asyncio
 async def test_code_6_uses_pool_configured_17_second_cooldown() -> None:
     calls = 0
 

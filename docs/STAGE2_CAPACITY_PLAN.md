@@ -15,6 +15,11 @@ Reports записываются атомарно и применяются то
 `production_allowed=false`. Порядок rollout: новый Pilot A run → новый subscriptions
 run → новый Pilot B run → новый subscription_posts run. После изменения flags, TTL,
 лимита или cohort size создаются новый run и новый report; старый run не продолжается.
+Gate отклоняет нулевой рост, менее 100 наблюдаемых users для Pilot A, менее 50 communities
+для Pilot B, любой failed job и прогноз роста больше текущего свободного места. Числа
+pilot/minimum настраиваются, но minimum не может превышать размер pilot. Перед
+`capacity-apply` требуется проверенный custom-format dump; его SHA-256 фиксируется в run
+и сверяется ещё раз непосредственно перед обращением к VK.
 
 ## До pilot
 
