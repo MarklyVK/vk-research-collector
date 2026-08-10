@@ -362,7 +362,7 @@ compose exec -T postgres pg_isready -U "$(env_value POSTGRES_USER)" -d "$(env_va
   || die 'PostgreSQL недоступен.'
 
 WORKER_BEFORE=$(service_state collector-worker)
-WORKER_CONTAINER=$(compose ps -q collector-worker 2>/dev/null || true)
+WORKER_CONTAINER=$(compose ps -aq collector-worker 2>/dev/null || true)
 if [[ -n "$WORKER_CONTAINER" ]]; then
   PREVIOUS_IMAGE=$(docker inspect --format '{{.Config.Image}}' "$WORKER_CONTAINER")
 fi
@@ -370,11 +370,15 @@ RUN_ID=$(env_value COLLECTION_RUN_ID)
 BASELINE_STATUS_JSON=""
 if [[ -n "$PREVIOUS_IMAGE" ]]; then
   IMAGE=$PREVIOUS_IMAGE
+  if [[ "$WORKER_BEFORE" != running/healthy && "$WORKER_BEFORE" != running ]]; then
+    # Ранний preflight обязан вернуть найденный остановленный production worker.
+    ROLLBACK_ALLOWED=1
+  fi
 fi
 if [[ -n "$RUN_ID" ]]; then
-  BASELINE_STATUS_JSON=$(compose run --rm --no-deps collector collection status --run-id "$RUN_ID")
+  BASELINE_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status --run-id "$RUN_ID")
 else
-  BASELINE_STATUS_JSON=$(compose run --rm --no-deps collector collection status)
+  BASELINE_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status)
   RUN_ID=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string run_id || true)
 fi
 IMAGE=$TARGET_IMAGE
@@ -428,12 +432,12 @@ compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker
 # До начала upgrade схема не менялась: любой pre-migration сбой должен вернуть старый worker.
 ROLLBACK_ALLOWED=1
 log 'Проверяется и применяется только Alembic upgrade.'
-compose run --rm --no-deps collector alembic current
+compose run --rm --no-deps --no-build collector alembic current
 # После начала forward migration старый image нельзя возвращать до успешного upgrade/check.
 ROLLBACK_ALLOWED=0
-compose run --rm --no-deps collector alembic upgrade head
-compose run --rm --no-deps collector alembic check
-ALEMBIC_REVISION=$(compose run --rm --no-deps collector alembic current | tail -n 1 | tr -d '\r')
+compose run --rm --no-deps --no-build collector alembic upgrade head
+compose run --rm --no-deps --no-build collector alembic check
+ALEMBIC_REVISION=$(compose run --rm --no-deps --no-build collector alembic current | tail -n 1 | tr -d '\r')
 
 ROLLBACK_ALLOWED=1
 atomic_text "$DEPLOY_DIR/.deploy/current-image" "$IMAGE"
@@ -453,8 +457,8 @@ done
 
 compose ps
 compose logs --no-color --since="$DEPLOY_STARTED_AT" --tail=300 collector-worker
-compose run --rm --no-deps collector classification summary
-compose run --rm --no-deps collector collection summary
+compose run --rm --no-deps --no-build collector classification summary
+compose run --rm --no-deps --no-build collector collection summary
 
 WORKER_CONTAINER=$(compose ps -q collector-worker)
 [[ -n "$WORKER_CONTAINER" ]] || die 'Container collector-worker не найден после запуска.'
@@ -463,7 +467,7 @@ WORKER_CONTAINER=$(compose ps -q collector-worker)
 verify_local_image
 
 if [[ -n "$RUN_ID" ]]; then
-  FINAL_STATUS_JSON=$(compose run --rm --no-deps collector collection status --run-id "$RUN_ID")
+  FINAL_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status --run-id "$RUN_ID")
   printf '%s\n' "$FINAL_STATUS_JSON"
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_FAILED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number failed || true)
@@ -472,7 +476,7 @@ if [[ -n "$RUN_ID" ]]; then
   (( FINAL_FAILED <= BASELINE_FAILED )) || die 'Количество failed jobs увеличилось.'
 
   set +e
-  VERIFY_JSON=$(compose run --rm --no-deps collector collection verify --run-id "$RUN_ID" 2>&1)
+  VERIFY_JSON=$(compose run --rm --no-deps --no-build collector collection verify --run-id "$RUN_ID" 2>&1)
   VERIFY_CODE=$?
   set -e
   printf '%s\n' "$VERIFY_JSON"
@@ -485,7 +489,7 @@ if [[ -n "$RUN_ID" ]]; then
   fi
 
   sleep "$PROGRESS_WAIT"
-  FINAL_STATUS_JSON=$(compose run --rm --no-deps collector collection status --run-id "$RUN_ID")
+  FINAL_STATUS_JSON=$(compose run --rm --no-deps --no-build collector collection status --run-id "$RUN_ID")
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
   FINAL_COMPLETED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number completed || true)
   FINAL_PENDING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number pending || true)
