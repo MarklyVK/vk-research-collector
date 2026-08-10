@@ -33,6 +33,10 @@ def upgrade() -> None:
             "group_memberships",
             "user_group_subscriptions",
             "collection_job_errors",
+            "vk_communities",
+            "user_subscription_states",
+            "vk_token_states",
+            "vk_token_method_states",
         }
     ]
     Base.metadata.create_all(op.get_bind(), tables=stage_one_tables)
@@ -88,6 +92,10 @@ def downgrade() -> None:
             "group_memberships",
             "user_group_subscriptions",
             "collection_job_errors",
+            "vk_communities",
+            "user_subscription_states",
+            "vk_token_states",
+            "vk_token_method_states",
         }
     ]
     Base.metadata.drop_all(op.get_bind(), tables=stage_one_tables)

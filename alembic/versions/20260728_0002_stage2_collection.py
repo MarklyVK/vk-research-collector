@@ -109,6 +109,7 @@ def upgrade() -> None:
 
     for table in (
         models.GroupCollectionState.__table__,
+        models.VKCommunity.__table__,
         models.GroupPost.__table__,
         models.PostAttachment.__table__,
         models.VKUser.__table__,
@@ -128,6 +129,7 @@ def downgrade() -> None:
         models.VKUser.__table__,
         models.PostAttachment.__table__,
         models.GroupPost.__table__,
+        models.VKCommunity.__table__,
         models.GroupCollectionState.__table__,
         models.CollectionJob.__table__,
         models.CollectionRun.__table__,

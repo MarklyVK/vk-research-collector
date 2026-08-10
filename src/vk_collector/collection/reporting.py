@@ -19,6 +19,10 @@ from vk_collector.database.models import (
     JobStatus,
     PostAttachment,
     UserGroupSubscription,
+    UserSubscriptionState,
+    VKCommunity,
+    VKTokenMethodState,
+    VKTokenState,
     VKUser,
 )
 
@@ -43,7 +47,11 @@ async def latest_runnable_run_id(
             .where(
                 CollectionRun.scope.in_(["full", "incremental"]),
                 CollectionRun.status.in_(
-                    [CollectionRunStatus.PLANNED, CollectionRunStatus.RUNNING]
+                    [
+                        CollectionRunStatus.PLANNED,
+                        CollectionRunStatus.RUNNING,
+                        CollectionRunStatus.WAITING_METHOD_LIMIT,
+                    ]
                 ),
                 CollectionRun.configuration["capacity_gate"].astext == "passed",
             )
@@ -82,16 +90,47 @@ async def run_summary(
                 ).where(CollectionJob.collection_run_id == target)
             )
         ).one()
+        job_types = (
+            await session.execute(
+                select(CollectionJob.job_type, CollectionJob.status, func.count(CollectionJob.id))
+                .where(CollectionJob.collection_run_id == target)
+                .group_by(CollectionJob.job_type, CollectionJob.status)
+            )
+        ).all()
+        method_limits = int(
+            await session.scalar(
+                select(func.count(VKTokenMethodState.id)).where(
+                    VKTokenMethodState.blocked_until > func.now()
+                )
+            )
+            or 0
+        )
+        next_method_retry = await session.scalar(
+            select(func.min(VKTokenMethodState.blocked_until)).where(
+                VKTokenMethodState.blocked_until > func.now()
+            )
+        )
         return {
             "run_id": str(target),
             "scope": run.scope,
             "status": run.status.value,
             "jobs": {status.value: count for status, count in jobs},
+            "jobs_by_type": {
+                job_type: {
+                    status.value: count
+                    for current_type, status, count in job_types
+                    if current_type == job_type
+                }
+                for job_type in sorted({row[0] for row in job_types})
+            },
             "api_requests": int(metrics[0]),
             "rows_inserted": int(metrics[1]),
             "rows_updated": int(metrics[2]),
             "retries": int(metrics[3]),
             "error_message": run.error_message,
+            "next_wakeup_at": run.next_wakeup_at.isoformat() if run.next_wakeup_at else None,
+            "blocked_token_methods": method_limits,
+            "next_method_retry_at": next_method_retry.isoformat() if next_method_retry else None,
         }
 
 
@@ -104,6 +143,10 @@ async def global_summary(sessions: async_sessionmaker[AsyncSession]) -> dict[str
             "memberships": GroupMembership,
             "users": VKUser,
             "subscriptions": UserGroupSubscription,
+            "communities": VKCommunity,
+            "subscription_states": UserSubscriptionState,
+            "token_states": VKTokenState,
+            "token_method_states": VKTokenMethodState,
             "runs": CollectionRun,
             "jobs": CollectionJob,
             "errors": CollectionJobError,
@@ -205,6 +248,7 @@ async def global_summary_from_session(session: AsyncSession) -> dict[str, int]:
         "memberships": GroupMembership,
         "users": VKUser,
         "subscriptions": UserGroupSubscription,
+        "communities": VKCommunity,
     }
     result: dict[str, int] = {}
     for label, model in rows.items():

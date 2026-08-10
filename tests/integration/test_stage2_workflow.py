@@ -29,6 +29,7 @@ from vk_collector.database.models import (
 )
 from vk_collector.database.session import create_database_engine
 from vk_collector.privacy import delete_user, inspect_user
+from vk_collector.vk import TokenPool, VKMethodUnavailable
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_INTEGRATION_TESTS") != "1" and os.getenv("APP_ENV") != "test",
@@ -78,7 +79,74 @@ class FakeVK:
     async def get_subscriptions_page(
         self, user_vk_id: int, offset: int, count: int
     ) -> dict[str, Any]:
-        return {"count": 1, "items": [777] if offset == 0 else []}
+        return {
+            "count": 1,
+            "items": [
+                {
+                    "id": 777,
+                    "name": "Подписка",
+                    "description": "Публичное описание",
+                    "screen_name": "subscription_fixture",
+                    "type": "group",
+                    "is_closed": 0,
+                }
+            ]
+            if offset == 0
+            else [],
+        }
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 1000.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    async def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+@pytest.mark.asyncio
+async def test_endpoint_state_survives_new_pool_and_does_not_block_other_method() -> None:
+    engine = create_database_engine(database_url())
+    token = f"integration-secret-{uuid.uuid4()}"
+    clock = FakeClock()
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            first_pool = TokenPool(
+                [token],
+                rps=100,
+                clock=clock,
+                sleep=clock.sleep,
+                sessions=sessions,
+                flood_initial_cooldown=60,
+            )
+            lease = await first_pool.acquire("groups.get")
+            await first_pool.method_cooldown(lease, 9)
+
+            restarted_pool = TokenPool(
+                [token],
+                rps=100,
+                clock=clock,
+                sleep=clock.sleep,
+                sessions=sessions,
+                flood_initial_cooldown=60,
+            )
+            with pytest.raises(VKMethodUnavailable):
+                await restarted_pool.acquire("groups.get")
+            wall_lease = await restarted_pool.acquire("wall.get")
+            assert wall_lease.method == "wall.get"
+            assert token not in repr(wall_lease)
+            await outer.rollback()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

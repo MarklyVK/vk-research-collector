@@ -3,7 +3,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from vk_collector.collection.notifications import notify
 from vk_collector.collection.queue import CollectionQueue
@@ -15,10 +15,18 @@ from vk_collector.config import Settings
 def test_blank_optional_limits_are_supported() -> None:
     settings = Settings(
         collection_members_max_per_group="",  # type: ignore[arg-type]
-        collection_subscriptions_max_per_user="",  # type: ignore[arg-type]
     )
     assert settings.collection_members_max_per_group is None
-    assert settings.collection_subscriptions_max_per_user is None
+    assert settings.collection_subscriptions_max_per_user == 50
+
+
+def test_subscription_limit_accepts_100_but_rejects_more() -> None:
+    assert (
+        Settings(collection_subscriptions_max_per_user=100).collection_subscriptions_max_per_user
+        == 100
+    )
+    with pytest.raises(ValidationError):
+        Settings(collection_subscriptions_max_per_user=101)
 
 
 def test_secret_masking_removes_tokens_and_database_urls() -> None:

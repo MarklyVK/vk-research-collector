@@ -13,6 +13,7 @@ from typing import Annotated, Any
 
 import typer
 from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.classification.audit import evaluate_audit, prepare_audit
 from vk_collector.classification.reclassification import (
@@ -37,7 +38,7 @@ from vk_collector.collection.reporting import (
     verify_run,
 )
 from vk_collector.collection.safety import inspect_disk
-from vk_collector.config import get_settings, load_keyword_config
+from vk_collector.config import Settings, get_settings, load_keyword_config
 from vk_collector.database.models import (
     CollectionJob,
     CollectionRun,
@@ -46,6 +47,10 @@ from vk_collector.database.models import (
     GroupKeywordMatch,
     JobStatus,
     SearchRun,
+    UserGroupSubscription,
+    UserSubscriptionState,
+    VKCommunity,
+    VKTokenMethodState,
 )
 from vk_collector.database.session import create_database_engine, create_session_factory
 from vk_collector.privacy import delete_user, inspect_group, inspect_user
@@ -58,10 +63,12 @@ app = typer.Typer(help="Поиск и ручная классификация с
 groups_app = typer.Typer(help="Поиск и статистика групп.")
 classification_app = typer.Typer(help="Пакеты ручной классификации.")
 collection_app = typer.Typer(help="Возобновляемый сбор публичных approved-данных.")
+subscriptions_app = typer.Typer(help="Обогащение существующих пользователей подписками.")
 privacy_app = typer.Typer(help="Проверка и минимизация персональных данных.")
 app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
 app.add_typer(collection_app, name="collection")
+collection_app.add_typer(subscriptions_app, name="subscriptions")
 app.add_typer(privacy_app, name="privacy")
 
 
@@ -79,16 +86,31 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _token_pool(
+    settings: Settings,
+    tokens: tuple[str, ...],
+    sessions: async_sessionmaker[AsyncSession],
+) -> TokenPool:
+    """Создать endpoint-aware pool из валидированной конфигурации."""
+    return TokenPool(
+        tokens,
+        rps=settings.vk_per_token_rps,
+        clock=time.monotonic,
+        flood_initial_cooldown=settings.vk_method_flood_initial_cooldown_seconds,
+        quota_initial_cooldown=settings.vk_method_quota_initial_cooldown_seconds,
+        max_method_cooldown=settings.vk_method_limit_max_cooldown_seconds,
+        probe_seconds=settings.vk_method_limit_probe_seconds,
+        global_rps_cooldown=settings.vk_global_rps_cooldown_seconds,
+        sessions=sessions,
+    )
+
+
 async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]:
     settings = get_settings()
     keyword_config = load_keyword_config()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
-    pool = TokenPool(
-        load_tokens(settings.vk_tokens_file),
-        rps=settings.vk_per_token_rps,
-        clock=time.monotonic,
-    )
+    pool = _token_pool(settings, load_tokens(settings.vk_tokens_file), sessions)
     client = VKClient(
         pool,
         api_version=settings.vk_api_version,
@@ -518,7 +540,7 @@ async def _execute_collection(
         except VKTokensUnavailable as exc:
             await queue.set_run_status(target, CollectionRunStatus.PAUSED_NO_TOKENS, str(exc))
             return target, 0
-        pool = TokenPool(tokens, rps=settings.vk_per_token_rps, clock=time.monotonic)
+        pool = _token_pool(settings, tokens, sessions)
         client = VKClient(
             pool,
             api_version=settings.vk_api_version,
@@ -635,6 +657,188 @@ def collection_status(
     """Показать состояние и накопленные метрики запуска."""
     payload = asyncio.run(_show_status(run_id))
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _plan_subscriptions(pilot: bool) -> uuid.UUID:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await CollectionQueue(sessions, settings).plan_subscriptions(pilot=pilot)
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("plan")
+def subscriptions_plan() -> None:
+    """Создать cohort-plan существующих публичных пользователей."""
+    run_id = asyncio.run(_plan_subscriptions(False))
+    typer.echo(f"План подписок создан или переиспользован: {run_id}")
+
+
+@subscriptions_app.command("pilot")
+def subscriptions_pilot() -> None:
+    """Создать детерминированный pilot максимум на 500 пользователей."""
+    run_id = asyncio.run(_plan_subscriptions(True))
+    typer.echo(f"Pilot подписок создан или переиспользован: {run_id}")
+
+
+@subscriptions_app.command("run")
+def subscriptions_run(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    max_jobs: Annotated[int | None, typer.Option("--max-jobs")] = None,
+) -> None:
+    """Выполнить подготовленный subscription run до idle."""
+    count = asyncio.run(_execute_collection(run_id, None, max_jobs, until_idle=True))
+    typer.echo(f"Обработано jobs: {count}")
+
+
+@subscriptions_app.command("status")
+def subscriptions_status(
+    run_id: Annotated[uuid.UUID | None, typer.Option("--run-id")] = None,
+) -> None:
+    """Показать состояние subscription run."""
+    typer.echo(json.dumps(asyncio.run(_show_status(run_id)), ensure_ascii=False, indent=2))
+
+
+async def _subscription_totals() -> dict[str, int]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            return {
+                "processed_users": int(
+                    await session.scalar(
+                        select(func.count(UserSubscriptionState.user_id)).where(
+                            UserSubscriptionState.last_success_at.is_not(None)
+                        )
+                    )
+                    or 0
+                ),
+                "private_subscriptions": int(
+                    await session.scalar(
+                        select(func.count(UserSubscriptionState.user_id)).where(
+                            UserSubscriptionState.privacy_denied.is_(True)
+                        )
+                    )
+                    or 0
+                ),
+                "subscription_links": int(
+                    await session.scalar(select(func.count(UserGroupSubscription.id))) or 0
+                ),
+                "communities": int(
+                    await session.scalar(select(func.count(VKCommunity.vk_id))) or 0
+                ),
+            }
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("totals")
+def subscriptions_totals() -> None:
+    """Показать накопленные subscription counters."""
+    typer.echo(json.dumps(asyncio.run(_subscription_totals()), ensure_ascii=False, indent=2))
+
+
+@subscriptions_app.command("capacity-preview")
+def subscriptions_capacity_preview() -> None:
+    """Сформировать консервативный JSON preview независимых Gate A и Gate B."""
+    settings = get_settings()
+    users = settings.collection_subscriptions_users_per_run
+    links = users * settings.collection_subscriptions_max_per_user
+    unique_communities_upper = links
+    posts = unique_communities_upper * settings.collection_subscription_group_posts_max
+    gate_a_bytes = links * 256 + unique_communities_upper * 1024
+    gate_b_bytes = posts * 2048 + posts * 256
+    payload = {
+        "kind": "theoretical_preview",
+        "requires_real_pilot": True,
+        "gate_a": {
+            "users": users,
+            "subscription_links_upper": links,
+            "unique_communities_upper": unique_communities_upper,
+            "estimated_bytes_upper": gate_a_bytes,
+        },
+        "gate_b": {
+            "communities_upper": unique_communities_upper,
+            "posts_upper": posts,
+            "estimated_bytes_upper": gate_b_bytes,
+        },
+        "safe_disk_limit_bytes": 7 * 1024**3,
+        "production_allowed": False,
+    }
+    target = settings.collection_export_dir / "subscription-capacity-preview.json"
+    _write_json(target, payload)
+    typer.echo(json.dumps({**payload, "path": str(target)}, ensure_ascii=False, indent=2))
+
+
+async def _method_limits(method: str | None = None) -> list[dict[str, object]]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            query = select(VKTokenMethodState).order_by(
+                VKTokenMethodState.method, VKTokenMethodState.token_fingerprint
+            )
+            if method:
+                query = query.where(VKTokenMethodState.method == method)
+            rows = list((await session.scalars(query)).all())
+            return [
+                {
+                    "token_fingerprint": row.token_fingerprint,
+                    "method": row.method,
+                    "blocked_until": row.blocked_until.isoformat() if row.blocked_until else None,
+                    "consecutive_limit_hits": row.consecutive_limit_hits,
+                    "last_error_code": row.last_error_code,
+                }
+                for row in rows
+            ]
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("method-limits")
+def method_limits(
+    method: Annotated[str | None, typer.Option("--method")] = None,
+) -> None:
+    """Показать method-specific cooldown без исходных токенов."""
+    typer.echo(json.dumps(asyncio.run(_method_limits(method)), ensure_ascii=False, indent=2))
+
+
+async def _reset_method_limits(method: str) -> int:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            result = await session.execute(
+                update(VKTokenMethodState)
+                .where(VKTokenMethodState.method == method)
+                .values(
+                    blocked_until=None,
+                    next_probe_at=None,
+                    consecutive_limit_hits=0,
+                    last_error_code=None,
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)  # type: ignore[attr-defined]
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("method-limits-reset")
+def method_limits_reset(
+    method: Annotated[str, typer.Option("--method")],
+    yes: Annotated[bool, typer.Option("--yes", help="Подтвердить точечный reset.")] = False,
+) -> None:
+    """Сбросить cooldown одного метода, не меняя токены и collection data."""
+    if not yes:
+        raise typer.BadParameter("Для reset укажите --yes")
+    count = asyncio.run(_reset_method_limits(method))
+    typer.echo(f"Сброшено method states: {count}")
 
 
 async def _change_run_status(run_id: uuid.UUID, status: CollectionRunStatus) -> None:
@@ -754,7 +958,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
             await queue.set_run_status(run_id, CollectionRunStatus.PAUSED_NO_TOKENS, str(exc))
             processed = 0
         else:
-            pool = TokenPool(tokens, rps=settings.vk_per_token_rps, clock=time.monotonic)
+            pool = _token_pool(settings, tokens, sessions)
             client = VKClient(
                 pool,
                 api_version=settings.vk_api_version,

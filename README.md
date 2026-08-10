@@ -1280,6 +1280,42 @@ Runtime secrets остаются только на сервере:
 
 ## Диагностика
 
+### Endpoint-aware подписки пользователей (выключены по умолчанию)
+
+Новый контур не запускается автоматически. Перед pilot сделайте проверенный backup,
+примените migration и оставьте оба feature flag в `false`:
+
+```bash
+make backup PURPOSE=before-subscriptions-pilot
+docker compose run --rm collector alembic upgrade head
+docker compose run --rm collector collection subscriptions capacity-preview
+docker compose run --rm collector collection subscriptions pilot
+docker compose run --rm collector collection subscriptions run --run-id RUN_ID --max-jobs 500
+docker compose run --rm collector collection subscriptions status --run-id RUN_ID
+```
+
+После измеренного Gate A разрешается отдельный cohort до 10 000 users с лимитом 50.
+Лимит 100 оценивается отдельным повторным pilot. Gate B (20 posts на уникальную
+community) включается только после Gate A и собственного capacity report:
+
+```bash
+COLLECTION_SUBSCRIPTIONS_ENABLED=true \
+COLLECTION_SUBSCRIPTIONS_MAX_PER_USER=50 \
+docker compose run --rm collector collection subscriptions plan
+
+COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=true \
+docker compose run --rm collector collection subscriptions run --run-id RUN_ID
+```
+
+Перед production cohort обязательны backup, свободное место по реальному JSON report и
+ручная фиксация gate. Теоретический preview никогда не выставляет
+`production_allowed=true`. Ограничения endpoints диагностируются без секретов:
+
+```bash
+docker compose run --rm collector collection method-limits
+docker compose run --rm collector collection method-limits-reset --method groups.get --yes
+```
+
 ### Контейнеры и логи
 
 ```bash
