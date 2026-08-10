@@ -141,8 +141,11 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
     stop = text.index('compose stop -t "$WORKER_STOP_TIMEOUT" collector-worker')
     preflight = text.index("compose_cli alembic current", stop)
     upgrade = text.index("compose_cli alembic upgrade head", preflight)
+    baseline = text.index("BASELINE_STATUS_JSON=$(compose_cli collection status", upgrade)
+    worker_start = text.index("compose up -d --no-deps --no-build collector-worker", baseline)
     assert text.index("ROLLBACK_ALLOWED=1", stop) < preflight
     assert preflight < text.index("ROLLBACK_ALLOWED=0", preflight) < upgrade
+    assert upgrade < baseline < worker_start
     assert "compose up -d --remove-orphans postgres" not in text
     assert "git reset --hard" not in text
     assert "git clean" not in text
