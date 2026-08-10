@@ -43,7 +43,8 @@ failed. Сбой preflight до начала `alembic upgrade` также воз
 Перед каждым одноразовым production CLI-контейнером проверяется наличие уже скачанного
 exact image, а `pull_policy: never` запрещает неявный pull. Это работает со старой
 версией Compose production runner и не позволяет случайно собрать target tag из прежнего
-deploy checkout. Остановленный worker определяется через `compose ps -aq`.
+deploy checkout. Baseline состояния collection снимается после успешной миграции схемы,
+но до запуска worker. Остановленный worker определяется через `compose ps -aq`.
 
 ## 13–15. Handoff и граница автоматизации
 

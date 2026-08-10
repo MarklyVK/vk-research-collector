@@ -425,16 +425,6 @@ atomic_text "$DEPLOY_DIR/.deploy/previous-image" "$PREVIOUS_IMAGE"
 log 'Скачивается неизменяемый SHA image.'
 docker pull "$IMAGE"
 verify_local_image
-if [[ -n "$RUN_ID" ]]; then
-  BASELINE_STATUS_JSON=$(compose_cli collection status --run-id "$RUN_ID")
-else
-  BASELINE_STATUS_JSON=$(compose_cli collection status)
-  RUN_ID=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string run_id || true)
-fi
-BASELINE_COMPLETED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number completed || true)
-BASELINE_FAILED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number failed || true)
-BASELINE_COMPLETED=${BASELINE_COMPLETED:-0}
-BASELINE_FAILED=${BASELINE_FAILED:-0}
 DISK_AFTER_PULL=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
 stop_worker_on_critical_disk "$DISK_AFTER_PULL" post-pull
 if (( DISK_AFTER_PULL >= DISK_WARNING )); then
@@ -455,6 +445,16 @@ compose_cli alembic check
 ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
 
 ROLLBACK_ALLOWED=1
+if [[ -n "$RUN_ID" ]]; then
+  BASELINE_STATUS_JSON=$(compose_cli collection status --run-id "$RUN_ID")
+else
+  BASELINE_STATUS_JSON=$(compose_cli collection status)
+  RUN_ID=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string run_id || true)
+fi
+BASELINE_COMPLETED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number completed || true)
+BASELINE_FAILED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number failed || true)
+BASELINE_COMPLETED=${BASELINE_COMPLETED:-0}
+BASELINE_FAILED=${BASELINE_FAILED:-0}
 atomic_text "$DEPLOY_DIR/.deploy/current-image" "$IMAGE"
 compose up -d --no-deps --no-build collector-worker
 
