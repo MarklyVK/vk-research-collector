@@ -37,8 +37,9 @@ CLI summaries, run status, failed/rejected jobs, дубли, диск и про�
 содержит SHA, images, backup, revision, states, run counters, DB size, disk и duration.
 
 При health failure возвращается `.deploy/previous-image`, но workflow остаётся
-failed. При migration failure worker не запускается и image rollback не имитирует
-откат схемы; PostgreSQL и backup остаются доступны для ручного восстановления.
+failed. Сбой preflight до начала `alembic upgrade` также возвращает старый worker.
+При migration failure после начала upgrade worker не запускается и image rollback не
+имитирует откат схемы; PostgreSQL и backup остаются доступны для ручного восстановления.
 
 ## 13–15. Handoff и граница автоматизации
 

@@ -16,6 +16,15 @@ def test_database_password_is_url_encoded_and_hidden() -> None:
     assert "secret:@/# value" not in repr(settings)
 
 
+def test_existing_subscription_page_size_500_remains_compatible() -> None:
+    settings = Settings(
+        collection_subscriptions_page_size=500,
+        collection_subscriptions_max_per_user=100,
+    )
+    assert settings.collection_subscriptions_page_size == 500
+    assert settings.collection_subscriptions_max_per_user == 100
+
+
 def test_all_four_subjects_and_food_service_keywords_are_loaded() -> None:
     config = load_keyword_config()
     assert config.subjects == SUBJECT_NAMES
