@@ -163,6 +163,16 @@ def test_runtime_secrets_archives_and_runner_are_not_tracked() -> None:
     assert not [path for path in tracked if forbidden.search(path)]
 
 
+def test_endpoint_migration_uses_one_set_based_post_backfill() -> None:
+    migration = (ROOT / "alembic/versions/20260810_0006_endpoint_aware_subscriptions.py").read_text(
+        encoding="utf-8"
+    )
+    assert "UPDATE group_posts AS p" in migration
+    assert "SET community_vk_id = g.vk_id" in migration
+    assert "ORDER BY p.id LIMIT 10000" not in migration
+    assert "GET DIAGNOSTICS changed" not in migration
+
+
 def test_operational_shell_scripts_are_executable_in_git() -> None:
     scripts = (
         "scripts/deploy-production.sh",
