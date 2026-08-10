@@ -78,11 +78,13 @@ grant_collector_backup_read() {
   backup_dir=$(dirname "$backup")
   chmod 0700 "$backup_dir"
   if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:10001:rx "$backup_dir"
     setfacl -m u:10001:r "$backup"
-    log 'Worker получил постоянный read-only ACL только на проверенный backup.'
+    log 'Worker получил rx ACL на закрытый каталог и read-only ACL на проверенный backup.'
   else
+    chmod o+x "$backup_dir"
     chmod o+r "$backup"
-    log 'setfacl отсутствует: backup directory закрыт 0700, файлу добавлено чтение для container UID.'
+    log 'setfacl отсутствует: каталогу добавлен только traverse, backup — только read.'
   fi
 }
 
@@ -201,6 +203,9 @@ start_subscriptions() {
   compose exec -T postgres pg_restore --list < "$latest_backup" >/dev/null \
     || die 'Последний backup не прошёл pg_restore --list.'
   grant_collector_backup_read "$latest_backup"
+  collector python -c \
+    'from pathlib import Path; p=Path("/app/backups/'"$(basename "$latest_backup")"'"); f=p.open("rb"); assert f.read(5) == b"PGDMP"' \
+    || die 'Collector UID не может прочитать PGDMP header после настройки ACL.'
 
   log 'Фиксирую безопасный лимит подписок: 50 на пользователя и включаю phase A.'
   set_env_value COLLECTION_SUBSCRIPTIONS_ENABLED true
