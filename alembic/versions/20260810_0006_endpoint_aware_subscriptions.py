@@ -84,23 +84,11 @@ def upgrade() -> None:
         op.add_column("group_posts", sa.Column("community_vk_id", sa.BigInteger()))
     op.execute(
         """
-        DO $$
-        DECLARE changed integer;
-        BEGIN
-          LOOP
-            WITH batch AS (
-              SELECT p.id, g.vk_id
-              FROM group_posts p
-              JOIN group_candidates g ON g.id = p.group_id
-              WHERE p.community_vk_id IS NULL
-              ORDER BY p.id LIMIT 10000
-            )
-            UPDATE group_posts p SET community_vk_id = batch.vk_id
-            FROM batch WHERE p.id = batch.id;
-            GET DIAGNOSTICS changed = ROW_COUNT;
-            EXIT WHEN changed = 0;
-          END LOOP;
-        END $$
+        UPDATE group_posts AS p
+        SET community_vk_id = g.vk_id
+        FROM group_candidates AS g
+        WHERE g.id = p.group_id
+          AND p.community_vk_id IS NULL
         """
     )
     missing = bind.scalar(sa.text("SELECT count(*) FROM group_posts WHERE community_vk_id IS NULL"))
