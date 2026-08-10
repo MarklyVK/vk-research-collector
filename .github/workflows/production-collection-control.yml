@@ -1,0 +1,70 @@
+name: Production collection control
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: report только читает; start-subscriptions запускает Pilot A и production run
+        required: true
+        type: choice
+        default: report
+        options:
+          - report
+          - start-subscriptions
+      confirmation:
+        description: Для запуска введите START_SUBSCRIPTIONS
+        required: false
+        type: string
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    name: Проверить или запустить production collection
+    runs-on: [self-hosted, linux, x64, production, vk-collector]
+    timeout-minutes: 360
+    environment:
+      name: production
+    steps:
+      - name: Получить проверенный main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Подтвердить commit и действие
+        shell: bash
+        env:
+          CONTROL_ACTION: ${{ inputs.action }}
+          CONTROL_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          if [[ "$CONTROL_ACTION" == start-subscriptions ]]; then
+            test "$CONTROL_CONFIRMATION" = START_SUBSCRIPTIONS
+          else
+            test "$CONTROL_ACTION" = report
+          fi
+      - name: Выполнить production control
+        shell: bash
+        env:
+          CONTROL_ACTION: ${{ inputs.action }}
+          DEPLOY_ROOT: /opt/vk-research-collector
+        run: |
+          set -Eeuo pipefail
+          report="$RUNNER_TEMP/production-collection-${GITHUB_RUN_ID}.log"
+          bash scripts/production-collection-control.sh \
+            --action "$CONTROL_ACTION" \
+            --deploy-dir "$DEPLOY_ROOT" | tee "$report"
+          {
+            echo '## Production collection control'
+            echo
+            echo '```text'
+            tail -n 240 "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

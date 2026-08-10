@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - Windows выполняет стати�
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy-production.sh"
 CLEANUP_SCRIPT = ROOT / "scripts" / "cleanup-production-storage.sh"
+COLLECTION_CONTROL_SCRIPT = ROOT / "scripts" / "production-collection-control.sh"
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE = f"ghcr.io/marklyvk/vk-research-collector/collector:sha-{FULL_SHA}"
 DIGEST = f"sha256:{'1' * 64}"
@@ -39,6 +40,9 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     cleanup_text = (ROOT / ".github/workflows/cleanup-production-storage.yml").read_text(
         encoding="utf-8"
     )
+    collection_control_text = (
+        ROOT / ".github/workflows/production-collection-control.yml"
+    ).read_text(encoding="utf-8")
     ci = load_yaml(ROOT / ".github/workflows/ci.yml")
     deploy = load_yaml(ROOT / ".github/workflows/deploy-production.yml")
 
@@ -79,7 +83,7 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     assert "TELEGRAM_BOT_TOKEN" in deploy_text
     assert "--workflow-failure" in deploy_text
     assert "ref=ghcr.io/${repository}/collector:sha-${GITHUB_SHA}" in deploy_text
-    workflow_text = ci_text + deploy_text + cleanup_text
+    workflow_text = ci_text + deploy_text + cleanup_text + collection_control_text
     assert "pull_request_target" not in workflow_text
     action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", workflow_text)
     assert action_refs and all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
@@ -219,10 +223,52 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
     assert not any(item in script for item in forbidden)
 
 
+def test_collection_control_is_manual_gated_and_preserves_capacity_guards() -> None:
+    workflow_path = ROOT / ".github/workflows/production-collection-control.yml"
+    workflow = load_yaml(workflow_path)
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    script = COLLECTION_CONTROL_SCRIPT.read_text(encoding="utf-8")
+
+    assert set(workflow["on"]) == {"workflow_dispatch"}  # type: ignore[arg-type]
+    assert workflow["concurrency"] == {  # type: ignore[index]
+        "group": "production-deployment",
+        "cancel-in-progress": "false",
+    }
+    job = workflow["jobs"]["control"]  # type: ignore[index]
+    assert job["runs-on"] == ["self-hosted", "linux", "x64", "production", "vk-collector"]
+    assert job["environment"] == {"name": "production"}
+    assert "START_SUBSCRIPTIONS" in workflow_text
+
+    required = (
+        "flock -n",
+        "20260810_0007",
+        "collection subscriptions pilot",
+        "subscription-gate-a.json",
+        "production_allowed",
+        "collection subscriptions plan",
+        "collection capacity-apply",
+        "--backup",
+        "COLLECTION_SUBSCRIPTIONS_MAX_PER_USER 50",
+        "compose stop -t 360 collector-worker",
+        "compose up -d --no-deps --no-build collector-worker",
+        "group_keyword_matches",
+        "vk_token_method_states",
+    )
+    assert all(item in script for item in required)
+    forbidden = (
+        "capacity_gate = 'passed'",
+        "UPDATE collection_runs",
+        "docker volume rm",
+        "down -v",
+    )
+    assert not any(item in script for item in forbidden)
+
+
 def test_operational_shell_scripts_are_executable_in_git() -> None:
     scripts = (
         "scripts/deploy-production.sh",
         "scripts/cleanup-production-storage.sh",
+        "scripts/production-collection-control.sh",
         "scripts/install-github-runner.sh",
         "scripts/import-server-handoff.sh",
         "scripts/setup-telegram-monitor.sh",
