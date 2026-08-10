@@ -754,7 +754,7 @@ docker compose run --rm collector [ГРУППА] [КОМАНДА] [АРГУМЕ�
 | `collection start` | Совместимый безопасный preview | — |
 | `collection plan` | Показать или применить план | `--apply`, `--pilot`, `--incremental-from UUID`, `--reason`, `--source`, `--audit-summary PATH` |
 | `collection pilot` | Выполнить pilot и оценить capacity | — |
-| `collection capacity-apply` | Применить успешный capacity report | `--run-id UUID`, `--source PATH` |
+| `collection capacity-apply` | Применить успешный capacity report | `--run-id UUID`, `--source PATH`; для подписок также `--backup DUMP` |
 | `collection run` | Запустить foreground worker | `--run-id UUID`, `--scope TEXT`, `--max-jobs N`, `--until-idle` |
 | `collection worker` | Запустить автономный worker | — |
 | `collection status` | Показать состояние run | `--run-id UUID` |
@@ -905,8 +905,12 @@ Production monitor выполняет read-only проверки каждые п
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `COLLECTION_SUBSCRIPTIONS_ENABLED` | `false` | Включить публичные подписки; требует отдельного capacity gate |
-| `COLLECTION_SUBSCRIPTIONS_MAX_PER_USER` | пусто | Максимум подписок пользователя |
-| `COLLECTION_SUBSCRIPTIONS_PAGE_SIZE` | `500` | Размер страницы, максимум 1000 |
+| `COLLECTION_SUBSCRIPTIONS_MAX_PER_USER` | `50` | Максимум подписок пользователя, не более 100 |
+| `COLLECTION_SUBSCRIPTIONS_PAGE_SIZE` | `50` | Размер страницы, не более 100 |
+| `COLLECTION_SUBSCRIPTION_PILOT_USERS` | `500` | Максимальный размер Pilot A |
+| `COLLECTION_SUBSCRIPTION_PILOT_MIN_USERS` | `100` | Минимальное наблюдение для разрешающего Gate A |
+| `COLLECTION_SUBSCRIPTION_POSTS_PILOT_COMMUNITIES` | `500` | Максимальный размер Pilot B |
+| `COLLECTION_SUBSCRIPTION_POSTS_PILOT_MIN_COMMUNITIES` | `50` | Минимальное наблюдение для разрешающего Gate B |
 
 ### Pilot и артефакты
 
@@ -1279,6 +1283,64 @@ Runtime secrets остаются только на сервере:
 Подробная настройка: [`docs/GITHUB_ACTIONS_DEPLOYMENT.md`](docs/GITHUB_ACTIONS_DEPLOYMENT.md).
 
 ## Диагностика
+
+### Endpoint-aware подписки пользователей (выключены по умолчанию)
+
+Новый контур не запускается автоматически. Каждый этап создаёт новый immutable run;
+после создания run нельзя менять влияющие на него flags/лимиты. Перед Pilot A сделайте
+backup, примените migration, включите только scope подписок и зафиксируйте лимит 50:
+
+```bash
+make backup PURPOSE=before-subscriptions-pilot
+docker compose run --rm collector alembic upgrade head
+docker compose run --rm collector collection subscriptions capacity-preview
+export COLLECTION_SUBSCRIPTIONS_ENABLED=true
+export COLLECTION_SUBSCRIPTIONS_MAX_PER_USER=50
+export COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=false
+docker compose run --rm collector collection subscriptions pilot
+```
+
+`pilot` сам выполняет до 500 jobs и атомарно пишет
+`subscription-gate-a.json`. Если report измеренный, свежий и разрешающий, создайте
+отдельный production run, примените Gate A и выполните его:
+
+```bash
+docker compose run --rm collector collection subscriptions plan
+docker compose run --rm collector collection capacity-apply \
+  --run-id SUBSCRIPTIONS_RUN_ID \
+  --source /app/exports/stage2-pilot/subscription-gate-a.json \
+  --backup /app/backups/BEFORE_SUBSCRIPTIONS.dump
+docker compose run --rm collector collection subscriptions run \
+  --run-id SUBSCRIPTIONS_RUN_ID
+```
+
+Gate B — ещё один pilot и ещё один run. После включения posts нельзя продолжать
+`SUBSCRIPTIONS_RUN_ID`, потому что его configuration неизменяема:
+
+```bash
+export COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED=true
+docker compose run --rm collector collection subscriptions posts-pilot \
+  --source-run-id PILOT_A_RUN_ID
+docker compose run --rm collector collection subscriptions posts-plan \
+  --source-run-id SUBSCRIPTIONS_RUN_ID
+docker compose run --rm collector collection capacity-apply \
+  --run-id POSTS_RUN_ID \
+  --source /app/exports/stage2-pilot/subscription-gate-b.json \
+  --backup /app/backups/BEFORE_SUBSCRIPTION_POSTS.dump
+docker compose run --rm collector collection subscriptions run --run-id POSTS_RUN_ID
+```
+
+Перед production cohort обязательны backup, свободное место по реальному JSON report и
+ручная фиксация gate. Теоретический preview никогда не выставляет
+`production_allowed=true`. CLI сохраняет SHA-256, размер и mtime dump в production run и
+повторно проверяет их перед первым API-вызовом. Сам dump предварительно проверьте через
+`pg_restore --list`, как в разделе «Проверенный backup через Make». Ограничения endpoints
+диагностируются без секретов:
+
+```bash
+docker compose run --rm collector collection method-limits
+docker compose run --rm collector collection method-limits-reset --method groups.get --yes
+```
 
 ### Контейнеры и логи
 

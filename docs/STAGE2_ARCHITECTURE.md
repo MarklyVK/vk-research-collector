@@ -117,8 +117,9 @@ Plan-key и capacity report содержат одинаковую collection-к�
 лимитов блокирует worker до обращения к VK. Backup создаётся перед schema/pilot/main run,
 проверяется `pg_restore --list` и не коммитится.
 
-После сбоя `collector-worker` запускается Docker Compose автоматически и выбирает только
-full или incremental run с `capacity_gate=passed`. Ручной путь — `collection resume`, затем
+После сбоя `collector-worker` запускается Docker Compose автоматически и выбирает
+full/incremental/subscriptions/subscription_posts run только с `capacity_gate=passed`.
+Pilot автономно не выбирается. Ручной путь — `collection resume`, затем
 `collection run --run-id ... --until-idle`; checkpoint исключает дубли уже сохранённых
 страниц. На Windows это требует запущенного Docker Desktop; на Debian Docker включается
 через systemd.
@@ -141,3 +142,41 @@ flowchart LR
 ограничивает `search_keywords.subject` и `group_labels.label`. `search_run_groups`
 даёт per-run дедупликацию и статистику known/new, а `classification_reviews` хранит
 неизменяемую историю повторных решений.
+
+## Endpoint-aware scheduler
+
+`VKClient.call(method, params)` получает lease только для точного `method`. Секрет живёт
+только в lease процесса; PostgreSQL хранит fingerprint, глобальное состояние токена и
+отдельные method states. Выдача RPS координируется транзакционной блокировкой строки
+token state, поэтому параллельные CLI/worker процессы не превышают общий лимит.
+
+Типы jobs отображаются на методы без объединения в семейства. Scheduler циклически
+обходит `refresh_group`, `collect_group_posts`, `collect_group_members`,
+`refresh_user_profile`, `collect_user_subscriptions` и
+`collect_subscription_group_posts`; priority применяется только внутри типа.
+
+Канонический поток данных:
+
+```text
+approved membership -> vk_user -> groups.get extended=1
+  -> vk_communities + user_group_subscriptions
+  -> unique collect_subscription_group_posts -> group_posts + post_attachments
+```
+
+Subscription communities не попадают в поисковую классификацию. `group_posts`
+ссылается на `vk_communities`; необязательная обратная связь с `group_candidates`
+сохраняется для совместимости.
+
+`next_probe_at` — не декоративное поле: после его наступления worker транзакционно
+переносит его вперёд и получает единственный probe lease, хотя `blocked_until` ещё не
+истёк. Probe не обходит `global_blocked_until` и общий per-token RPS slot. Успех очищает
+method state, повторный limit увеличивает backoff. Run в
+`waiting_method_limit` остаётся видим автономному worker и возвращается в `running`
+после `next_wakeup_at`; method deferral уменьшает обратно технический claim attempt.
+
+Subscription planner исключает как свежие успешные состояния, так и privacy/access
+состояния до `next_scheduled_at`. После наступления TTL или даты повтора завершённый
+исторический run не переиспользуется: создаётся новый immutable run. Capacity Gate A/B
+принимает только реальный pilot с минимальным числом наблюдений, положительным ростом,
+нулём failed jobs и прогнозом в пределах 7 GiB и свободного места. Production run также
+привязан к неизменному backup по пути, размеру, mtime и SHA-256.

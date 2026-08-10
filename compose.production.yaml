@@ -12,6 +12,7 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./exports:/app/exports
+      - ./backups:/app/backups:ro
       - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
 
   collector-worker:
@@ -21,6 +22,7 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./exports:/app/exports
+      - ./backups:/app/backups:ro
       - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
     healthcheck:
       test:

@@ -19,9 +19,15 @@ from vk_collector.database.models import (
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
+    CommunityPostCollectionState,
     GroupCandidate,
     GroupLabel,
+    GroupMembership,
     JobStatus,
+    UserGroupSubscription,
+    UserSubscriptionState,
+    VKCommunity,
+    VKUser,
 )
 from vk_collector.subjects import SUBJECT_NAMES
 
@@ -101,8 +107,6 @@ class CollectionQueue:
             scopes.append("members")
         if self._settings.collection_users_enabled:
             scopes.append("users")
-        if self._settings.collection_subscriptions_enabled:
-            scopes.append("subscriptions")
         return tuple(scopes)
 
     def collection_configuration(self) -> dict[str, object]:
@@ -118,6 +122,26 @@ class CollectionQueue:
             "user_batch_size": self._settings.collection_user_batch_size,
             "subscriptions_max_per_user": (self._settings.collection_subscriptions_max_per_user),
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
+            "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,
+            "subscriptions_ttl_days": self._settings.collection_subscriptions_ttl_days,
+            "subscription_pilot_users": self._settings.collection_subscription_pilot_users,
+            "subscription_pilot_min_users": (
+                self._settings.collection_subscription_pilot_min_users
+            ),
+            "subscriptions_enabled": self._settings.collection_subscriptions_enabled,
+            "subscription_posts_enabled": (
+                self._settings.collection_subscription_group_posts_enabled
+            ),
+            "subscription_posts_max": self._settings.collection_subscription_group_posts_max,
+            "subscription_posts_ttl_days": (
+                self._settings.collection_subscription_group_posts_ttl_days
+            ),
+            "subscription_posts_pilot_communities": (
+                self._settings.collection_subscription_posts_pilot_communities
+            ),
+            "subscription_posts_pilot_min_communities": (
+                self._settings.collection_subscription_posts_pilot_min_communities
+            ),
         }
 
     async def incremental_group_ids(self, baseline_run_id: uuid.UUID) -> list[int]:
@@ -337,14 +361,21 @@ class CollectionQueue:
             await session.commit()
             return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
-    async def claim(self, run_id: uuid.UUID, *, scope: str | None = None) -> ClaimedJob | None:
+    async def claim(
+        self,
+        run_id: uuid.UUID,
+        *,
+        scope: str | None = None,
+        job_type: str | None = None,
+    ) -> ClaimedJob | None:
         now = datetime.now(UTC)
-        job_type = {
+        selected_job_type = job_type or {
             "groups": "refresh_group",
             "posts": "collect_group_posts",
             "members": "collect_group_members",
             "users": "refresh_user_profile",
             "subscriptions": "collect_user_subscriptions",
+            "subscription_posts": "collect_subscription_group_posts",
         }.get(scope or "")
         async with self._sessions() as session:
             query = (
@@ -361,8 +392,8 @@ class CollectionQueue:
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
-            if job_type:
-                query = query.where(CollectionJob.job_type == job_type)
+            if selected_job_type:
+                query = query.where(CollectionJob.job_type == selected_job_type)
             job = await session.scalar(query)
             if job is None:
                 return None
@@ -377,6 +408,7 @@ class CollectionQueue:
                 CollectionRunStatus.PLANNED,
                 CollectionRunStatus.PAUSED,
                 CollectionRunStatus.PAUSED_NO_TOKENS,
+                CollectionRunStatus.WAITING_METHOD_LIMIT,
             }:
                 run.status = CollectionRunStatus.RUNNING
                 run.started_at = run.started_at or now
@@ -390,6 +422,255 @@ class CollectionQueue:
                 dict(job.checkpoint),
                 job.attempt_count,
             )
+
+    async def plan_subscriptions(self, *, pilot: bool = False) -> uuid.UUID:
+        """Идемпотентно спланировать enrichment уже существующих доступных users."""
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=self._settings.collection_subscriptions_ttl_days)
+        limit = (
+            self._settings.collection_subscription_pilot_users
+            if pilot
+            else self._settings.collection_subscriptions_users_per_run
+        )
+        async with self._sessions() as session:
+            fresh = select(UserSubscriptionState.user_id).where(
+                or_(
+                    UserSubscriptionState.next_scheduled_at > now,
+                    UserSubscriptionState.last_success_at >= cutoff,
+                )
+            )
+            ids = list(
+                (
+                    await session.scalars(
+                        select(VKUser.vk_id)
+                        .join(GroupMembership, GroupMembership.user_id == VKUser.vk_id)
+                        .join(GroupCandidate, GroupCandidate.id == GroupMembership.group_id)
+                        .where(
+                            GroupCandidate.classification_status == ClassificationStatus.APPROVED,
+                            GroupMembership.is_current.is_(True),
+                            VKUser.deactivated.is_(None),
+                            or_(
+                                VKUser.is_closed.is_(False),
+                                VKUser.can_access_closed.is_(True),
+                            ),
+                            VKUser.vk_id.not_in(fresh),
+                        )
+                        .distinct()
+                        .order_by(VKUser.vk_id)
+                        .limit(limit)
+                    )
+                ).all()
+            )
+            id_hash = hashlib.sha256(
+                ",".join(str(value) for value in ids).encode("ascii")
+            ).hexdigest()
+            collection_configuration = self.collection_configuration()
+            configuration = {
+                "plan_key": hashlib.sha256(
+                    json.dumps(
+                        {
+                            "user_hash": id_hash,
+                            "pilot": pilot,
+                            "collection": collection_configuration,
+                        },
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest(),
+                "pilot": pilot,
+                "phase": "A",
+                "user_ids_hash": id_hash,
+                "user_count": len(ids),
+                "collection": collection_configuration,
+                "capacity_gate": "pilot_required" if not pilot else "pilot",
+            }
+            existing_query = select(CollectionRun).where(
+                CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+            )
+            if ids:
+                existing_query = existing_query.where(
+                    CollectionRun.status.in_(
+                        [
+                            CollectionRunStatus.PLANNED,
+                            CollectionRunStatus.RUNNING,
+                            CollectionRunStatus.PAUSED,
+                            CollectionRunStatus.PAUSED_NO_TOKENS,
+                            CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                            CollectionRunStatus.WAITING_METHOD_LIMIT,
+                        ]
+                    )
+                )
+            existing = await session.scalar(
+                existing_query.order_by(CollectionRun.created_at.desc()).limit(1)
+            )
+            if existing is not None:
+                return existing.id
+            run = CollectionRun(
+                scope="subscriptions_pilot" if pilot else "subscriptions",
+                status=(
+                    CollectionRunStatus.COMPLETED
+                    if not ids
+                    else CollectionRunStatus.PLANNED
+                    if pilot
+                    else CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                ),
+                configuration=configuration,
+                finished_at=now if not ids else None,
+                error_message="Нет подходящих пользователей; запуск завершён без API-вызовов"
+                if not ids
+                else None,
+            )
+            session.add(run)
+            await session.flush()
+            for start in range(0, len(ids), 1000):
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        [
+                            {
+                                "collection_run_id": run.id,
+                                "job_type": "collect_user_subscriptions",
+                                "entity_type": "user",
+                                "entity_id": user_id,
+                                "priority": 50,
+                            }
+                            for user_id in ids[start : start + 1000]
+                        ]
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+            run.total_jobs = len(ids)
+            await session.commit()
+            return run.id
+
+    async def plan_subscription_posts(
+        self,
+        *,
+        pilot: bool = False,
+        source_run_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        """Создать отдельный неизменяемый run последних 20 постов communities."""
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            if pilot and source_run_id is None:
+                source_run_id = await session.scalar(
+                    select(CollectionRun.id)
+                    .where(
+                        CollectionRun.scope == "subscriptions_pilot",
+                        CollectionRun.status == CollectionRunStatus.COMPLETED,
+                    )
+                    .order_by(CollectionRun.created_at.desc())
+                    .limit(1)
+                )
+            if not pilot and source_run_id is None:
+                raise ValueError(
+                    "Для production posts нужен завершённый production subscriptions run"
+                )
+            if source_run_id is not None:
+                source_run = await session.get(CollectionRun, source_run_id)
+                expected_scope = "subscriptions_pilot" if pilot else "subscriptions"
+                if (
+                    source_run is None
+                    or source_run.scope != expected_scope
+                    or source_run.status != CollectionRunStatus.COMPLETED
+                ):
+                    label = "Pilot B" if pilot else "Production posts"
+                    raise ValueError(
+                        f"{label} принимает только завершённый run scope={expected_scope}"
+                    )
+            elif pilot:
+                raise ValueError("Для Pilot B нужен завершённый Pilot A")
+            fresh = select(CommunityPostCollectionState.community_vk_id).where(
+                CommunityPostCollectionState.next_scheduled_at > now,
+            )
+            query = (
+                select(VKCommunity.vk_id)
+                .join(
+                    UserGroupSubscription,
+                    UserGroupSubscription.vk_group_id == VKCommunity.vk_id,
+                )
+                .where(
+                    UserGroupSubscription.is_current.is_(True),
+                    VKCommunity.deactivated.is_(None),
+                    VKCommunity.is_closed.is_(False),
+                    VKCommunity.vk_id.not_in(fresh),
+                )
+                .distinct()
+                .order_by(VKCommunity.vk_id)
+            )
+            if source_run_id is not None:
+                query = query.where(UserGroupSubscription.source_run_id == source_run_id)
+            if pilot:
+                query = query.limit(self._settings.collection_subscription_posts_pilot_communities)
+            ids = list((await session.scalars(query)).all())
+            configuration = {
+                "pilot": pilot,
+                "phase": "B",
+                "source_run_id": str(source_run_id) if source_run_id else None,
+                "community_count": len(ids),
+                "collection": self.collection_configuration(),
+                "capacity_gate": "pilot" if pilot else "pilot_required",
+            }
+            configuration["plan_key"] = hashlib.sha256(
+                json.dumps({**configuration, "community_ids": ids}, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            existing_query = select(CollectionRun).where(
+                CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
+            )
+            if ids:
+                existing_query = existing_query.where(
+                    CollectionRun.status.in_(
+                        [
+                            CollectionRunStatus.PLANNED,
+                            CollectionRunStatus.RUNNING,
+                            CollectionRunStatus.PAUSED,
+                            CollectionRunStatus.PAUSED_NO_TOKENS,
+                            CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                            CollectionRunStatus.WAITING_METHOD_LIMIT,
+                        ]
+                    )
+                )
+            existing = await session.scalar(
+                existing_query.order_by(CollectionRun.created_at.desc()).limit(1)
+            )
+            if existing is not None:
+                return existing.id
+            run = CollectionRun(
+                scope="subscription_posts_pilot" if pilot else "subscription_posts",
+                status=(
+                    CollectionRunStatus.COMPLETED
+                    if not ids
+                    else CollectionRunStatus.PLANNED
+                    if pilot
+                    else CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                ),
+                configuration=configuration,
+                finished_at=now if not ids else None,
+                error_message="Нет communities для сбора постов; запуск завершён без API-вызовов"
+                if not ids
+                else None,
+            )
+            session.add(run)
+            await session.flush()
+            for start in range(0, len(ids), 1000):
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        [
+                            {
+                                "collection_run_id": run.id,
+                                "job_type": "collect_subscription_group_posts",
+                                "entity_type": "community",
+                                "entity_id": community_id,
+                                "priority": 60,
+                            }
+                            for community_id in ids[start : start + 1000]
+                        ]
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+            run.total_jobs = len(ids)
+            await session.commit()
+            return run.id
 
     async def claim_user_batch(self, run_id: uuid.UUID, *, limit: int) -> list[ClaimedJob]:
         """Атомарно захватить дополнительные profile jobs для одного users.get."""
@@ -482,6 +763,60 @@ class CollectionQueue:
             await session.commit()
         await self.refresh_run(job.collection_run_id)
 
+    async def defer_method(self, job: ClaimedJob, *, retry_at: datetime, message: str) -> None:
+        """Отложить job из-за method limit, не расходуя обычную попытку."""
+        async with self._sessions() as session:
+            current = await session.get(CollectionJob, job.id, with_for_update=True)
+            if current is None:
+                return
+            current.status = JobStatus.RETRY_WAIT
+            current.next_attempt_at = retry_at
+            current.attempt_count = max(0, current.attempt_count - 1)
+            current.last_error_type = "method_limit"
+            current.last_error_message = message
+            current.locked_at = None
+            current.locked_by = None
+            current.heartbeat_at = None
+            run = await session.get(CollectionRun, job.run_id, with_for_update=True)
+            if run is not None:
+                run.status = CollectionRunStatus.WAITING_METHOD_LIMIT
+                run.next_wakeup_at = (
+                    retry_at if run.next_wakeup_at is None else min(run.next_wakeup_at, retry_at)
+                )
+                run.error_message = message
+            await session.commit()
+
+    async def pending_job_types(self, run_id: uuid.UUID) -> set[str]:
+        """Вернуть типы готовых pending/retry jobs без claim."""
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            return set(
+                (
+                    await session.scalars(
+                        select(CollectionJob.job_type)
+                        .where(
+                            CollectionJob.collection_run_id == run_id,
+                            CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY_WAIT]),
+                            or_(
+                                CollectionJob.next_attempt_at.is_(None),
+                                CollectionJob.next_attempt_at <= now,
+                            ),
+                        )
+                        .distinct()
+                    )
+                ).all()
+            )
+
+    async def wait_for_methods(self, run_id: uuid.UUID, retry_at: datetime) -> None:
+        """Зафиксировать ближайшее автоматическое пробуждение run."""
+        async with self._sessions() as session:
+            run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if run is not None:
+                run.status = CollectionRunStatus.WAITING_METHOD_LIMIT
+                run.next_wakeup_at = retry_at
+                run.error_message = "Все готовые VK methods временно ограничены"
+            await session.commit()
+
     async def refresh_run(self, run_id: uuid.UUID) -> None:
         progress_notification: int | None = None
         async with self._sessions() as session:
@@ -527,6 +862,17 @@ class CollectionQueue:
                     if run.failed_jobs
                     else CollectionRunStatus.COMPLETED
                 )
+            elif run.status == CollectionRunStatus.WAITING_METHOD_LIMIT:
+                next_retry = await session.scalar(
+                    select(func.min(CollectionJob.next_attempt_at)).where(
+                        CollectionJob.collection_run_id == run_id,
+                        CollectionJob.status == JobStatus.RETRY_WAIT,
+                    )
+                )
+                run.next_wakeup_at = next_retry
+                if next_retry is not None and next_retry <= datetime.now(UTC):
+                    run.status = CollectionRunStatus.RUNNING
+                    run.next_wakeup_at = None
             await session.commit()
         if progress_notification is not None:
             await notify(

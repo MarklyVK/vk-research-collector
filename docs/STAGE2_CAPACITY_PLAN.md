@@ -1,5 +1,26 @@
 # План ёмкости второго этапа
 
+## Независимые gates подписок
+
+Gate A измеряет детерминированный pilot примерно на 500 users: сначала лимит 50,
+затем preview 100. JSON report содержит API requests, subscription rows, unique
+communities, рост БД и длительность. Gate B берёт уникальные communities Pilot A и
+измеряет до 20 posts, attachments, skipped, рост БД и длительность. Массовый запуск
+разрешается cohort-порциями (по умолчанию до 10 000 users) только после backup и если
+оба прогноза укладываются в safe disk limit. Отсутствие реального pilot означает
+техническую готовность к pilot, но не готовность к production rollout.
+
+Reports записываются атомарно и применяются только к точному configuration hash в
+течение `COLLECTION_CAPACITY_REPORT_MAX_AGE_DAYS`. Теоретический preview всегда имеет
+`production_allowed=false`. Порядок rollout: новый Pilot A run → новый subscriptions
+run → новый Pilot B run → новый subscription_posts run. После изменения flags, TTL,
+лимита или cohort size создаются новый run и новый report; старый run не продолжается.
+Gate отклоняет нулевой рост, менее 100 наблюдаемых users для Pilot A, менее 50 communities
+для Pilot B, любой failed job и прогноз роста больше текущего свободного места. Числа
+pilot/minimum настраиваются, но minimum не может превышать размер pilot. Перед
+`capacity-apply` требуется проверенный custom-format dump; его SHA-256 фиксируется в run
+и сверяется ещё раз непосредственно перед обращением к VK.
+
 ## До pilot
 
 Известно 12 260 целевых approved-групп. Ни число доступных постов/участников, ни

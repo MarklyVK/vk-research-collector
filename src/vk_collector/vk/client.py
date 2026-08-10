@@ -15,8 +15,8 @@ Sleep = Callable[[float], Awaitable[None]]
 Jitter = Callable[[float], float]
 
 AUTH_ERRORS = frozenset({5, 27, 28})
-RATE_LIMIT_ERRORS = frozenset({6, 29})
-FLOOD_ERRORS = frozenset({9})
+GLOBAL_RATE_LIMIT_ERRORS = frozenset({6})
+METHOD_LIMIT_ERRORS = frozenset({9, 29})
 RETRYABLE_ERRORS = frozenset({1, 10})
 PERMISSION_ERROR = 7
 INVALID_PARAMS_ERROR = 100
@@ -32,14 +32,12 @@ class VKClient:
         http_client: httpx.AsyncClient | None = None,
         sleep: Sleep = asyncio.sleep,
         retry_delays: Sequence[float] = (60, 300, 900, 3600, 21600),
-        cooldown_seconds: float = 60.0,
         jitter: Jitter | None = None,
     ) -> None:
         self._pool = token_pool
         self._api_version = api_version
         self._sleep = sleep
         self._retry_delays = tuple(retry_delays)
-        self._cooldown_seconds = cooldown_seconds
         self._jitter = jitter or (lambda delay: random.uniform(0.9, 1.1) * delay)
         self._http = http_client or httpx.AsyncClient(
             base_url="https://api.vk.com/method/", timeout=timeout
@@ -50,15 +48,23 @@ class VKClient:
         if self._owns_http:
             await self._http.aclose()
 
+    async def is_method_available(self, method: str) -> bool:
+        """Проверить endpoint-aware доступность без выполнения запроса."""
+        return await self._pool.is_method_available(method)
+
+    async def next_method_available_at(self, method: str) -> float | None:
+        """Вернуть ближайший момент доступности метода по clock пула."""
+        return await self._pool.next_available_at(method)
+
     async def call(self, method: str, params: Mapping[str, str | int]) -> Any:
         """Вызвать метод, применяя политику ошибок без утечки токена."""
         retry_index = 0
         while True:
-            token = await self._pool.acquire()
+            lease = await self._pool.acquire(method)
             try:
                 response = await self._http.post(
                     method,
-                    data={**params, "access_token": token, "v": self._api_version},
+                    data={**params, "access_token": lease.token, "v": self._api_version},
                 )
                 response.raise_for_status()
                 body: dict[str, Any] = response.json()
@@ -78,17 +84,18 @@ class VKClient:
                 result = body.get("response")
                 if not isinstance(result, (dict, list)):
                     raise VKAPIError(-1, "Некорректная структура ответа")
+                await self._pool.mark_success(lease)
                 return result
             code = int(error.get("error_code", -1))
             message = str(error.get("error_msg", "неизвестная ошибка"))
             if code in AUTH_ERRORS:
-                await self._pool.disable(token)
+                await self._pool.disable(lease, f"VK auth error {code}")
                 continue
-            if code in RATE_LIMIT_ERRORS:
-                await self._pool.cooldown(token, self._cooldown_seconds)
+            if code in GLOBAL_RATE_LIMIT_ERRORS:
+                await self._pool.global_cooldown(lease)
                 continue
-            if code in FLOOD_ERRORS:
-                await self._pool.cooldown(token, self._cooldown_seconds * 2)
+            if code in METHOD_LIMIT_ERRORS:
+                await self._pool.method_cooldown(lease, code)
                 continue
             if code in RETRYABLE_ERRORS:
                 if retry_index >= len(self._retry_delays):
@@ -213,7 +220,13 @@ class VKClient:
     ) -> dict[str, Any]:
         response = await self.call(
             "groups.get",
-            {"user_id": user_vk_id, "offset": offset, "count": count, "extended": 0},
+            {
+                "user_id": user_vk_id,
+                "offset": offset,
+                "count": count,
+                "extended": 1,
+                "fields": "description,status,screen_name,members_count",
+            },
         )
         if not isinstance(response, dict):
             raise VKAPIError(-1, "Некорректный ответ groups.get")

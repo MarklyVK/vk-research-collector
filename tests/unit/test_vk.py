@@ -11,6 +11,7 @@ from vk_collector.vk import (
     TokenPool,
     VKAPIError,
     VKClient,
+    VKMethodUnavailable,
     VKTokensUnavailable,
     load_tokens,
 )
@@ -48,17 +49,172 @@ def test_loads_unlimited_nonempty_tokens(tmp_path: Path) -> None:
 async def test_pool_rate_limit_cooldown_disable_and_redacted_repr() -> None:
     time = FakeTime()
     pool = TokenPool(["secret-a", "secret-b"], rps=2, clock=time.clock, sleep=time.sleep)
-    assert await pool.acquire() == "secret-a"
-    await pool.cooldown("secret-b", 10)
-    assert await pool.acquire() == "secret-a"
+    first = await pool.acquire("groups.get")
+    assert first.token == "secret-a"
+    second = await pool.acquire("groups.get")
+    await pool.global_cooldown(second, 10)
+    assert (await pool.acquire("groups.get")).token == "secret-a"
     assert time.sleeps == [0.5]
-    await pool.disable("secret-a")
-    assert await pool.acquire() == "secret-b"
+    await pool.disable(first)
+    assert (await pool.acquire("groups.get")).token == "secret-b"
     assert time.value == 10
-    await pool.disable("secret-b")
+    await pool.disable(second)
     with pytest.raises(VKTokensUnavailable):
-        await pool.acquire()
+        await pool.acquire("groups.get")
     assert "secret" not in repr(pool)
+    assert "secret" not in repr(first)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [9, 29])
+async def test_method_limit_switches_token_and_keeps_other_methods(error_code: int) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(httpx.QueryParams(request.content.decode()))
+        token = params["access_token"]
+        method = request.url.path.rsplit("/", 1)[-1]
+        seen.append((method, token))
+        if method == "groups.get" and token == "token-a":
+            return httpx.Response(
+                200,
+                json={"error": {"error_code": error_code, "error_msg": "limited"}},
+            )
+        return httpx.Response(200, json={"response": {"count": 0, "items": []}})
+
+    time = FakeTime()
+    pool = TokenPool(
+        ["token-a", "token-b"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=10,
+        quota_initial_cooldown=10,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        client = VKClient(pool, http_client=http, sleep=time.sleep)
+        await client.call("groups.get", {})
+        await client.call("wall.get", {})
+    assert seen[:2] == [("groups.get", "token-a"), ("groups.get", "token-b")]
+    assert seen[2] == ("wall.get", "token-a")
+
+
+@pytest.mark.asyncio
+async def test_all_tokens_limited_for_exact_method_raise_unavailable() -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["a", "b"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=10,
+    )
+    first = await pool.acquire("groups.get")
+    await pool.method_cooldown(first, 9)
+    second = await pool.acquire("groups.get")
+    await pool.method_cooldown(second, 9)
+    with pytest.raises(VKMethodUnavailable):
+        await pool.acquire("groups.get")
+    assert (await pool.acquire("wall.get")).fingerprint in {
+        first.fingerprint,
+        second.fingerprint,
+    }
+
+
+@pytest.mark.asyncio
+async def test_method_cooldown_grows_and_is_capped() -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=10,
+        max_method_cooldown=25,
+    )
+    lease = await pool.acquire("groups.get")
+    assert await pool.method_cooldown(lease, 9) == 10
+    time.value = 10
+    lease = await pool.acquire("groups.get")
+    assert await pool.method_cooldown(lease, 9) == 30
+    time.value = 30
+    lease = await pool.acquire("groups.get")
+    assert await pool.method_cooldown(lease, 9) == 55
+
+
+@pytest.mark.asyncio
+async def test_next_probe_allows_exactly_one_attempt_before_long_block_expires() -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=100,
+        probe_seconds=10,
+    )
+    lease = await pool.acquire("groups.get")
+    await pool.method_cooldown(lease, 9)
+    with pytest.raises(VKMethodUnavailable):
+        await pool.acquire("groups.get")
+    time.value = 10
+    probe = await pool.acquire("groups.get")
+    assert probe.is_probe
+    with pytest.raises(VKMethodUnavailable):
+        await pool.acquire("groups.get")
+    await pool.mark_success(probe)
+    assert not (await pool.acquire("groups.get")).is_probe
+
+
+@pytest.mark.asyncio
+async def test_probe_respects_global_cooldown_and_shared_rps_slot() -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=0.05,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=100,
+        probe_seconds=10,
+        global_rps_cooldown=50,
+    )
+    lease = await pool.acquire("groups.get")
+    await pool.method_cooldown(lease, 9)
+    await pool.global_cooldown(lease)
+    time.value = 10
+    probe = await pool.acquire("groups.get")
+    assert probe.is_probe
+    assert time.value == 50
+
+
+@pytest.mark.asyncio
+async def test_code_6_uses_pool_configured_17_second_cooldown() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200, json={"error": {"error_code": 6, "error_msg": "too many requests"}}
+            )
+        return httpx.Response(200, json={"response": []})
+
+    time = FakeTime()
+    pool = TokenPool(
+        ["a"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        global_rps_cooldown=17,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        await VKClient(pool, http_client=http).call("users.get", {})
+    assert time.sleeps == [17]
 
 
 @async_test
@@ -162,3 +318,26 @@ async def test_transient_retry_uses_injected_jitter_without_real_wait() -> None:
         )
         assert await client.call("groups.getById", {}) == []
     assert time.sleeps == [11]
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_request_uses_extended_objects_and_requested_limit() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(
+            200,
+            json={"response": {"count": 1, "items": [{"id": 7, "name": "Группа"}]}},
+        )
+
+    time = FakeTime()
+    pool = TokenPool(["fake"], rps=1000, clock=time.clock, sleep=time.sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        response = await VKClient(pool, http_client=http).get_subscriptions_page(42, 0, 100)
+    assert response["items"] == [{"id": 7, "name": "Группа"}]
+    assert captured["extended"] == "1"
+    assert captured["count"] == "100"
+    assert "description" in captured["fields"]

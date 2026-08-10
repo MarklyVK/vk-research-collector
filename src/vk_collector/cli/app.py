@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import signal
@@ -9,10 +10,11 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import typer
 from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.classification.audit import evaluate_audit, prepare_audit
 from vk_collector.classification.reclassification import (
@@ -26,6 +28,11 @@ from vk_collector.classification.service import (
     import_classification,
 )
 from vk_collector.collection import CollectionQueue, CollectionWorker
+from vk_collector.collection.capacity import (
+    build_capacity_report,
+    validate_capacity_report,
+    write_capacity_report,
+)
 from vk_collector.collection.notifications import notify
 from vk_collector.collection.reporting import (
     capacity_gate_passed,
@@ -37,7 +44,7 @@ from vk_collector.collection.reporting import (
     verify_run,
 )
 from vk_collector.collection.safety import inspect_disk
-from vk_collector.config import get_settings, load_keyword_config
+from vk_collector.config import Settings, get_settings, load_keyword_config
 from vk_collector.database.models import (
     CollectionJob,
     CollectionRun,
@@ -46,6 +53,10 @@ from vk_collector.database.models import (
     GroupKeywordMatch,
     JobStatus,
     SearchRun,
+    UserGroupSubscription,
+    UserSubscriptionState,
+    VKCommunity,
+    VKTokenMethodState,
 )
 from vk_collector.database.session import create_database_engine, create_session_factory
 from vk_collector.privacy import delete_user, inspect_group, inspect_user
@@ -54,14 +65,17 @@ from vk_collector.search.service import Keyword, SearchService
 from vk_collector.subjects import SubjectName, ensure_subject
 from vk_collector.vk import TokenPool, VKClient, VKTokensUnavailable, load_tokens
 
+logger = logging.getLogger(__name__)
 app = typer.Typer(help="Поиск и ручная классификация сообществ VK.")
 groups_app = typer.Typer(help="Поиск и статистика групп.")
 classification_app = typer.Typer(help="Пакеты ручной классификации.")
 collection_app = typer.Typer(help="Возобновляемый сбор публичных approved-данных.")
+subscriptions_app = typer.Typer(help="Обогащение существующих пользователей подписками.")
 privacy_app = typer.Typer(help="Проверка и минимизация персональных данных.")
 app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
 app.add_typer(collection_app, name="collection")
+collection_app.add_typer(subscriptions_app, name="subscriptions")
 app.add_typer(privacy_app, name="privacy")
 
 
@@ -79,16 +93,33 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _token_pool(
+    settings: Settings,
+    tokens: tuple[str, ...],
+    sessions: async_sessionmaker[AsyncSession],
+) -> TokenPool:
+    """Создать endpoint-aware pool из валидированной конфигурации."""
+    return TokenPool(
+        tokens,
+        rps=settings.vk_per_token_rps,
+        clock=time.monotonic,
+        flood_initial_cooldown=settings.vk_method_flood_initial_cooldown_seconds,
+        quota_initial_cooldown=settings.vk_method_quota_initial_cooldown_seconds,
+        max_method_cooldown=settings.vk_method_limit_max_cooldown_seconds,
+        probe_seconds=settings.vk_method_limit_probe_seconds,
+        global_rps_cooldown=settings.vk_global_rps_cooldown_seconds,
+        escalation_window=settings.vk_limit_escalation_window_seconds,
+        escalation_methods=settings.vk_limit_escalation_distinct_methods,
+        sessions=sessions,
+    )
+
+
 async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]:
     settings = get_settings()
     keyword_config = load_keyword_config()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
-    pool = TokenPool(
-        load_tokens(settings.vk_tokens_file),
-        rps=settings.vk_per_token_rps,
-        clock=time.monotonic,
-    )
+    pool = _token_pool(settings, load_tokens(settings.vk_tokens_file), sessions)
     client = VKClient(
         pool,
         api_version=settings.vk_api_version,
@@ -490,6 +521,7 @@ async def _execute_collection(
     *,
     until_idle: bool,
     stop_event: asyncio.Event | None = None,
+    explicit_pilot: bool = False,
 ) -> tuple[uuid.UUID, int]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -508,6 +540,55 @@ async def _execute_collection(
                 sessions, target
             ):
                 raise ValueError("Full/incremental run запрещён до успешного capacity gate")
+            if run.scope in {"subscriptions_pilot", "subscription_posts_pilot"}:
+                if not explicit_pilot:
+                    raise ValueError(
+                        "Pilot запускается только явной командой subscriptions pilot/posts-pilot"
+                    )
+            elif run.scope == "subscriptions":
+                if not settings.collection_subscriptions_enabled:
+                    raise ValueError("Сбор подписок выключен COLLECTION_SUBSCRIPTIONS_ENABLED")
+                report_path = run.configuration.get("capacity_report")
+                if run.configuration.get("capacity_gate") != "passed" or not isinstance(
+                    report_path, str
+                ):
+                    raise ValueError("Subscription run запрещён до успешного Gate A")
+                expected = run.configuration.get("collection")
+                if not isinstance(expected, dict):
+                    raise ValueError("Subscription run содержит повреждённую конфигурацию")
+                validate_capacity_report(
+                    Path(report_path),
+                    phase="A",
+                    configuration=expected,
+                    max_age_days=settings.collection_capacity_report_max_age_days,
+                )
+                backup = run.configuration.get("verified_backup")
+                if not isinstance(backup, dict) or not isinstance(backup.get("path"), str):
+                    raise ValueError("Subscription run запрещён без проверенного backup")
+                _validated_backup_metadata(Path(backup["path"]), expected=backup)
+            elif run.scope == "subscription_posts":
+                if not settings.collection_subscription_group_posts_enabled:
+                    raise ValueError(
+                        "Сбор постов подписок выключен COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED"
+                    )
+                report_path = run.configuration.get("capacity_report")
+                if run.configuration.get("capacity_gate") != "passed" or not isinstance(
+                    report_path, str
+                ):
+                    raise ValueError("Subscription posts run запрещён до успешного Gate B")
+                expected = run.configuration.get("collection")
+                if not isinstance(expected, dict):
+                    raise ValueError("Subscription posts run содержит повреждённую конфигурацию")
+                validate_capacity_report(
+                    Path(report_path),
+                    phase="B",
+                    configuration=expected,
+                    max_age_days=settings.collection_capacity_report_max_age_days,
+                )
+                backup = run.configuration.get("verified_backup")
+                if not isinstance(backup, dict) or not isinstance(backup.get("path"), str):
+                    raise ValueError("Subscription posts run запрещён без проверенного backup")
+                _validated_backup_metadata(Path(backup["path"]), expected=backup)
             expected_configuration = run.configuration.get("collection")
             if expected_configuration != queue.collection_configuration():
                 raise ValueError(
@@ -518,7 +599,7 @@ async def _execute_collection(
         except VKTokensUnavailable as exc:
             await queue.set_run_status(target, CollectionRunStatus.PAUSED_NO_TOKENS, str(exc))
             return target, 0
-        pool = TokenPool(tokens, rps=settings.vk_per_token_rps, clock=time.monotonic)
+        pool = _token_pool(settings, tokens, sessions)
         client = VKClient(
             pool,
             api_version=settings.vk_api_version,
@@ -553,7 +634,15 @@ def run_collection(
     until_idle: Annotated[bool, typer.Option("--until-idle")] = False,
 ) -> None:
     """Запустить foreground worker; результат всегда сохраняется в PostgreSQL."""
-    if scope not in {None, "groups", "posts", "members", "users", "subscriptions"}:
+    if scope not in {
+        None,
+        "groups",
+        "posts",
+        "members",
+        "users",
+        "subscriptions",
+        "subscription_posts",
+    }:
         typer.echo("Неизвестный scope.", err=True)
         raise typer.Exit(code=2)
     try:
@@ -585,13 +674,20 @@ async def _collection_worker_service() -> None:
                         stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
                     )
                 continue
-            await _execute_collection(
-                target,
-                None,
-                None,
-                until_idle=False,
-                stop_event=stop_event,
-            )
+            try:
+                await _execute_collection(
+                    target,
+                    None,
+                    None,
+                    until_idle=False,
+                    stop_event=stop_event,
+                )
+            except ValueError as exc:
+                queue = CollectionQueue(sessions, settings)
+                await queue.set_run_status(
+                    target, CollectionRunStatus.PAUSED_CAPACITY_LIMIT, str(exc)
+                )
+                logger.error("Автономный run %s безопасно отклонён: %s", target, exc)
     finally:
         await engine.dispose()
 
@@ -635,6 +731,239 @@ def collection_status(
     """Показать состояние и накопленные метрики запуска."""
     payload = asyncio.run(_show_status(run_id))
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _plan_subscriptions(pilot: bool) -> uuid.UUID:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await CollectionQueue(sessions, settings).plan_subscriptions(pilot=pilot)
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("plan")
+def subscriptions_plan() -> None:
+    """Создать cohort-plan существующих публичных пользователей."""
+    run_id = asyncio.run(_plan_subscriptions(False))
+    typer.echo(f"План подписок создан или переиспользован: {run_id}")
+
+
+@subscriptions_app.command("pilot")
+def subscriptions_pilot(
+    max_jobs: Annotated[int | None, typer.Option("--max-jobs", min=1)] = None,
+) -> None:
+    """Явно выполнить Pilot A максимум на 500 пользователей и записать report."""
+    try:
+        payload = asyncio.run(_run_subscription_pilot("A", max_jobs=max_jobs))
+    except ValueError as exc:
+        typer.echo(f"Pilot A отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _plan_subscription_posts(pilot: bool, source_run_id: uuid.UUID | None) -> uuid.UUID:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await CollectionQueue(sessions, settings).plan_subscription_posts(
+            pilot=pilot, source_run_id=source_run_id
+        )
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("posts-plan")
+def subscription_posts_plan(
+    source_run_id: Annotated[uuid.UUID, typer.Option("--source-run-id")],
+) -> None:
+    """Создать отдельный production-plan постов после Gate B."""
+    try:
+        run_id = asyncio.run(_plan_subscription_posts(False, source_run_id))
+    except ValueError as exc:
+        typer.echo(f"Production plan постов отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"План постов подписок создан или переиспользован: {run_id}")
+
+
+@subscriptions_app.command("posts-pilot")
+def subscription_posts_pilot(
+    source_run_id: Annotated[uuid.UUID | None, typer.Option("--source-run-id")] = None,
+    max_jobs: Annotated[int | None, typer.Option("--max-jobs", min=1)] = None,
+) -> None:
+    """Явно выполнить Pilot B по communities завершённого Pilot A."""
+    try:
+        payload = asyncio.run(
+            _run_subscription_pilot("B", source_run_id=source_run_id, max_jobs=max_jobs)
+        )
+    except ValueError as exc:
+        typer.echo(f"Pilot B отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@subscriptions_app.command("run")
+def subscriptions_run(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    max_jobs: Annotated[int | None, typer.Option("--max-jobs")] = None,
+) -> None:
+    """Выполнить подготовленный subscription run до idle."""
+    try:
+        _, count = asyncio.run(_execute_collection(run_id, None, max_jobs, until_idle=False))
+    except ValueError as exc:
+        typer.echo(f"Запуск подписок отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"Обработано jobs: {count}")
+
+
+@subscriptions_app.command("status")
+def subscriptions_status(
+    run_id: Annotated[uuid.UUID | None, typer.Option("--run-id")] = None,
+) -> None:
+    """Показать состояние subscription run."""
+    typer.echo(json.dumps(asyncio.run(_show_status(run_id)), ensure_ascii=False, indent=2))
+
+
+async def _subscription_totals() -> dict[str, int]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            return {
+                "processed_users": int(
+                    await session.scalar(
+                        select(func.count(UserSubscriptionState.user_id)).where(
+                            UserSubscriptionState.last_success_at.is_not(None)
+                        )
+                    )
+                    or 0
+                ),
+                "private_subscriptions": int(
+                    await session.scalar(
+                        select(func.count(UserSubscriptionState.user_id)).where(
+                            UserSubscriptionState.privacy_denied.is_(True)
+                        )
+                    )
+                    or 0
+                ),
+                "subscription_links": int(
+                    await session.scalar(select(func.count(UserGroupSubscription.id))) or 0
+                ),
+                "communities": int(
+                    await session.scalar(select(func.count(VKCommunity.vk_id))) or 0
+                ),
+            }
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("totals")
+def subscriptions_totals() -> None:
+    """Показать накопленные subscription counters."""
+    typer.echo(json.dumps(asyncio.run(_subscription_totals()), ensure_ascii=False, indent=2))
+
+
+@subscriptions_app.command("capacity-preview")
+def subscriptions_capacity_preview() -> None:
+    """Сформировать консервативный JSON preview независимых Gate A и Gate B."""
+    settings = get_settings()
+    users = settings.collection_subscriptions_users_per_run
+    links = users * settings.collection_subscriptions_max_per_user
+    unique_communities_upper = links
+    posts = unique_communities_upper * settings.collection_subscription_group_posts_max
+    gate_a_bytes = links * 256 + unique_communities_upper * 1024
+    gate_b_bytes = posts * 2048 + posts * 256
+    payload = {
+        "kind": "theoretical_preview",
+        "requires_real_pilot": True,
+        "gate_a": {
+            "users": users,
+            "subscription_links_upper": links,
+            "unique_communities_upper": unique_communities_upper,
+            "estimated_bytes_upper": gate_a_bytes,
+        },
+        "gate_b": {
+            "communities_upper": unique_communities_upper,
+            "posts_upper": posts,
+            "estimated_bytes_upper": gate_b_bytes,
+        },
+        "safe_disk_limit_bytes": 7 * 1024**3,
+        "production_allowed": False,
+    }
+    target = settings.collection_export_dir / "subscription-capacity-preview.json"
+    _write_json(target, payload)
+    typer.echo(json.dumps({**payload, "path": str(target)}, ensure_ascii=False, indent=2))
+
+
+async def _method_limits(method: str | None = None) -> list[dict[str, object]]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            query = select(VKTokenMethodState).order_by(
+                VKTokenMethodState.method, VKTokenMethodState.token_fingerprint
+            )
+            if method:
+                query = query.where(VKTokenMethodState.method == method)
+            rows = list((await session.scalars(query)).all())
+            return [
+                {
+                    "token_fingerprint": row.token_fingerprint,
+                    "method": row.method,
+                    "blocked_until": row.blocked_until.isoformat() if row.blocked_until else None,
+                    "consecutive_limit_hits": row.consecutive_limit_hits,
+                    "last_error_code": row.last_error_code,
+                }
+                for row in rows
+            ]
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("method-limits")
+def method_limits(
+    method: Annotated[str | None, typer.Option("--method")] = None,
+) -> None:
+    """Показать method-specific cooldown без исходных токенов."""
+    typer.echo(json.dumps(asyncio.run(_method_limits(method)), ensure_ascii=False, indent=2))
+
+
+async def _reset_method_limits(method: str) -> int:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            result = await session.execute(
+                update(VKTokenMethodState)
+                .where(VKTokenMethodState.method == method)
+                .values(
+                    blocked_until=None,
+                    next_probe_at=None,
+                    consecutive_limit_hits=0,
+                    last_error_code=None,
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)  # type: ignore[attr-defined]
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("method-limits-reset")
+def method_limits_reset(
+    method: Annotated[str, typer.Option("--method")],
+    yes: Annotated[bool, typer.Option("--yes", help="Подтвердить точечный reset.")] = False,
+) -> None:
+    """Сбросить cooldown одного метода, не меняя токены и collection data."""
+    if not yes:
+        raise typer.BadParameter("Для reset укажите --yes")
+    count = asyncio.run(_reset_method_limits(method))
+    typer.echo(f"Сброшено method states: {count}")
 
 
 async def _change_run_status(run_id: uuid.UUID, status: CollectionRunStatus) -> None:
@@ -737,6 +1066,193 @@ def _write_json(target: Path, payload: dict[str, Any]) -> None:
     temporary.replace(target)
 
 
+def _validated_backup_metadata(
+    backup: Path,
+    *,
+    expected: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Проверить формат и fingerprint PostgreSQL custom-format backup."""
+    digest = hashlib.sha256()
+    try:
+        stat = backup.stat()
+        with backup.open("rb") as stream:
+            header = stream.read(5)
+            digest.update(header)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError(f"Backup не читается: {exc}") from exc
+    if not backup.is_file() or stat.st_size <= 5 or header != b"PGDMP":
+        raise ValueError("Нужен непустой PostgreSQL backup формата pg_dump -Fc")
+    metadata: dict[str, object] = {
+        "path": str(backup.resolve()),
+        "size_bytes": stat.st_size,
+        "modified_ns": stat.st_mtime_ns,
+        "sha256": digest.hexdigest(),
+    }
+    if expected is not None and metadata != expected:
+        raise ValueError("Проверенный backup отсутствует или изменился после capacity-apply")
+    return metadata
+
+
+async def _run_subscription_pilot(
+    phase: Literal["A", "B"],
+    *,
+    source_run_id: uuid.UUID | None = None,
+    max_jobs: int | None = None,
+) -> dict[str, Any]:
+    """Выполнить измеряемый Pilot A/B; незавершённый pilot оставляет gate закрытым."""
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        queue = CollectionQueue(sessions, settings)
+        before = await database_metrics(sessions)
+        run_id = (
+            await queue.plan_subscriptions(pilot=True)
+            if phase == "A"
+            else await queue.plan_subscription_posts(pilot=True, source_run_id=source_run_id)
+        )
+        started_at = time.monotonic()
+        _, processed = await _execute_collection(
+            run_id,
+            None,
+            max_jobs,
+            until_idle=False,
+            explicit_pilot=True,
+        )
+        duration_seconds = time.monotonic() - started_at
+        after = await database_metrics(sessions)
+        summary = await run_summary(sessions, run_id)
+        database_growth = max(0, after["database_bytes"] - before["database_bytes"])
+        relation_growth = sum(
+            max(0, after[key] - before[key])
+            for key in before
+            if key.startswith("relation_") and key in after
+        )
+        measured_growth = max(database_growth, relation_growth)
+        configuration = queue.collection_configuration()
+        selected = int(
+            summary.get("jobs_by_type", {})
+            .get(
+                "collect_user_subscriptions"
+                if phase == "A"
+                else "collect_subscription_group_posts",
+                {},
+            )
+            .get("completed", 0)
+        )
+        target_entities = (
+            settings.collection_subscriptions_users_per_run
+            if phase == "A"
+            else int(after.get("subscription_communities", 0))
+        )
+        projected_growth = (
+            int(measured_growth / selected * target_entities * 1.30)
+            if selected > 0 and measured_growth > 0
+            else None
+        )
+        projected_database = (
+            after["database_bytes"] + projected_growth if projected_growth is not None else None
+        )
+        completed = summary["status"] == "completed"
+        jobs = summary.get("jobs", {})
+        planned_entities = sum(int(value) for value in jobs.values())
+        skipped_entities = int(jobs.get("skipped", 0))
+        failed_entities = int(jobs.get("failed", 0))
+        observed_entities = selected + skipped_entities
+        minimum_entities = (
+            settings.collection_subscription_pilot_min_users
+            if phase == "A"
+            else settings.collection_subscription_posts_pilot_min_communities
+        )
+        disk = inspect_disk(
+            settings.collection_export_dir,
+            settings.disk_warning_percent,
+            settings.disk_stop_percent,
+        )
+        production_allowed = bool(
+            completed
+            and max_jobs is None
+            and failed_entities == 0
+            and observed_entities >= minimum_entities
+            and measured_growth > 0
+            and isinstance(projected_growth, int)
+            and isinstance(projected_database, int)
+            and projected_database <= 7 * 1024**3
+            and projected_growth <= disk.free_bytes
+        )
+        measured: dict[str, int | float] = {
+            "duration_seconds": duration_seconds,
+            "api_requests": int(summary.get("api_requests", 0)),
+            "processed_jobs": processed,
+            "planned_entities": planned_entities,
+            "observed_entities": observed_entities,
+            "completed_entities": selected,
+            "skipped_entities": skipped_entities,
+            "failed_entities": failed_entities,
+            "private_entities": int(summary.get("private_users", 0)),
+            "database_bytes_before": before["database_bytes"],
+            "database_bytes_after": after["database_bytes"],
+            "database_growth_bytes": database_growth,
+            "relation_growth_bytes": relation_growth,
+            "disk_free_bytes_after": disk.free_bytes,
+            "subscription_links_before": before.get("subscriptions", 0),
+            "subscription_links_after": after.get("subscriptions", 0),
+            "unique_communities_before": before.get("communities", 0),
+            "unique_communities_after": after.get("communities", 0),
+            "posts_before": before.get("posts", 0),
+            "posts_after": after.get("posts", 0),
+            "attachments_before": before.get("attachments", 0),
+            "attachments_after": after.get("attachments", 0),
+        }
+        for key in sorted(name for name in before if name.startswith("relation_")):
+            measured[f"{key}_before"] = before[key]
+            measured[f"{key}_after"] = after[key]
+        projected: dict[str, int | float | None] = {
+            "target_entities": target_entities,
+            "database_growth_bytes": projected_growth,
+            "database_bytes": projected_database,
+            "reserve_factor": 1.30,
+        }
+        if phase == "A" and projected_growth is not None:
+            projected["database_bytes_limit_100"] = before["database_bytes"] + int(
+                projected_growth * 100 / settings.collection_subscriptions_max_per_user
+            )
+        limits = (
+            {
+                "pilot_users": settings.collection_subscription_pilot_users,
+                "minimum_pilot_users": settings.collection_subscription_pilot_min_users,
+                "subscriptions_per_user": settings.collection_subscriptions_max_per_user,
+                "subscriptions_preview_limit": 100,
+                "production_users": settings.collection_subscriptions_users_per_run,
+            }
+            if phase == "A"
+            else {
+                "pilot_communities": (settings.collection_subscription_posts_pilot_communities),
+                "minimum_pilot_communities": (
+                    settings.collection_subscription_posts_pilot_min_communities
+                ),
+                "posts_per_community": settings.collection_subscription_group_posts_max,
+                "post_ttl_days": settings.collection_subscription_group_posts_ttl_days,
+            }
+        )
+        report = build_capacity_report(
+            phase=phase,
+            run_id=run_id,
+            configuration=configuration,
+            limits=limits,
+            measured=measured,
+            projected=projected,
+            production_allowed=production_allowed,
+        )
+        target = settings.collection_export_dir / f"subscription-gate-{phase.lower()}.json"
+        write_capacity_report(target, report)
+        return {"path": str(target), **report}
+    finally:
+        await engine.dispose()
+
+
 async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -754,7 +1270,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
             await queue.set_run_status(run_id, CollectionRunStatus.PAUSED_NO_TOKENS, str(exc))
             processed = 0
         else:
-            pool = TokenPool(tokens, rps=settings.vk_per_token_rps, clock=time.monotonic)
+            pool = _token_pool(settings, tokens, sessions)
             client = VKClient(
                 pool,
                 api_version=settings.vk_api_version,
@@ -817,36 +1333,75 @@ def collection_pilot() -> None:
     typer.echo(f"Capacity gate: {capacity['decision']}")
 
 
-async def _apply_capacity(run_id: uuid.UUID, source: Path) -> dict[str, Any]:
+async def _apply_capacity(
+    run_id: uuid.UUID,
+    source: Path,
+    backup: Path | None = None,
+) -> dict[str, Any]:
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Capacity report не читается: {exc}") from exc
-    projected = payload.get("projected_database_bytes")
-    safe_limit = payload.get("safe_limit_bytes")
-    if (
-        payload.get("decision") != "passed"
-        or not isinstance(projected, int)
-        or not isinstance(safe_limit, int)
-        or projected > safe_limit
-    ):
-        raise ValueError("Capacity report не разрешает full run")
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     try:
         async with sessions() as session:
             run = await session.get(CollectionRun, run_id, with_for_update=True)
-            if run is None or run.scope != "full":
-                raise ValueError("Full run не найден")
-            if payload.get("configuration") != run.configuration.get("collection"):
-                raise ValueError("Capacity report относится к другой конфигурации сбора")
+            if run is None:
+                raise ValueError("Collection run не найден")
+            expected = run.configuration.get("collection")
+            if not isinstance(expected, dict):
+                raise ValueError("Collection run содержит повреждённую конфигурацию")
+            backup_metadata: dict[str, object] | None = None
+            if run.scope in {"subscriptions", "subscription_posts"}:
+                if backup is None:
+                    raise ValueError("Для subscription capacity gate обязателен --backup")
+                backup_metadata = _validated_backup_metadata(backup)
+                phase: Literal["A", "B"] = "A" if run.scope == "subscriptions" else "B"
+                payload = validate_capacity_report(
+                    source,
+                    phase=phase,
+                    configuration=expected,
+                    max_age_days=settings.collection_capacity_report_max_age_days,
+                )
+                pilot_id = payload.get("run_id")
+                try:
+                    pilot_run = await session.get(CollectionRun, uuid.UUID(str(pilot_id)))
+                except ValueError as exc:
+                    raise ValueError("Capacity report содержит некорректный pilot run ID") from exc
+                expected_scope = (
+                    "subscriptions_pilot" if phase == "A" else "subscription_posts_pilot"
+                )
+                if (
+                    pilot_run is None
+                    or pilot_run.scope != expected_scope
+                    or pilot_run.status != CollectionRunStatus.COMPLETED
+                ):
+                    raise ValueError("Capacity report не связан с завершённым pilot run")
+                projected = payload["projected"]["database_bytes"]
+                safe_limit = payload["safe_disk_limit_bytes"]
+            elif run.scope == "full":
+                projected = payload.get("projected_database_bytes")
+                safe_limit = payload.get("safe_limit_bytes")
+                if (
+                    payload.get("decision") != "passed"
+                    or not isinstance(projected, int)
+                    or not isinstance(safe_limit, int)
+                    or projected > safe_limit
+                ):
+                    raise ValueError("Capacity report не разрешает full run")
+                if payload.get("configuration") != expected:
+                    raise ValueError("Capacity report относится к другой конфигурации сбора")
+            else:
+                raise ValueError("Capacity report нельзя применить к этому scope")
             run.configuration = {
                 **run.configuration,
                 "capacity_gate": "passed",
                 "projected_database_bytes": projected,
                 "safe_limit_bytes": safe_limit,
-                "capacity_report": str(source),
+                "capacity_report": str(source.resolve()),
+                **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
             }
             run.status = CollectionRunStatus.PLANNED
             run.error_message = None
@@ -863,12 +1418,19 @@ def apply_capacity_gate(
         Path | None,
         typer.Option("--source", help="Проверенный capacity-estimate.json."),
     ] = None,
+    backup: Annotated[
+        Path | None,
+        typer.Option(
+            "--backup",
+            help="Проверенный pg_dump -Fc; обязателен для subscription Gate A/B.",
+        ),
+    ] = None,
 ) -> None:
     """Разрешить full run только по измеренному успешному capacity report."""
     settings = get_settings()
     target = source or settings.collection_export_dir / "capacity-estimate.json"
     try:
-        payload = asyncio.run(_apply_capacity(run_id, target))
+        payload = asyncio.run(_apply_capacity(run_id, target, backup))
     except ValueError as exc:
         typer.echo(f"Capacity gate отклонён: {exc}", err=True)
         raise typer.Exit(code=2) from exc

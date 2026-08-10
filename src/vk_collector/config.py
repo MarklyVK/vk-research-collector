@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import quote
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from vk_collector.subjects import SUBJECT_NAMES, SUBJECT_TITLES, SubjectName, ensure_subject
@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     vk_request_timeout_seconds: float = 30
     vk_max_concurrency: int = Field(default=3, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
+    vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
+    vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
+    vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)
+    vk_method_limit_probe_seconds: int = Field(default=900, ge=1)
+    vk_global_rps_cooldown_seconds: int = Field(default=60, ge=1)
+    vk_limit_escalation_window_seconds: int = Field(default=60, ge=1)
+    vk_limit_escalation_distinct_methods: int = Field(default=3, ge=2)
     classification_batch_size: int = Field(default=100, ge=1)
     export_dir: Path = Path("/app/exports/classification")
     postgres_db: str = "vk_research"
@@ -63,20 +70,50 @@ class Settings(BaseSettings):
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
     collection_subscriptions_enabled: bool = False
-    collection_subscriptions_max_per_user: int | None = Field(default=None, ge=1)
-    collection_subscriptions_page_size: int = Field(default=500, ge=1, le=1000)
+    collection_subscriptions_max_per_user: int = Field(default=50, ge=1, le=100)
+    collection_subscriptions_page_size: int = Field(default=50, ge=1, le=100)
+    collection_subscriptions_users_per_run: int = Field(default=10000, ge=1)
+    collection_subscriptions_ttl_days: int = Field(default=30, ge=1)
+    collection_subscription_pilot_users: int = Field(default=500, ge=1, le=500)
+    collection_subscription_pilot_min_users: int = Field(default=100, ge=1, le=500)
+    collection_subscription_group_posts_enabled: bool = False
+    collection_subscription_group_posts_max: int = Field(default=20, ge=1, le=20)
+    collection_subscription_group_posts_ttl_days: int = Field(default=30, ge=1)
+    collection_subscription_posts_pilot_communities: int = Field(default=500, ge=1, le=5000)
+    collection_subscription_posts_pilot_min_communities: int = Field(default=50, ge=1, le=500)
+    collection_capacity_report_max_age_days: int = Field(default=30, ge=1)
     collection_pilot_seed: int = 20260728
     collection_pilot_groups_per_category: int = Field(default=10, ge=1)
     collection_export_dir: Path = Path("/app/exports/stage2-pilot")
 
     @field_validator(
         "collection_members_max_per_group",
-        "collection_subscriptions_max_per_user",
         mode="before",
     )
     @classmethod
     def blank_limit_is_none(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("vk_method_limit_max_cooldown_seconds")
+    @classmethod
+    def method_max_not_shorter_than_initial(cls, value: int, info: Any) -> int:
+        flood = info.data.get("vk_method_flood_initial_cooldown_seconds", 3600)
+        quota = info.data.get("vk_method_quota_initial_cooldown_seconds", 3600)
+        if value < max(int(flood), int(quota)):
+            raise ValueError("max cooldown не может быть короче начального cooldown")
+        return value
+
+    @model_validator(mode="after")
+    def pilot_minimums_fit_samples(self) -> Settings:
+        """Не разрешать minimum, который невозможно набрать заданным pilot."""
+        if self.collection_subscription_pilot_min_users > self.collection_subscription_pilot_users:
+            raise ValueError("minimum Pilot A не может превышать размер Pilot A")
+        if (
+            self.collection_subscription_posts_pilot_min_communities
+            > self.collection_subscription_posts_pilot_communities
+        ):
+            raise ValueError("minimum Pilot B не может превышать размер Pilot B")
+        return self
 
     @property
     def sqlalchemy_url(self) -> str:

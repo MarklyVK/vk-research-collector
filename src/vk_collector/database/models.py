@@ -56,6 +56,7 @@ class CollectionRunStatus(StrEnum):
     PAUSED = "paused"
     PAUSED_NO_TOKENS = "paused_no_tokens"
     PAUSED_CAPACITY_LIMIT = "paused_capacity_limit"
+    WAITING_METHOD_LIMIT = "waiting_method_limit"
     COMPLETED = "completed"
     COMPLETED_WITH_ERRORS = "completed_with_errors"
     FAILED = "failed"
@@ -306,7 +307,9 @@ class ClassificationReview(Base):
     __table_args__ = (
         UniqueConstraint("operation_id", "group_id", name="uq_reviews_operation_group"),
         CheckConstraint(
-            "confidence >= 0 AND confidence <= 1", name="classification_review_confidence_range"
+            "confidence >= 0 AND confidence <= 1",
+            # Совпадает с безопасно усечённым PostgreSQL-именем старой migration 0005.
+            name="classification_review_confide_f6e2",
         ),
         Index("ix_classification_reviews_group", "group_id", "created_at"),
     )
@@ -356,6 +359,7 @@ class CollectionRun(TimestampMixin, Base):
     failed_jobs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     skipped_jobs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     error_message: Mapped[str | None] = mapped_column(Text)
+    next_wakeup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class CollectionJob(TimestampMixin, Base):
@@ -453,14 +457,18 @@ class GroupPost(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("vk_owner_id", "vk_post_id", name="uq_group_posts_owner_post"),
         Index("ix_group_posts_group_published", "group_id", "published_at"),
+        Index("ix_group_posts_community_published", "community_vk_id", "published_at"),
         Index("ix_group_posts_signer", "signer_vk_user_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     vk_owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     vk_post_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    group_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("group_candidates.id", ondelete="CASCADE"), nullable=False
+    group_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("group_candidates.id", ondelete="SET NULL")
+    )
+    community_vk_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_communities.vk_id", ondelete="RESTRICT"), nullable=False
     )
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -557,7 +565,9 @@ class UserGroupSubscription(Base):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), nullable=False
     )
-    vk_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    vk_group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_communities.vk_id", ondelete="RESTRICT"), nullable=False
+    )
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
@@ -589,4 +599,108 @@ class CollectionJobError(Base):
     sanitized_message: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class VKCommunity(Base):
+    __tablename__ = "vk_communities"
+
+    vk_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    name: Mapped[str] = mapped_column(String(512), nullable=False, server_default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    status_text: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    screen_name: Mapped[str | None] = mapped_column(String(255))
+    community_type: Mapped[str | None] = mapped_column(String(32))
+    is_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    deactivated: Mapped[str | None] = mapped_column(String(50))
+    members_count: Mapped[int | None] = mapped_column(Integer)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    metadata_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UserSubscriptionState(Base):
+    __tablename__ = "user_subscription_states"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), primary_key=True
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    total_reported: Mapped[int | None] = mapped_column(BigInteger)
+    collected_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    collected_limit: Mapped[int] = mapped_column(Integer, nullable=False, server_default="50")
+    privacy_denied: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    last_error_code: Mapped[int | None] = mapped_column(Integer)
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+    next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CommunityPostCollectionState(Base):
+    __tablename__ = "community_post_collection_states"
+    __table_args__ = (Index("ix_community_post_states_next", "next_scheduled_at"),)
+
+    community_vk_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("vk_communities.vk_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+    last_error_code: Mapped[int | None] = mapped_column(Integer)
+    last_error_reason: Mapped[str | None] = mapped_column(String(255))
+    collected_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    wall_private: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    unavailable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+
+class VKTokenState(Base):
+    __tablename__ = "vk_token_states"
+
+    token_fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    global_blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    disabled_reason: Mapped[str | None] = mapped_column(String(255))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class VKTokenMethodState(Base):
+    __tablename__ = "vk_token_method_states"
+    __table_args__ = (
+        UniqueConstraint("token_fingerprint", "method", name="uq_vk_token_method_state"),
+        Index("ix_vk_token_method_blocked", "method", "blocked_until"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    token_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("vk_token_states.token_fingerprint", ondelete="CASCADE"),
+        nullable=False,
+    )
+    method: Mapped[str] = mapped_column(String(100), nullable=False)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_limit_hits: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error_code: Mapped[int | None] = mapped_column(Integer)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
