@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - Windows выполняет стати�
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy-production.sh"
+CLEANUP_SCRIPT = ROOT / "scripts" / "cleanup-production-storage.sh"
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE = f"ghcr.io/marklyvk/vk-research-collector/collector:sha-{FULL_SHA}"
 DIGEST = f"sha256:{'1' * 64}"
@@ -35,6 +36,9 @@ def load_yaml(path: Path) -> dict[str, object]:
 def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -> None:
     ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     deploy_text = (ROOT / ".github/workflows/deploy-production.yml").read_text(encoding="utf-8")
+    cleanup_text = (ROOT / ".github/workflows/cleanup-production-storage.yml").read_text(
+        encoding="utf-8"
+    )
     ci = load_yaml(ROOT / ".github/workflows/ci.yml")
     deploy = load_yaml(ROOT / ".github/workflows/deploy-production.yml")
 
@@ -75,8 +79,9 @@ def test_workflows_have_safe_triggers_runners_permissions_and_pinned_actions() -
     assert "TELEGRAM_BOT_TOKEN" in deploy_text
     assert "--workflow-failure" in deploy_text
     assert "ref=ghcr.io/${repository}/collector:sha-${GITHUB_SHA}" in deploy_text
-    assert "pull_request_target" not in ci_text + deploy_text
-    action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", ci_text + deploy_text)
+    workflow_text = ci_text + deploy_text + cleanup_text
+    assert "pull_request_target" not in workflow_text
+    action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", workflow_text)
     assert action_refs and all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
 
 
@@ -173,9 +178,51 @@ def test_endpoint_migration_uses_one_set_based_post_backfill() -> None:
     assert "GET DIAGNOSTICS changed" not in migration
 
 
+def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() -> None:
+    workflow_path = ROOT / ".github/workflows/cleanup-production-storage.yml"
+    workflow = load_yaml(workflow_path)
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    script = CLEANUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert set(workflow["on"]) == {"workflow_dispatch"}  # type: ignore[arg-type]
+    assert workflow["concurrency"] == {  # type: ignore[index]
+        "group": "production-deployment",
+        "cancel-in-progress": "false",
+    }
+    job = workflow["jobs"]["cleanup"]  # type: ignore[index]
+    assert job["runs-on"] == ["self-hosted", "linux", "x64", "production", "vk-collector"]
+    assert job["environment"] == {"name": "production"}
+    assert "DELETE_OLD_BACKUPS" in workflow_text
+    assert "cleanup-production-storage.sh" in workflow_text
+
+    required = (
+        'EXPECTED_DEPLOY_DIR="${CLEANUP_EXPECTED_DEPLOY_DIR:-/opt/vk-research-collector}"',
+        "pg_restore --list",
+        "LATEST_BACKUP",
+        "CURRENT_IMAGE_ID",
+        "PREVIOUS_IMAGE_ID",
+        "docker builder prune -af",
+        "docker image prune -f",
+        "PostgreSQL не healthy после cleanup",
+        "Worker не healthy после cleanup",
+        "20260810_0007",
+    )
+    assert all(item in script for item in required)
+    forbidden = (
+        "docker system prune",
+        "docker volume rm",
+        "compose down",
+        "down -v",
+        "rm -rf",
+        'rm -r "$DEPLOY_DIR"',
+    )
+    assert not any(item in script for item in forbidden)
+
+
 def test_operational_shell_scripts_are_executable_in_git() -> None:
     scripts = (
         "scripts/deploy-production.sh",
+        "scripts/cleanup-production-storage.sh",
         "scripts/install-github-runner.sh",
         "scripts/import-server-handoff.sh",
         "scripts/setup-telegram-monitor.sh",
