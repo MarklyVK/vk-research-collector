@@ -134,6 +134,13 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "org.opencontainers.image.revision",
         "EXPECTED_IMAGE_DIGEST",
         'BACKUP_KEEP="${PREDEPLOY_BACKUP_KEEP:-1}"',
+        "load_protected_backups",
+        "grant_collector_protected_backup_read",
+        "is_protected_backup",
+        "configuration #>> '{verified_backup,path}'",
+        "paused_capacity_limit",
+        "setfacl -m u:10001:rx",
+        "setfacl -m u:10001:r",
         "stop_worker_on_critical_disk",
         "DISK_AFTER_BACKUP",
         "DISK_AFTER_PULL",
@@ -203,6 +210,8 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         'EXPECTED_DEPLOY_DIR="${CLEANUP_EXPECTED_DEPLOY_DIR:-/opt/vk-research-collector}"',
         "pg_restore --list",
         "LATEST_BACKUP",
+        "PROTECTED_BACKUPS",
+        "configuration #>> '{verified_backup,path}'",
         "CURRENT_IMAGE_ID",
         "PREVIOUS_IMAGE_ID",
         "docker builder prune -af",
@@ -267,6 +276,9 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "status::text IN ('completed','completed_with_errors')",
         "sanitized_message",
         "j.status = 'failed'",
+        "for pilot_attempt in 1 2 3",
+        "retryable_pilot",
+        "terminal-состояний",
     )
     assert all(item in script for item in required)
     forbidden = (

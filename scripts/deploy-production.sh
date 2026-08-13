@@ -24,6 +24,7 @@ BASELINE_COMPLETED=0
 BASELINE_FAILED=0
 ROLLBACK_ALLOWED=0
 REPORT_STATUS=failed
+PROTECTED_BACKUPS=()
 
 usage() {
   cat <<'EOF'
@@ -110,6 +111,66 @@ compose() {
     -f "$DEPLOY_DIR/compose.yaml" \
     -f "$DEPLOY_DIR/compose.production.yaml" \
     "$@"
+}
+
+psql_query() {
+  compose exec -T postgres psql \
+    -X -v ON_ERROR_STOP=1 -P pager=off \
+    -U "$(env_value POSTGRES_USER)" -d "$(env_value POSTGRES_DB)" "$@"
+}
+
+load_protected_backups() {
+  local configured_path backup_name host_path
+  PROTECTED_BACKUPS=()
+  while IFS= read -r configured_path; do
+    [[ -n "$configured_path" ]] || continue
+    backup_name=${configured_path##*/}
+    [[ "$configured_path" == "/app/backups/$backup_name" ]] \
+      || die "Небезопасный путь verified backup в collection run: $configured_path"
+    [[ "$backup_name" =~ ^[A-Za-z0-9._-]+\.dump$ ]] \
+      || die "Недопустимое имя verified backup: $backup_name"
+    host_path="$DEPLOY_DIR/backups/$backup_name"
+    if [[ -f "$host_path" ]]; then
+      PROTECTED_BACKUPS+=("$host_path")
+    else
+      log "Предупреждение: незавершённый run ссылается на отсутствующий backup: $host_path"
+    fi
+  done < <(psql_query -Atqc \
+    "SELECT DISTINCT configuration #>> '{verified_backup,path}'
+       FROM collection_runs
+      WHERE status::text IN (
+        'planned','running','paused','paused_no_tokens',
+        'paused_capacity_limit','waiting_method_limit'
+      )
+        AND configuration #>> '{verified_backup,path}' IS NOT NULL
+      ORDER BY 1")
+}
+
+grant_collector_protected_backup_read() {
+  local backup
+  (( ${#PROTECTED_BACKUPS[@]} > 0 )) || return 0
+  chmod 0700 "$DEPLOY_DIR/backups"
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:10001:rx "$DEPLOY_DIR/backups"
+    for backup in "${PROTECTED_BACKUPS[@]}"; do
+      setfacl -m u:10001:r "$backup"
+    done
+    log "Сохранён read-only ACL collector для verified backup: ${#PROTECTED_BACKUPS[@]}."
+  else
+    chmod o+x "$DEPLOY_DIR/backups"
+    for backup in "${PROTECTED_BACKUPS[@]}"; do
+      chmod o+r "$backup"
+    done
+    log "setfacl отсутствует: сохранён минимальный read-only доступ к verified backup."
+  fi
+}
+
+is_protected_backup() {
+  local candidate=$1 protected
+  for protected in "${PROTECTED_BACKUPS[@]}"; do
+    [[ "$candidate" == "$protected" ]] && return 0
+  done
+  return 1
 }
 
 compose_cli() {
@@ -375,6 +436,7 @@ fi
 
 compose exec -T postgres pg_isready -U "$(env_value POSTGRES_USER)" -d "$(env_value POSTGRES_DB)" >/dev/null \
   || die 'PostgreSQL недоступен.'
+load_protected_backups
 
 WORKER_BEFORE=$(service_state collector-worker)
 WORKER_CONTAINER=$(compose ps -aq collector-worker 2>/dev/null || true)
@@ -403,6 +465,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 install -d -m 700 "$DEPLOY_DIR/backups" "$DEPLOY_DIR/.deploy"
+grant_collector_protected_backup_read
 TIMESTAMP=$(date -u +%Y%m%d-%H%M%SZ)
 BACKUP_FILE="$DEPLOY_DIR/backups/predeploy-${TIMESTAMP}-${GIT_SHA}.dump"
 log "Создаётся backup: $BACKUP_FILE"
@@ -413,7 +476,9 @@ compose exec -T postgres pg_restore --list < "$BACKUP_FILE" >/dev/null || die 'p
 mapfile -t OLD_BACKUPS < <(find "$DEPLOY_DIR/backups" -maxdepth 1 -type f -name 'predeploy-*.dump' -printf '%T@ %p\n' \
   | sort -rn | tail -n "+$((BACKUP_KEEP + 1))" | cut -d' ' -f2-)
 for old_backup in "${OLD_BACKUPS[@]}"; do
-  [[ "$old_backup" == "$BACKUP_FILE" ]] || rm -f -- "$old_backup"
+  if [[ "$old_backup" != "$BACKUP_FILE" ]] && ! is_protected_backup "$old_backup"; then
+    rm -f -- "$old_backup"
+  fi
 done
 
 DISK_AFTER_BACKUP=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')

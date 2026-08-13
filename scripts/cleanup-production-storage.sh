@@ -122,6 +122,26 @@ REVISION=$(compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 [[ "$REVISION" == 20260810_0007 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 BACKUP_DIR="$DEPLOY_DIR/backups"
+PROTECTED_BACKUPS=()
+while IFS= read -r configured_path; do
+  [[ -n "$configured_path" ]] || continue
+  backup_name=${configured_path##*/}
+  [[ "$configured_path" == "/app/backups/$backup_name" ]] \
+    || die "Небезопасный путь verified backup в collection run: $configured_path"
+  [[ "$backup_name" =~ ^[A-Za-z0-9._-]+\.dump$ ]] \
+    || die "Недопустимое имя verified backup: $backup_name"
+  protected_path="$BACKUP_DIR/$backup_name"
+  [[ -f "$protected_path" ]] && PROTECTED_BACKUPS+=("$protected_path")
+done < <(compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -P pager=off \
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc \
+  "SELECT DISTINCT configuration #>> '{verified_backup,path}'
+     FROM collection_runs
+    WHERE status::text IN (
+      'planned','running','paused','paused_no_tokens',
+      'paused_capacity_limit','waiting_method_limit'
+    )
+      AND configuration #>> '{verified_backup,path}' IS NOT NULL
+    ORDER BY 1")
 mapfile -d '' -t BACKUP_RECORDS < <(
   find "$BACKUP_DIR" -type f -name '*.dump' -printf '%T@ %p\0' | sort -z -nr
 )
@@ -138,6 +158,14 @@ BACKUP_DELETE=()
 BACKUP_DELETE_BYTES=0
 for path in "${ALL_BACKUP_FILES[@]}"; do
   [[ "$path" == "$LATEST_BACKUP" ]] && continue
+  protected=0
+  for protected_path in "${PROTECTED_BACKUPS[@]}"; do
+    if [[ "$path" == "$protected_path" ]]; then
+      protected=1
+      break
+    fi
+  done
+  (( protected == 1 )) && continue
   resolved=$(realpath -m "$path")
   [[ "$resolved" == "$BACKUP_DIR/"* ]] || die "Backup path вышел за allowlist: $resolved"
   BACKUP_DELETE+=("$resolved")
@@ -183,6 +211,7 @@ DISK_PERCENT_BEFORE=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {print $5}')
 log "Режим: $([[ "$APPLY" -eq 1 ]] && printf apply || printf preview)"
 log "Alembic: $REVISION; PostgreSQL: $POSTGRES_STATE_BEFORE; worker: $WORKER_STATE_BEFORE"
 log "Сохраняется последний backup: $LATEST_BACKUP ($LATEST_BACKUP_BYTES bytes)"
+log "Verified backup незавершённых запусков под защитой: ${#PROTECTED_BACKUPS[@]}"
 log "Старых backup-файлов к удалению: ${#BACKUP_DELETE[@]} ($BACKUP_DELETE_BYTES bytes)"
 for path in "${BACKUP_DELETE[@]}"; do
   log "DELETE backup: $path ($(file_size "$path") bytes)"
@@ -257,4 +286,3 @@ printf 'FREED_BYTES=%s\n' "$FREED_BYTES"
 printf 'ALEMBIC_REVISION=%s\n' "$REVISION"
 printf 'WORKER_STATE=%s\n' "$WORKER_STATE_AFTER"
 printf 'POSTGRES_STATE=%s\n' "$POSTGRES_STATE_AFTER"
-

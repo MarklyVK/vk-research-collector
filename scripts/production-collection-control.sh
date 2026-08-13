@@ -206,7 +206,8 @@ SQL
 }
 
 start_subscriptions() {
-  local active_runs gate_applied latest_backup plan_state report_path production_allowed plan_output run_id
+  local active_runs gate_applied latest_backup pilot_attempt pilot_state plan_state report_path
+  local production_allowed plan_output retryable_pilot run_id
   active_runs=$(psql_query -Atqc \
     "SELECT count(*) FROM collection_runs WHERE status::text IN ('planned','running','waiting_method_limit')")
   if [[ "$active_runs" != 0 ]]; then
@@ -263,14 +264,21 @@ start_subscriptions() {
   fi
 
   if [[ "$gate_applied" -eq 0 ]]; then
-    log 'Запускаю Pilot A подписок (capacity gate не обходится).'
-    collector collection subscriptions pilot
-    [[ -s "$report_path" ]] || die "Pilot A не создал отчёт: $report_path"
-    production_allowed=$(python3 -c \
-      'import json,sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["production_allowed"]).lower())' \
-      "$report_path")
-    [[ "$production_allowed" == true ]] \
-      || die 'Pilot A завершён, но capacity report не разрешает production run.'
+    for pilot_attempt in 1 2 3; do
+      log "Запускаю Pilot A подписок, попытка $pilot_attempt/3 (capacity gate не обходится)."
+      collector collection subscriptions pilot
+      [[ -s "$report_path" ]] || die "Pilot A не создал отчёт: $report_path"
+      pilot_state=$(python3 -c \
+        'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); m=p["measured"]; allowed=p["production_allowed"] is True; retry=(not allowed and m["planned_entities"] > 0 and m["completed_entities"] == 0 and m["failed_entities"] == 0 and m["skipped_entities"] == m["planned_entities"]); print(f"{str(allowed).lower()}|{str(retry).lower()}")' \
+        "$report_path")
+      IFS='|' read -r production_allowed retryable_pilot <<< "$pilot_state"
+      [[ "$production_allowed" == true ]] && break
+      if [[ "$retryable_pilot" == true && "$pilot_attempt" -lt 3 ]]; then
+        log 'Pilot целиком пропущен из-за terminal-состояний; выбираю следующую cohort.'
+        continue
+      fi
+      die 'Pilot A завершён, но capacity report не разрешает production run.'
+    done
 
     log 'Создаю production cohort подписок.'
     plan_output=$(collector collection subscriptions plan)
