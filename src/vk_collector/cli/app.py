@@ -1118,7 +1118,7 @@ async def _run_subscription_pilot(
             run_id,
             None,
             max_jobs,
-            until_idle=False,
+            until_idle=True,
             explicit_pilot=True,
         )
         duration_seconds = time.monotonic() - started_at
@@ -1161,6 +1161,10 @@ async def _run_subscription_pilot(
         skipped_entities = int(jobs.get("skipped", 0))
         failed_entities = int(jobs.get("failed", 0))
         observed_entities = selected + skipped_entities
+        deferred_entities = max(
+            0,
+            planned_entities - observed_entities - failed_entities,
+        )
         minimum_entities = (
             settings.collection_subscription_pilot_min_users
             if phase == "A"
@@ -1191,6 +1195,7 @@ async def _run_subscription_pilot(
             "completed_entities": selected,
             "skipped_entities": skipped_entities,
             "failed_entities": failed_entities,
+            "deferred_entities": deferred_entities,
             "private_entities": int(summary.get("private_users", 0)),
             "database_bytes_before": before["database_bytes"],
             "database_bytes_after": after["database_bytes"],

@@ -222,7 +222,7 @@ SQL
 
 start_subscriptions() {
   local active_runs gate_applied latest_backup pilot_attempt pilot_state plan_state report_path
-  local production_allowed plan_output retryable_pilot run_id
+  local deferred_pilot production_allowed plan_output retryable_pilot run_id
   active_runs=$(psql_query -Atqc \
     "SELECT count(*)
        FROM collection_runs
@@ -287,10 +287,16 @@ start_subscriptions() {
       collector collection subscriptions pilot
       [[ -s "$report_path" ]] || die "Pilot A не создал отчёт: $report_path"
       pilot_state=$(python3 -c \
-        'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); m=p["measured"]; allowed=p["production_allowed"] is True; retry=(not allowed and m["planned_entities"] > 0 and m["completed_entities"] == 0 and m["failed_entities"] == 0 and m["skipped_entities"] == m["planned_entities"]); print(f"{str(allowed).lower()}|{str(retry).lower()}")' \
+        'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); m=p["measured"]; allowed=p["production_allowed"] is True; retry=(not allowed and m["planned_entities"] > 0 and m["completed_entities"] == 0 and m["failed_entities"] == 0 and m["skipped_entities"] == m["planned_entities"]); deferred=(not allowed and m.get("deferred_entities", 0) > 0); print(f"{str(allowed).lower()}|{str(retry).lower()}|{str(deferred).lower()}")' \
         "$report_path")
-      IFS='|' read -r production_allowed retryable_pilot <<< "$pilot_state"
+      IFS='|' read -r production_allowed retryable_pilot deferred_pilot <<< "$pilot_state"
       [[ "$production_allowed" == true ]] && break
+      if [[ "$deferred_pilot" == true ]]; then
+        log 'Pilot сохранил transient retry в PostgreSQL; продолжение выполнит следующий hourly-control.'
+        restart_worker
+        trap - EXIT
+        return
+      fi
       if [[ "$retryable_pilot" == true && "$pilot_attempt" -lt 3 ]]; then
         log 'Pilot целиком пропущен из-за terminal-состояний; выбираю следующую cohort.'
         continue

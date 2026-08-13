@@ -169,6 +169,7 @@ def test_capacity_report_rejects_stale_corrupt_and_theoretical_preview(tmp_path:
         "completed_entities": 100,
         "skipped_entities": 0,
         "failed_entities": 0,
+        "deferred_entities": 0,
         "database_bytes_before": 1,
         "database_bytes_after": 2,
         "database_growth_bytes": 1,
