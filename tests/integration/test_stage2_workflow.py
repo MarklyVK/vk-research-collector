@@ -34,6 +34,7 @@ from vk_collector.database.models import (
 from vk_collector.database.session import create_database_engine
 from vk_collector.privacy import delete_user, inspect_user
 from vk_collector.vk import TokenPool, VKAPIError, VKMethodUnavailable
+from vk_collector.vk.errors import VKRetryExhausted
 
 
 def database_url() -> str:
@@ -114,6 +115,13 @@ class AccessDeniedSubscriptionsVK(FakeVK):
         self, user_vk_id: int, offset: int, count: int
     ) -> dict[str, Any]:
         raise VKAPIError(15, "Доступ запрещён")
+
+
+class FailingSubscriptionsVK(FakeVK):
+    async def get_subscriptions_page(
+        self, user_vk_id: int, offset: int, count: int
+    ) -> dict[str, Any]:
+        raise VKRetryExhausted("VK API недоступен после повторов")
 
 
 class FakeClock:
@@ -480,6 +488,47 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                     assert denied_state.privacy_denied
                     assert denied_state.last_error_code == 15
                     assert denied_state.next_scheduled_at > datetime.now(UTC)
+
+                # Transient-сбой также создаёт короткий cooldown и не блокирует
+                # каждую следующую pilot cohort одним и тем же user.
+                transient_user_id = 9_000_000_002
+                async with sessions() as session:
+                    transient_user = await session.get(VKUser, transient_user_id)
+                    if transient_user is None:
+                        session.add(
+                            VKUser(
+                                vk_id=transient_user_id,
+                                first_name="Сетевой",
+                                last_name="Сбой",
+                                is_closed=False,
+                                can_access_closed=True,
+                                first_seen_at=datetime.now(UTC),
+                                last_seen_at=datetime.now(UTC),
+                            )
+                        )
+                        await session.commit()
+                transient_run = CollectionRun(
+                    scope="subscriptions_pilot", status=CollectionRunStatus.PLANNED
+                )
+                async with sessions() as session:
+                    session.add(transient_run)
+                    await session.flush()
+                    transient_job = CollectionJob(
+                        collection_run_id=transient_run.id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=transient_user_id,
+                    )
+                    session.add(transient_job)
+                    transient_run.total_jobs = 1
+                    await session.commit()
+                await CollectionWorker(sessions, FailingSubscriptionsVK(), settings).run(
+                    transient_run.id
+                )  # type: ignore[arg-type]
+                async with sessions() as session:
+                    transient_state = await session.get(UserSubscriptionState, transient_user_id)
+                    assert transient_state is not None
+                    assert transient_state.next_scheduled_at > datetime.now(UTC)
 
                 # Новый run с теми же сущностями обновляет строки, но не создаёт дублей.
                 async with sessions() as session:

@@ -371,6 +371,8 @@ class CollectionWorker:
     async def _retry_or_fail(self, job: ClaimedJob, category: str, message: str) -> None:
         if job.job_type in {"collect_group_posts", "collect_subscription_group_posts"}:
             await self._mark_post_failure(job, None, message, terminal=False)
+        if job.job_type == "collect_user_subscriptions":
+            await self._mark_subscriptions_transient(job)
         if job.attempt_count >= len(RETRY_DELAYS):
             await self._queue.finish(
                 job.id, JobStatus.FAILED, error_type=category, error_message=message
@@ -384,6 +386,34 @@ class CollectionWorker:
             error_message=message,
             retry_at=retry_at,
         )
+
+    async def _mark_subscriptions_transient(self, job: ClaimedJob) -> None:
+        """Отложить transient-user, чтобы он не блокировал каждую следующую cohort."""
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            await session.execute(
+                insert(UserSubscriptionState)
+                .values(
+                    user_id=job.entity_id,
+                    last_attempt_at=now,
+                    collected_limit=self._settings.collection_subscriptions_max_per_user,
+                    privacy_denied=False,
+                    last_error_code=None,
+                    last_run_id=job.run_id,
+                    next_scheduled_at=now + timedelta(days=1),
+                )
+                .on_conflict_do_update(
+                    index_elements=[UserSubscriptionState.user_id],
+                    set_={
+                        "last_attempt_at": now,
+                        "privacy_denied": False,
+                        "last_error_code": None,
+                        "last_run_id": job.run_id,
+                        "next_scheduled_at": now + timedelta(days=1),
+                    },
+                )
+            )
+            await session.commit()
 
     async def _group(self, group_id: int) -> GroupCandidate:
         async with self._sessions() as session:
