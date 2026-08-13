@@ -31,7 +31,7 @@ class VKClient:
         timeout: float = 30.0,
         http_client: httpx.AsyncClient | None = None,
         sleep: Sleep = asyncio.sleep,
-        retry_delays: Sequence[float] = (60, 300, 900, 3600, 21600),
+        retry_delays: Sequence[float] = (1, 3, 10),
         jitter: Jitter | None = None,
     ) -> None:
         self._pool = token_pool

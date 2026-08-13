@@ -15,6 +15,7 @@ from vk_collector.vk import (
     VKTokensUnavailable,
     load_tokens,
 )
+from vk_collector.vk.errors import VKRetryExhausted
 
 T = TypeVar("T")
 
@@ -318,6 +319,31 @@ async def test_transient_retry_uses_injected_jitter_without_real_wait() -> None:
         )
         assert await client.call("groups.getById", {}) == []
     assert time.sleeps == [11]
+
+
+@pytest.mark.asyncio
+async def test_default_transient_retries_are_short_enough_for_durable_queue() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, request=request)
+
+    time = FakeTime()
+    pool = TokenPool(["fake"], rps=1000, clock=time.clock, sleep=time.sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        with pytest.raises(VKRetryExhausted):
+            await VKClient(
+                pool,
+                http_client=http,
+                sleep=time.sleep,
+                jitter=lambda delay: delay,
+            ).call("groups.get", {})
+    assert calls == 4
+    assert time.sleeps == [1, 3, 10]
 
 
 @pytest.mark.asyncio

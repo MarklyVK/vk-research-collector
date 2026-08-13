@@ -73,6 +73,21 @@ restart_worker() {
   fi
 }
 
+ensure_worker_healthy() {
+  local attempt state
+  state=$(service_state collector-worker)
+  if [[ "$state" != running/healthy ]]; then
+    log "Worker имеет status $state; выполняю безопасный self-heal."
+    compose up -d --no-deps --no-build collector-worker
+  fi
+  for attempt in {1..30}; do
+    state=$(service_state collector-worker)
+    [[ "$state" == running/healthy ]] && return 0
+    sleep 2
+  done
+  die "Worker не healthy после self-heal: $state"
+}
+
 grant_collector_backup_read() {
   local backup=$1 backup_dir
   backup_dir=$(dirname "$backup")
@@ -209,7 +224,10 @@ start_subscriptions() {
   local active_runs gate_applied latest_backup pilot_attempt pilot_state plan_state report_path
   local production_allowed plan_output retryable_pilot run_id
   active_runs=$(psql_query -Atqc \
-    "SELECT count(*) FROM collection_runs WHERE status::text IN ('planned','running','waiting_method_limit')")
+    "SELECT count(*)
+       FROM collection_runs
+      WHERE scope IN ('full','incremental','subscriptions','subscription_posts')
+        AND status::text IN ('planned','running','waiting_method_limit')")
   if [[ "$active_runs" != 0 ]]; then
     log "Активных collection runs: $active_runs. Следующая cohort пока не нужна."
     return
@@ -344,7 +362,7 @@ compose config --quiet
 POSTGRES_USER=$(env_value POSTGRES_USER); POSTGRES_USER=${POSTGRES_USER:-vk_collector}
 POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
-[[ "$(service_state collector-worker)" == running/healthy ]] || die 'Worker не healthy.'
+ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
 [[ "$REVISION" == 20260810_0007 ]] || die "Неожиданная Alembic revision: $REVISION"
 

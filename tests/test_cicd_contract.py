@@ -279,6 +279,9 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "for pilot_attempt in 1 2 3",
         "retryable_pilot",
         "terminal-состояний",
+        "ensure_worker_healthy",
+        "безопасный self-heal",
+        "scope IN ('full','incremental','subscriptions','subscription_posts')",
     )
     assert all(item in script for item in required)
     forbidden = (
