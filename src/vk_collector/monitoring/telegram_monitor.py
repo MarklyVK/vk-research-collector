@@ -55,6 +55,7 @@ class MonitorSettings:
     swap_warning_percent: int = 90
     collection_lease_seconds: int = 300
     collection_run_id: str = ""
+    subscriptions_enabled: bool = False
     postgres_user: str = "vk_collector"
     postgres_db: str = "vk_research"
 
@@ -113,6 +114,9 @@ class MonitorSettings:
             swap_warning_percent=parse_int(values, "TELEGRAM_SWAP_WARNING_PERCENT", 90, 1),
             collection_lease_seconds=parse_int(values, "COLLECTION_JOB_LEASE_SECONDS", 300, 30),
             collection_run_id=explicit_run,
+            subscriptions_enabled=parse_bool(
+                values.get("COLLECTION_SUBSCRIPTIONS_ENABLED", "false")
+            ),
             postgres_user=values.get("POSTGRES_USER", "vk_collector"),
             postgres_db=values.get("POSTGRES_DB", "vk_research"),
         )
@@ -824,6 +828,17 @@ def evaluate_snapshot(
                     "Collection run содержит error_message",
                     "проверить очищенную ошибку через collection status",
                     (f"Run: {run_id}",),
+                )
+            )
+        active_runs = int(database.get("active_runs", 0) or 0)
+        if settings.subscriptions_enabled and active_runs == 0:
+            issues.append(
+                Issue(
+                    "collection.no_active_run",
+                    "critical",
+                    "Сбор подписок включён, но активного collection run нет",
+                    "проверить scheduled production control и создать следующую cohort",
+                    (f"Последний выбранный run: {run_id}",),
                 )
             )
         stale = int(database.get("stale_running", 0) or 0)

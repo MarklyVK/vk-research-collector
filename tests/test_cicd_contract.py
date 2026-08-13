@@ -223,13 +223,14 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
     assert not any(item in script for item in forbidden)
 
 
-def test_collection_control_is_manual_gated_and_preserves_capacity_guards() -> None:
+def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -> None:
     workflow_path = ROOT / ".github/workflows/production-collection-control.yml"
     workflow = load_yaml(workflow_path)
     workflow_text = workflow_path.read_text(encoding="utf-8")
     script = COLLECTION_CONTROL_SCRIPT.read_text(encoding="utf-8")
 
-    assert set(workflow["on"]) == {"workflow_dispatch"}  # type: ignore[arg-type]
+    assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}  # type: ignore[arg-type]
+    assert workflow["on"]["schedule"] == [{"cron": "17 * * * *"}]  # type: ignore[index]
     assert workflow["concurrency"] == {  # type: ignore[index]
         "group": "production-deployment",
         "cancel-in-progress": "false",
@@ -238,6 +239,8 @@ def test_collection_control_is_manual_gated_and_preserves_capacity_guards() -> N
     assert job["runs-on"] == ["self-hosted", "linux", "x64", "production", "vk-collector"]
     assert job["environment"] == {"name": "production"}
     assert "START_SUBSCRIPTIONS" in workflow_text
+    assert "github.event_name == 'schedule'" in workflow_text
+    assert '"$GITHUB_EVENT_NAME" != schedule' in workflow_text
 
     required = (
         "flock -n",
@@ -258,6 +261,12 @@ def test_collection_control_is_manual_gated_and_preserves_capacity_guards() -> N
         "compose up -d --no-deps --no-build collector-worker",
         "group_keyword_matches",
         "vk_token_method_states",
+        "Следующая cohort пока не нужна",
+        "Подходящих пользователей для новой cohort сейчас нет",
+        "created_at > coalesce",
+        "status::text IN ('completed','completed_with_errors')",
+        "sanitized_message",
+        "j.status = 'failed'",
     )
     assert all(item in script for item in required)
     forbidden = (

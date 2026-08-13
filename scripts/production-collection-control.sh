@@ -176,6 +176,21 @@ SELECT endpoint, error_category, coalesce(vk_error_code, 0) AS vk_error_code, co
 FROM collection_job_errors GROUP BY endpoint, error_category, vk_error_code
 ORDER BY errors DESC, endpoint LIMIT 30;
 
+SELECT DISTINCT ON (endpoint, error_category, coalesce(vk_error_code, 0))
+       endpoint, error_category, coalesce(vk_error_code, 0) AS vk_error_code,
+       created_at AS latest_at, left(sanitized_message, 180) AS latest_message
+FROM collection_job_errors
+ORDER BY endpoint, error_category, coalesce(vk_error_code, 0), created_at DESC;
+
+SELECT r.scope, j.job_type, j.entity_type, j.entity_id, j.attempt_count,
+       left(coalesce(j.last_error_type, ''), 80) AS error_type,
+       left(coalesce(j.last_error_message, ''), 180) AS error_message
+FROM collection_jobs j
+JOIN collection_runs r ON r.id = j.collection_run_id
+WHERE j.status = 'failed'
+ORDER BY j.finished_at DESC NULLS LAST
+LIMIT 30;
+
 SELECT method, count(*) AS token_states,
        count(*) FILTER (WHERE blocked_until > now()) AS currently_blocked,
        min(blocked_until) FILTER (WHERE blocked_until > now()) AS nearest_unblock,
@@ -191,11 +206,13 @@ SQL
 }
 
 start_subscriptions() {
-  local active_runs gate_applied latest_backup report_path production_allowed plan_output run_id
+  local active_runs gate_applied latest_backup plan_state report_path production_allowed plan_output run_id
   active_runs=$(psql_query -Atqc \
     "SELECT count(*) FROM collection_runs WHERE status::text IN ('planned','running','waiting_method_limit')")
-  [[ "$active_runs" == 0 ]] \
-    || die "Найдено активных collection runs: $active_runs. Новый конкурентный run не создан."
+  if [[ "$active_runs" != 0 ]]; then
+    log "Активных collection runs: $active_runs. Следующая cohort пока не нужна."
+    return
+  fi
 
   latest_backup=$(find "$DEPLOY_DIR/backups" -type f -name '*.dump' -printf '%T@ %p\n' \
     | sort -nr | head -n 1 | cut -d' ' -f2-)
@@ -220,7 +237,19 @@ start_subscriptions() {
   report_path="$DEPLOY_DIR/exports/stage2-pilot/subscription-gate-a.json"
   gate_applied=0
   run_id=$(psql_query -Atqc \
-    "SELECT id FROM collection_runs WHERE scope='subscriptions' AND status::text='paused_capacity_limit' ORDER BY created_at DESC LIMIT 1")
+    "SELECT id
+       FROM collection_runs
+      WHERE scope='subscriptions'
+        AND status::text='paused_capacity_limit'
+        AND created_at > coalesce(
+          (SELECT max(finished_at)
+             FROM collection_runs
+            WHERE scope='subscriptions'
+              AND status::text IN ('completed','completed_with_errors')),
+          '-infinity'::timestamptz
+        )
+      ORDER BY created_at DESC
+      LIMIT 1")
   if [[ -n "$run_id" && -s "$report_path" ]]; then
     log "Пробую применить уже измеренный Gate A к незапущенному run $run_id."
     if collector collection capacity-apply \
@@ -249,6 +278,16 @@ start_subscriptions() {
     run_id=$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
       <<< "$plan_output" | tail -n 1)
     [[ -n "$run_id" ]] || die 'Не удалось получить run ID из production plan.'
+    plan_state=$(psql_query -AtF '|' -c \
+      "SELECT status::text, total_jobs FROM collection_runs WHERE id='$run_id'::uuid")
+    if [[ "$plan_state" == 'completed|0' ]]; then
+      log 'Подходящих пользователей для новой cohort сейчас нет.'
+      restart_worker
+      trap - EXIT
+      return
+    fi
+    [[ "$plan_state" == "paused_capacity_limit|"* ]] \
+      || die "Production plan имеет неожиданный status/jobs: $plan_state"
 
     log "Применяю проверенный Gate A к run $run_id."
     collector collection capacity-apply \

@@ -297,7 +297,9 @@ class CollectionWorker:
             await notify(self._settings, f"Сбор {job.run_id}: все VK-токены недоступны")
         except VKAPIError as exc:
             message = sanitize_message(str(exc))
-            subscriptions_private = exc.code == 260 and job.job_type == "collect_user_subscriptions"
+            subscriptions_private = (
+                exc.code in {15, 30, 260} and job.job_type == "collect_user_subscriptions"
+            )
             category = (
                 "subscriptions_private"
                 if subscriptions_private
@@ -307,11 +309,13 @@ class CollectionWorker:
             )
             await self._record_error(job, category, message, vk_code=exc.code)
             if subscriptions_private:
-                await self._mark_subscriptions_private(job)
+                await self._mark_subscriptions_terminal(job, exc.code)
                 await self._queue.finish(
                     job.id, JobStatus.SKIPPED, error_type=category, error_message=message
                 )
             elif exc.code in TERMINAL_VK_CODES:
+                if job.job_type == "collect_user_subscriptions":
+                    await self._mark_subscriptions_terminal(job, exc.code)
                 if job.job_type in {
                     "collect_group_posts",
                     "collect_subscription_group_posts",
@@ -954,8 +958,10 @@ class CollectionWorker:
             )
             await session.commit()
 
-    async def _mark_subscriptions_private(self, job: ClaimedJob) -> None:
+    async def _mark_subscriptions_terminal(self, job: ClaimedJob, error_code: int) -> None:
+        """Не включать terminal-ошибку подписок в каждую следующую cohort."""
         now = datetime.now(UTC)
+        privacy_denied = error_code in {15, 30, 260}
         async with self._sessions() as session:
             await session.execute(
                 insert(UserSubscriptionState)
@@ -963,8 +969,8 @@ class CollectionWorker:
                     user_id=job.entity_id,
                     last_attempt_at=now,
                     collected_limit=self._settings.collection_subscriptions_max_per_user,
-                    privacy_denied=True,
-                    last_error_code=260,
+                    privacy_denied=privacy_denied,
+                    last_error_code=error_code,
                     last_run_id=job.run_id,
                     next_scheduled_at=now
                     + timedelta(days=self._settings.collection_subscriptions_ttl_days),
@@ -973,8 +979,8 @@ class CollectionWorker:
                     index_elements=[UserSubscriptionState.user_id],
                     set_={
                         "last_attempt_at": now,
-                        "privacy_denied": True,
-                        "last_error_code": 260,
+                        "privacy_denied": privacy_denied,
+                        "last_error_code": error_code,
                         "last_run_id": job.run_id,
                         "next_scheduled_at": now
                         + timedelta(days=self._settings.collection_subscriptions_ttl_days),

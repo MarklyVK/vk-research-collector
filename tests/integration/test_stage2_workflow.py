@@ -109,6 +109,13 @@ class PrivateSubscriptionsVK(FakeVK):
         raise VKAPIError(260, "Доступ к подпискам ограничен")
 
 
+class AccessDeniedSubscriptionsVK(FakeVK):
+    async def get_subscriptions_page(
+        self, user_vk_id: int, offset: int, count: int
+    ) -> dict[str, Any]:
+        raise VKAPIError(15, "Доступ запрещён")
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.value = 1000.0
@@ -460,6 +467,19 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                     assert private_state is not None
                     assert private_state.privacy_denied
                     assert private_state.next_scheduled_at is not None
+
+                    private_state.next_scheduled_at = datetime.now(UTC) - timedelta(seconds=1)
+                    await session.commit()
+                denied_run_id = await queue.plan_subscriptions(pilot=True)
+                await CollectionWorker(sessions, AccessDeniedSubscriptionsVK(), settings).run(
+                    denied_run_id
+                )  # type: ignore[arg-type]
+                async with sessions() as session:
+                    denied_state = await session.get(UserSubscriptionState, 9_000_000_001)
+                    assert denied_state is not None
+                    assert denied_state.privacy_denied
+                    assert denied_state.last_error_code == 15
+                    assert denied_state.next_scheduled_at > datetime.now(UTC)
 
                 # Новый run с теми же сущностями обновляет строки, но не создаёт дублей.
                 async with sessions() as session:

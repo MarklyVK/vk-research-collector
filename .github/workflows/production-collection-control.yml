@@ -1,6 +1,8 @@
 name: Production collection control
 
 on:
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       action:
@@ -38,22 +40,26 @@ jobs:
       - name: Подтвердить commit и действие
         shell: bash
         env:
-          CONTROL_ACTION: ${{ inputs.action }}
+          CONTROL_ACTION: ${{ github.event_name == 'schedule' && 'start-subscriptions' || inputs.action }}
           CONTROL_CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -Eeuo pipefail
           test "$GITHUB_REF" = refs/heads/main
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          if [[ "$CONTROL_ACTION" == start-subscriptions ]]; then
-            test "$CONTROL_CONFIRMATION" = START_SUBSCRIPTIONS
-          else
-            test "$CONTROL_ACTION" = report
-          fi
+          case "$CONTROL_ACTION" in
+            start-subscriptions)
+              if [[ "$GITHUB_EVENT_NAME" != schedule ]]; then
+                test "$CONTROL_CONFIRMATION" = START_SUBSCRIPTIONS
+              fi
+              ;;
+            report) ;;
+            *) exit 2 ;;
+          esac
       - name: Выполнить production control
         shell: bash
         env:
-          CONTROL_ACTION: ${{ inputs.action }}
+          CONTROL_ACTION: ${{ github.event_name == 'schedule' && 'start-subscriptions' || inputs.action }}
           DEPLOY_ROOT: /opt/vk-research-collector
         run: |
           set -Eeuo pipefail

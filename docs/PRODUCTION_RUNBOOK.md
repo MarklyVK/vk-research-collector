@@ -2,6 +2,13 @@
 
 ## Ежедневная диагностика
 
+Workflow `Production collection control` каждый час проверяет очередь. Если разрешённый
+run ещё активен, scheduled-запуск завершается без изменений. Если партия подписок
+завершена, workflow повторно проходит Gate A и создаёт следующую cohort. Ручной запуск
+`start-subscriptions` по-прежнему требует подтверждение `START_SUBSCRIPTIONS`.
+Старый paused-run не возобновляется, если после его создания уже завершилась более
+новая партия подписок: в этом случае строится свежий cohort без повторной обработки.
+
 ```bash
 cd /opt/vk-research-collector
 export COLLECTOR_IMAGE=$(cat .deploy/current-image)

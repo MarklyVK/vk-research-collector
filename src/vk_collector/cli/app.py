@@ -1350,6 +1350,10 @@ async def _apply_capacity(
             run = await session.get(CollectionRun, run_id, with_for_update=True)
             if run is None:
                 raise ValueError("Collection run не найден")
+            if run.status != CollectionRunStatus.PAUSED_CAPACITY_LIMIT or run.total_jobs <= 0:
+                raise ValueError(
+                    "Capacity gate можно применить только к непустому run на capacity-паузе"
+                )
             expected = run.configuration.get("collection")
             if not isinstance(expected, dict):
                 raise ValueError("Collection run содержит повреждённую конфигурацию")

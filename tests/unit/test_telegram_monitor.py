@@ -136,6 +136,22 @@ def healthy_snapshot(now: datetime) -> dict[str, Any]:
     }
 
 
+def test_enabled_subscriptions_without_active_run_are_critical(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    snapshot = healthy_snapshot(now)
+    snapshot["database"]["run_status"] = "completed"
+    snapshot["database"]["active_runs"] = 0
+
+    issues = evaluate_snapshot(
+        snapshot,
+        {},
+        settings(tmp_path, subscriptions_enabled=True),
+        now=now,
+    )
+
+    assert any(issue.key == "collection.no_active_run" for issue in issues)
+
+
 def test_formatting_escapes_dynamic_html_and_contains_daily_metrics(tmp_path: Path) -> None:
     now = datetime(2026, 7, 31, 6, 0, tzinfo=UTC)
     snapshot = healthy_snapshot(now)
