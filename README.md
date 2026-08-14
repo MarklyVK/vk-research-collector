@@ -1301,17 +1301,24 @@ docker compose run --rm collector collection subscriptions pilot
 ```
 
 `pilot` сам выполняет до 500 jobs и атомарно пишет
-`subscription-gate-a.json`. Если report измеренный, свежий и разрешающий, создайте
-отдельный production run, примените Gate A и выполните его:
+`subscription-gate-a.json`. Незавершённый pilot сначала просматривается и продолжается
+по существующему run ID; новый pilot при этом не создаётся:
 
 ```bash
-docker compose run --rm collector collection subscriptions plan
-docker compose run --rm collector collection capacity-apply \
-  --run-id SUBSCRIPTIONS_RUN_ID \
+docker compose run --rm collector collection subscriptions pilot-preview
+docker compose run --rm collector collection subscriptions pilot --run-id PILOT_RUN_ID
+```
+
+Если report измеренный, свежий и разрешающий, `campaign plan` остаётся read-only, а
+atomic apply проверяет report, PGDMP fingerprint, snapshot heap/PK, initial jobs,
+reserve factor и диск до materialization:
+
+```bash
+docker compose run --rm collector collection campaign plan
+docker compose run --rm collector collection campaign plan --apply \
   --source /app/exports/stage2-pilot/subscription-gate-a.json \
   --backup /app/backups/BEFORE_SUBSCRIPTIONS.dump
-docker compose run --rm collector collection subscriptions run \
-  --run-id SUBSCRIPTIONS_RUN_ID
+docker compose up -d collector-worker
 ```
 
 Gate B — ещё один pilot и ещё один run. После включения posts нельзя продолжать
@@ -1342,6 +1349,11 @@ docker compose run --rm collector collection method-limits
 docker compose run --rm collector collection light-repair
 docker compose run --rm collector collection light-repair --apply
 ```
+
+Light-repair создаёт не более 10 000 metadata/profile jobs после disk gate. Approved
+metadata batch атомарно согласует `GroupCandidate`, `VKCommunity` и
+`GroupCollectionState`; следующий cohort создаётся повторной явной apply после
+terminal предыдущего. Posts/members/subscription posts в таком run запрещены.
 
 ### Контейнеры и логи
 

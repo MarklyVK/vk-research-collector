@@ -55,6 +55,8 @@ JOB_METHODS = {
 FAIR_JOB_TYPES = tuple(JOB_METHODS)
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
 SUBSCRIPTION_LONG_RETRY_MAX_SECONDS = 86400
+METADATA_BATCH_MISS_LIMIT = 3
+METADATA_SINGLE_MISS_LIMIT = 2
 logger = logging.getLogger(__name__)
 
 
@@ -1034,9 +1036,13 @@ class CollectionWorker:
 
     async def _refresh_community_metadata(self, job: ClaimedJob) -> bool:
         """Process several community jobs with one groups.getById request."""
-        extras = await self._queue.claim_metadata_batch(
-            job.run_id,
-            limit=self._settings.collection_community_metadata_batch_size - 1,
+        extras = (
+            await self._queue.claim_metadata_batch(
+                job.run_id,
+                limit=self._settings.collection_community_metadata_batch_size - 1,
+            )
+            if int(job.checkpoint.get("metadata_miss_count", 0)) < METADATA_BATCH_MISS_LIMIT
+            else []
         )
         batch = sorted([job, *extras], key=lambda item: item.entity_id)
         requested_ids = [item.entity_id for item in batch]
@@ -1099,29 +1105,151 @@ class CollectionWorker:
                         },
                     )
                 )
+            candidates = list(
+                (
+                    await session.scalars(
+                        select(GroupCandidate).where(GroupCandidate.vk_id.in_(by_id))
+                    )
+                ).all()
+            )
+            for candidate in candidates:
+                value = by_id[candidate.vk_id]
+                candidate.name = str(value.get("name", candidate.name))
+                candidate.description = str(value.get("description", ""))
+                candidate.status_text = str(value.get("status", ""))
+                candidate.screen_name = (
+                    str(value["screen_name"]) if value.get("screen_name") else candidate.screen_name
+                )
+                candidate.last_seen_at = now
+                deactivated = value.get("deactivated")
+                await session.execute(
+                    insert(GroupCollectionState)
+                    .values(
+                        group_id=candidate.id,
+                        last_group_success_at=None if deactivated else now,
+                        next_scheduled_at=now
+                        + timedelta(days=self._settings.collection_community_metadata_ttl_days),
+                        unavailable=bool(deactivated),
+                        skip_reason=(f"deactivated:{deactivated}" if deactivated else None),
+                        last_error_type=("community_deactivated" if deactivated else None),
+                        last_error_message=(
+                            "VK явно пометил сообщество как deactivated" if deactivated else None
+                        ),
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[GroupCollectionState.group_id],
+                        set_={
+                            "last_group_success_at": None if deactivated else now,
+                            "next_scheduled_at": now
+                            + timedelta(days=self._settings.collection_community_metadata_ttl_days),
+                            "unavailable": bool(deactivated),
+                            "skip_reason": (f"deactivated:{deactivated}" if deactivated else None),
+                            "last_error_type": ("community_deactivated" if deactivated else None),
+                            "last_error_message": (
+                                "VK явно пометил сообщество как deactivated"
+                                if deactivated
+                                else None
+                            ),
+                        },
+                    )
+                )
             await self._update_metrics(session, job.id, requests=1, updated=len(normalized))
             await session.commit()
         for extra in extras:
             available = extra.entity_id in by_id
-            await self._queue.finish(
-                extra.id,
-                JobStatus.COMPLETED if available else JobStatus.RETRY_WAIT,
-                error_type=None if available else "community_partial_response",
-                error_message=None if available else "ID отсутствует в частичном groups.getById",
-                retry_at=None
-                if available
-                else datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS[0]),
-            )
+            if available:
+                await self._queue.finish(extra.id, JobStatus.COMPLETED)
+            else:
+                await self._finish_metadata_miss(extra)
         if job.entity_id not in by_id:
-            await self._queue.finish(
-                job.id,
-                JobStatus.RETRY_WAIT,
-                error_type="community_partial_response",
-                error_message="ID отсутствует в частичном groups.getById",
-                retry_at=datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS[0]),
-            )
+            await self._finish_metadata_miss(job)
             return False
         return True
+
+    async def _finish_metadata_miss(self, job: ClaimedJob) -> None:
+        """Persist bounded batch-to-single diagnostics for an omitted community ID."""
+        previous_misses = int(job.checkpoint.get("metadata_miss_count", 0))
+        miss_count = previous_misses + 1
+        single_attempt = max(0, miss_count - METADATA_BATCH_MISS_LIMIT)
+        terminal = single_attempt >= METADATA_SINGLE_MISS_LIMIT
+        stage = "single" if miss_count > METADATA_BATCH_MISS_LIMIT else "batch"
+        checkpoint = {**job.checkpoint, "metadata_miss_count": miss_count, "stage": stage}
+        message = (
+            f"groups.getById не вернул ID; stage={stage}; "
+            f"attempt={job.attempt_count}; miss={miss_count}; single_miss={single_attempt}"
+        )
+        await self._record_error(job, "community_partial_response", message)
+        if terminal:
+            now = datetime.now(UTC)
+            async with self._sessions() as session:
+                await session.execute(
+                    insert(VKCommunity)
+                    .values(
+                        vk_id=job.entity_id,
+                        name="",
+                        description="",
+                        status_text="",
+                        deactivated="unavailable",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        metadata_updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[VKCommunity.vk_id],
+                        set_={
+                            "deactivated": "unavailable",
+                            "last_seen_at": now,
+                            "metadata_updated_at": now,
+                        },
+                    )
+                )
+                candidate_id = await session.scalar(
+                    select(GroupCandidate.id).where(GroupCandidate.vk_id == job.entity_id)
+                )
+                if candidate_id is not None:
+                    await session.execute(
+                        insert(GroupCollectionState)
+                        .values(
+                            group_id=candidate_id,
+                            next_scheduled_at=now
+                            + timedelta(days=self._settings.collection_community_metadata_ttl_days),
+                            unavailable=True,
+                            skip_reason="missing_from_groups_get_by_id",
+                            last_error_type="community_missing_terminal",
+                            last_error_message=message,
+                        )
+                        .on_conflict_do_update(
+                            index_elements=[GroupCollectionState.group_id],
+                            set_={
+                                "next_scheduled_at": now
+                                + timedelta(
+                                    days=self._settings.collection_community_metadata_ttl_days
+                                ),
+                                "unavailable": True,
+                                "skip_reason": "missing_from_groups_get_by_id",
+                                "last_error_type": "community_missing_terminal",
+                                "last_error_message": message,
+                            },
+                        )
+                    )
+                await session.commit()
+            await self._queue.finish(
+                job.id,
+                JobStatus.SKIPPED,
+                error_type="community_missing_terminal",
+                error_message=message,
+                checkpoint=checkpoint,
+            )
+            return
+        delay = RETRY_DELAYS[min(miss_count - 1, len(RETRY_DELAYS) - 1)]
+        await self._queue.finish(
+            job.id,
+            JobStatus.RETRY_WAIT,
+            error_type="community_partial_response",
+            error_message=message,
+            retry_at=datetime.now(UTC) + timedelta(seconds=delay),
+            checkpoint=checkpoint,
+        )
 
     async def _collect_subscription_posts(self, job: ClaimedJob) -> None:
         """Сохранить не более 20 последних постов канонического сообщества."""

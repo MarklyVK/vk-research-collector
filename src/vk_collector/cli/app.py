@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import typer
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.classification.audit import evaluate_audit, prepare_audit
@@ -36,6 +36,11 @@ from vk_collector.collection.capacity import (
     write_capacity_report,
 )
 from vk_collector.collection.notifications import notify
+from vk_collector.collection.pilots import (
+    cancel_pilot,
+    choose_pilot_control_action,
+    pilot_previews,
+)
 from vk_collector.collection.reporting import (
     bounded_wakeup_delay,
     capacity_gate_passed,
@@ -781,6 +786,22 @@ async def _validate_autonomous_run(
             raise ValueError("Run не имеет разрешающего capacity gate")
         if run.configuration.get("collection") != queue.collection_configuration():
             raise ValueError("Runtime-конфигурация не совпадает с immutable run")
+        if run.scope == "light_repair":
+            allowed = {"refresh_community_metadata", "refresh_user_profile"}
+            actual = set(
+                (
+                    await session.scalars(
+                        select(CollectionJob.job_type)
+                        .where(CollectionJob.collection_run_id == run_id)
+                        .distinct()
+                    )
+                ).all()
+            )
+            forbidden = sorted(actual - allowed)
+            if forbidden:
+                raise ValueError(
+                    "Light-repair содержит запрещённые job types: " + ", ".join(forbidden)
+                )
         if run.scope in {
             "subscriptions",
             "subscription_discovery",
@@ -868,7 +889,7 @@ async def _campaign_operation(
     try:
         manager = CampaignManager(sessions, settings)
         if action == "plan":
-            return {"campaign_id": str(await manager.plan())}
+            raise ValueError("Используйте campaign plan --apply --source ... --backup ...")
         if action == "status":
             return await manager.status(campaign_id)
         if campaign_id is None:
@@ -899,6 +920,14 @@ def campaign_plan(
         bool,
         typer.Option("--apply", help="Создать или переиспользовать кампанию и первый cohort."),
     ] = False,
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Свежий успешный capacity report Pilot A."),
+    ] = None,
+    backup: Annotated[
+        Path | None,
+        typer.Option("--backup", help="Проверенный pg_dump -Fc перед materialization."),
+    ] = None,
 ) -> None:
     """Создать campaign только явно; без --apply показать неизменяющий preview."""
     if not apply:
@@ -908,13 +937,144 @@ def campaign_plan(
             engine = create_database_engine(settings.sqlalchemy_url)
             sessions = create_session_factory(engine)
             try:
-                return await CampaignManager(sessions, settings).plan_preview()
+                payload = await CampaignManager(sessions, settings).plan_preview()
+                async with sessions() as session:
+                    database_bytes = int(
+                        await session.scalar(select(func.pg_database_size(func.current_database())))
+                        or 0
+                    )
+                disk = inspect_disk(
+                    settings.collection_export_dir,
+                    settings.disk_warning_percent,
+                    settings.disk_stop_percent,
+                )
+                storage = payload.get("snapshot_storage_estimate")
+                projected_growth = 0
+                if isinstance(storage, dict):
+                    projected_growth = int(
+                        sum(
+                            int(storage.get(key, 0))
+                            for key in (
+                                "heap_bytes",
+                                "primary_key_bytes",
+                                "initial_cohort_jobs_bytes",
+                            )
+                        )
+                        * float(storage.get("reserve_factor", 1.30))
+                    )
+                return {
+                    **payload,
+                    "database_bytes": database_bytes,
+                    "disk": {
+                        "total_bytes": disk.total_bytes,
+                        "free_bytes": disk.free_bytes,
+                        "used_percent": disk.used_percent,
+                        "warning": disk.warning,
+                        "stop": disk.stop,
+                    },
+                    "projected_growth_with_reserve_bytes": projected_growth,
+                }
             finally:
                 await engine.dispose()
 
         typer.echo(json.dumps(asyncio.run(preview()), ensure_ascii=False, indent=2))
         return
-    _show_campaign_operation("plan")
+    if source is None or backup is None:
+        typer.echo(
+            "Campaign apply отклонён: обязательны --source и --backup до materialization.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    async def apply_campaign() -> dict[str, object]:
+        settings = get_settings()
+        engine = create_database_engine(settings.sqlalchemy_url)
+        sessions = create_session_factory(engine)
+        try:
+            manager = CampaignManager(sessions, settings)
+            preview = await manager.plan_preview()
+            backup_metadata = _validated_backup_metadata(backup)
+            collection_configuration = manager.configuration()["collection"]
+            if not isinstance(collection_configuration, dict):
+                raise ValueError("Campaign collection configuration повреждена")
+            report = validate_capacity_report(
+                source,
+                phase="A",
+                configuration=collection_configuration,
+                max_age_days=settings.collection_capacity_report_max_age_days,
+            )
+            try:
+                pilot_id = uuid.UUID(str(report["run_id"]))
+            except (KeyError, ValueError) as exc:
+                raise ValueError("Capacity report содержит некорректный pilot run ID") from exc
+            async with sessions() as session:
+                pilot = await session.get(CollectionRun, pilot_id)
+                database_bytes = int(
+                    await session.scalar(select(func.pg_database_size(func.current_database())))
+                    or 0
+                )
+            if (
+                pilot is None
+                or pilot.scope != "subscriptions_pilot"
+                or pilot.status != CollectionRunStatus.COMPLETED
+            ):
+                raise ValueError("Capacity report не связан с завершённым Pilot A")
+            storage = preview.get("snapshot_storage_estimate")
+            if not isinstance(storage, dict):
+                raise ValueError("Campaign preview не содержит storage projection")
+            snapshot_growth = sum(
+                int(storage.get(key, 0))
+                for key in ("heap_bytes", "primary_key_bytes", "initial_cohort_jobs_bytes")
+            )
+            reserve_factor = float(storage.get("reserve_factor", 1.30))
+            reserved_growth = int(snapshot_growth * reserve_factor)
+            disk = inspect_disk(
+                settings.collection_export_dir,
+                settings.disk_warning_percent,
+                settings.disk_stop_percent,
+            )
+            report_projection = report.get("projected", {}).get("database_bytes")
+            projected_database = (
+                int(report_projection) + reserved_growth
+                if isinstance(report_projection, int)
+                else database_bytes + reserved_growth
+            )
+            projected_used = (
+                100.0 * (disk.total_bytes - disk.free_bytes + reserved_growth) / disk.total_bytes
+            )
+            if (
+                disk.warning
+                or disk.stop
+                or reserved_growth > disk.free_bytes
+                or projected_used >= settings.disk_warning_percent
+                or projected_database > int(report["safe_disk_limit_bytes"])
+            ):
+                raise ValueError("Campaign apply отклонён disk/capacity projection до snapshot")
+            evidence: dict[str, object] = {
+                "decision": "passed",
+                "planning_configuration_hash": preview["planning_configuration_hash"],
+                "snapshot_users": preview["snapshot_users"],
+                "capacity_report": str(source.resolve()),
+                "verified_backup": backup_metadata,
+                "projected_database_bytes": projected_database,
+                "snapshot_projected_growth_bytes": reserved_growth,
+                "disk_free_bytes": disk.free_bytes,
+                "disk_used_percent": disk.used_percent,
+                "projected_disk_used_percent": projected_used,
+                "reserve_factor": reserve_factor,
+                "verified_at": datetime.now(UTC).isoformat(),
+            }
+            campaign_id = await manager.plan(gate_evidence=evidence)
+            return {"campaign_id": str(campaign_id), "capacity_gate": evidence}
+        finally:
+            await engine.dispose()
+
+    try:
+        payload = asyncio.run(apply_campaign())
+    except ValueError as exc:
+        typer.echo(f"Campaign apply отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 @campaign_app.command("status")
@@ -945,6 +1105,22 @@ def campaign_metadata_preview(
     _show_campaign_operation("metadata-preview", campaign_id)
 
 
+@campaign_app.command("control-decision")
+def campaign_control_decision() -> None:
+    """Показать phase-aware решение hourly-control без изменения campaign."""
+
+    async def operation() -> dict[str, object]:
+        settings = get_settings()
+        engine = create_database_engine(settings.sqlalchemy_url)
+        sessions = create_session_factory(engine)
+        try:
+            return await CampaignManager(sessions, settings).control_decision()
+        finally:
+            await engine.dispose()
+
+    typer.echo(json.dumps(asyncio.run(operation())["decision"], ensure_ascii=False))
+
+
 @subscriptions_app.command("plan")
 def subscriptions_plan() -> None:
     """Создать cohort-plan существующих публичных пользователей."""
@@ -955,12 +1131,60 @@ def subscriptions_plan() -> None:
 @subscriptions_app.command("pilot")
 def subscriptions_pilot(
     max_jobs: Annotated[int | None, typer.Option("--max-jobs", min=1)] = None,
+    run_id: Annotated[uuid.UUID | None, typer.Option("--run-id")] = None,
 ) -> None:
     """Явно выполнить Pilot A максимум на 500 пользователей и записать report."""
     try:
-        payload = asyncio.run(_run_subscription_pilot("A", max_jobs=max_jobs))
+        payload = asyncio.run(_run_subscription_pilot("A", max_jobs=max_jobs, run_id=run_id))
     except ValueError as exc:
         typer.echo(f"Pilot A отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _pilot_control(
+    *, cancel_run_id: uuid.UUID | None = None, reason: str = "", confirm: bool = False
+) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        if cancel_run_id is not None:
+            if not confirm:
+                raise ValueError("Отмена pilot требует --confirm")
+            return await cancel_pilot(sessions, cancel_run_id, reason=reason)
+        rows = await pilot_previews(sessions, settings)
+        return {"pilots": rows, "decision": choose_pilot_control_action(rows)}
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("pilot-preview")
+def subscriptions_pilot_preview() -> None:
+    """Показать классификацию и безопасное действие для всех historical pilot."""
+    typer.echo(json.dumps(asyncio.run(_pilot_control()), ensure_ascii=False, indent=2))
+
+
+@subscriptions_app.command("pilot-control-decision")
+def subscriptions_pilot_control_decision() -> None:
+    """Вернуть тестируемое решение hourly-control без изменения PostgreSQL."""
+    payload = asyncio.run(_pilot_control())
+    typer.echo(json.dumps(payload["decision"], ensure_ascii=False))
+
+
+@subscriptions_app.command("cancel-pilot")
+def subscriptions_cancel_pilot(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    confirm: Annotated[bool, typer.Option("--confirm")] = False,
+    reason: Annotated[
+        str, typer.Option("--reason", help="Причина сохраняется в collection run.")
+    ] = "obsolete pilot отменён оператором",
+) -> None:
+    """Явно отменить один pilot, сохранив jobs, checkpoints и collected data."""
+    try:
+        payload = asyncio.run(_pilot_control(cancel_run_id=run_id, reason=reason, confirm=confirm))
+    except ValueError as exc:
+        typer.echo(f"Отмена pilot отклонена: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -1270,11 +1494,45 @@ def light_repair(
             preview = await queue.light_repair_preview()
             if not apply:
                 return {"apply": False, **preview}
-            run_id = await queue.plan_light_repair()
+            disk = inspect_disk(
+                settings.collection_export_dir,
+                settings.disk_warning_percent,
+                settings.disk_stop_percent,
+            )
+            growth = preview.get("projected_cohort_growth_bytes")
+            if not isinstance(growth, int):
+                raise ValueError("Light-repair preview не содержит projected growth")
+            reserve_factor = 1.30
+            reserved_growth = int(growth * reserve_factor)
+            projected_used = (
+                100.0 * (disk.total_bytes - disk.free_bytes + reserved_growth) / disk.total_bytes
+            )
+            decision = (
+                "passed"
+                if not disk.warning
+                and not disk.stop
+                and reserved_growth <= disk.free_bytes
+                and projected_used < settings.disk_warning_percent
+                else "rejected"
+            )
+            evidence: dict[str, object] = {
+                "decision": decision,
+                "preview_hash": preview["preview_hash"],
+                "checked_at": datetime.now(UTC).isoformat(),
+                "disk_total_bytes": disk.total_bytes,
+                "disk_free_bytes": disk.free_bytes,
+                "disk_used_percent": disk.used_percent,
+                "projected_growth_bytes": growth,
+                "reserved_growth_bytes": reserved_growth,
+                "projected_used_percent": projected_used,
+                "reserve_factor": reserve_factor,
+            }
+            run_id = await queue.plan_light_repair(capacity_evidence=evidence)
             return {
                 "apply": True,
                 "run_id": str(run_id),
                 "allowed_methods": ["groups.getById", "users.get"],
+                "capacity_evidence": evidence,
                 **preview,
             }
         finally:
@@ -1398,6 +1656,7 @@ async def _run_subscription_pilot(
     *,
     source_run_id: uuid.UUID | None = None,
     max_jobs: int | None = None,
+    run_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """Выполнить измеряемый Pilot A/B; незавершённый pilot оставляет gate закрытым."""
     settings = get_settings()
@@ -1405,12 +1664,53 @@ async def _run_subscription_pilot(
     sessions = create_session_factory(engine)
     try:
         queue = CollectionQueue(sessions, settings)
-        before = await database_metrics(sessions)
-        run_id = (
-            await queue.plan_subscriptions(pilot=True)
-            if phase == "A"
-            else await queue.plan_subscription_posts(pilot=True, source_run_id=source_run_id)
-        )
+        invocation_before = await database_metrics(sessions)
+        if run_id is None:
+            run_id = (
+                await queue.plan_subscriptions(pilot=True)
+                if phase == "A"
+                else await queue.plan_subscription_posts(pilot=True, source_run_id=source_run_id)
+            )
+        else:
+            rows = await pilot_previews(sessions, settings)
+            preview = next((row for row in rows if row["run_id"] == str(run_id)), None)
+            expected_scope = "subscriptions_pilot" if phase == "A" else "subscription_posts_pilot"
+            if preview is None or preview["scope"] != expected_scope:
+                raise ValueError("Указанный run ID не является pilot выбранной фазы")
+            if preview["classification"] == "waiting":
+                raise ValueError(
+                    "Pilot ожидает persisted retry до " + str(preview["nearest_retry"])
+                )
+            if preview["classification"] not in {
+                "compatible_recoverable",
+                "stale_running_lease",
+            }:
+                raise ValueError(
+                    "Pilot нельзя безопасно возобновить: " + str(preview["classification"])
+                )
+        async with sessions() as session:
+            pilot_run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if pilot_run is None:
+                raise ValueError("Pilot run исчез до выполнения")
+            stored_baseline = pilot_run.configuration.get("measurement_baseline")
+            raw_previous_duration = pilot_run.configuration.get("measurement_duration_seconds", 0)
+            previous_duration = (
+                float(raw_previous_duration)
+                if isinstance(raw_previous_duration, (int, float))
+                else 0.0
+            )
+            if isinstance(stored_baseline, dict) and all(
+                isinstance(value, int) for value in stored_baseline.values()
+            ):
+                before = {str(key): int(value) for key, value in stored_baseline.items()}
+            else:
+                before = invocation_before
+                pilot_run.configuration = {
+                    **pilot_run.configuration,
+                    "measurement_baseline": before,
+                    "measurement_started_at": datetime.now(UTC).isoformat(),
+                }
+                await session.commit()
         started_at = time.monotonic()
         _, processed = await _execute_collection(
             run_id,
@@ -1419,7 +1719,15 @@ async def _run_subscription_pilot(
             until_idle=True,
             explicit_pilot=True,
         )
-        duration_seconds = time.monotonic() - started_at
+        duration_seconds = previous_duration + time.monotonic() - started_at
+        async with sessions() as session:
+            pilot_run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if pilot_run is not None:
+                pilot_run.configuration = {
+                    **pilot_run.configuration,
+                    "measurement_duration_seconds": duration_seconds,
+                }
+                await session.commit()
         after = await database_metrics(sessions)
         summary = await run_summary(sessions, run_id)
         database_growth = max(0, after["database_bytes"] - before["database_bytes"])
@@ -1712,6 +2020,48 @@ async def _apply_capacity(
                     raise ValueError("Capacity report относится к другой конфигурации сбора")
             else:
                 raise ValueError("Capacity report нельзя применить к этому scope")
+            metadata_evidence: dict[str, object] | None = None
+            if run.scope == "subscription_metadata":
+                average_row_bytes = int(
+                    await session.scalar(
+                        text(
+                            "SELECT coalesce(avg(pg_column_size(v)), 0)::bigint "
+                            "FROM vk_communities AS v"
+                        )
+                    )
+                    or 0
+                )
+                reserve_factor = 1.30
+                per_job_bytes = max(1024, average_row_bytes + 512)
+                projected_metadata_growth = int(run.total_jobs * per_job_bytes * reserve_factor)
+                disk = inspect_disk(
+                    settings.collection_export_dir,
+                    settings.disk_warning_percent,
+                    settings.disk_stop_percent,
+                )
+                projected_used = (
+                    100.0
+                    * (disk.total_bytes - disk.free_bytes + projected_metadata_growth)
+                    / disk.total_bytes
+                )
+                if (
+                    disk.warning
+                    or disk.stop
+                    or projected_metadata_growth > disk.free_bytes
+                    or projected_used >= settings.disk_warning_percent
+                ):
+                    raise ValueError("Metadata capacity renewal отклонён disk projection")
+                metadata_evidence = {
+                    "kind": "metadata_lightweight_capacity",
+                    "checked_at": datetime.now(UTC).isoformat(),
+                    "jobs": run.total_jobs,
+                    "measured_average_community_row_bytes": average_row_bytes,
+                    "conservative_per_job_bytes": per_job_bytes,
+                    "projected_growth_bytes": projected_metadata_growth,
+                    "reserve_factor": reserve_factor,
+                    "disk_free_bytes": disk.free_bytes,
+                    "projected_disk_used_percent": projected_used,
+                }
             run.configuration = {
                 **run.configuration,
                 "capacity_gate": "passed",
@@ -1719,6 +2069,11 @@ async def _apply_capacity(
                 "safe_limit_bytes": safe_limit,
                 "capacity_report": str(source.resolve()),
                 **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
+                **(
+                    {"metadata_capacity_evidence": metadata_evidence}
+                    if metadata_evidence is not None
+                    else {}
+                ),
             }
             operator_paused = False
             if run.campaign_id is not None:
@@ -1744,6 +2099,11 @@ async def _apply_capacity(
                     "safe_limit_bytes": safe_limit,
                     "capacity_report": str(source.resolve()),
                     **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
+                    **(
+                        {"metadata_capacity_evidence": metadata_evidence}
+                        if metadata_evidence is not None
+                        else {}
+                    ),
                 }
                 campaign.status = (
                     CampaignStatus.PAUSED.value if operator_paused else CampaignStatus.RUNNING.value
@@ -1751,7 +2111,11 @@ async def _apply_capacity(
                 campaign.started_at = campaign.started_at or datetime.now(UTC)
                 campaign.error_message = None
             await session.commit()
-            return {"run_id": str(run_id), "status": "planned", "capacity_gate": "passed"}
+            return {
+                "run_id": str(run_id),
+                "status": run.status.value,
+                "capacity_gate": "passed",
+            }
     finally:
         await engine.dispose()
 

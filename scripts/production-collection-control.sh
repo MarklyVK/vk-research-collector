@@ -235,10 +235,15 @@ SQL
 }
 
 start_subscriptions() {
-  local active_campaigns active_runs paused_capacity_campaigns unfinished_pilots
-  local gate_applied latest_backup
+  local active_campaigns active_runs paused_capacity_campaigns
+  local campaign_action campaign_decision_json campaign_id gate_applied latest_backup
   local pilot_attempt pilot_state plan_state report_path
-  local deferred_pilot production_allowed plan_output retryable_pilot run_id
+  local deferred_pilot production_allowed plan_output renew_run_id retryable_pilot run_id run_phase
+  local pilot_decision pilot_decision_json pilot_ids pilot_run_id pilot_scope pilot_wakeup
+  log 'Фиксирую безопасный лимит подписок: 50 на пользователя и включаю phase A.'
+  set_env_value COLLECTION_SUBSCRIPTIONS_ENABLED true
+  set_env_value COLLECTION_SUBSCRIPTIONS_MAX_PER_USER 50
+  set_env_value COLLECTION_SUBSCRIPTIONS_PAGE_SIZE 50
   active_campaigns=$(psql_query -Atqc \
     "SELECT count(*) FROM collection_campaigns
       WHERE campaign_type='subscription_enrichment'
@@ -247,22 +252,44 @@ start_subscriptions() {
     "SELECT count(*)
        FROM collection_runs
       WHERE scope IN ('subscriptions','subscription_posts',
-                      'subscription_discovery','subscription_metadata',
-                      'subscriptions_pilot','subscription_posts_pilot')
+                      'subscription_discovery','subscription_metadata')
         AND status::text IN ('planned','running','paused','paused_no_tokens',
                              'waiting_method_limit')")
   paused_capacity_campaigns=$(psql_query -Atqc \
     "SELECT count(*) FROM collection_campaigns
       WHERE campaign_type='subscription_enrichment'
         AND status='paused_capacity_limit'")
-  unfinished_pilots=$(psql_query -Atqc \
-    "SELECT count(*) FROM collection_runs
-      WHERE scope IN ('subscriptions_pilot','subscription_posts_pilot')
-        AND status::text IN ('planned','running','paused','paused_no_tokens',
-                             'waiting_method_limit')")
-  if [[ "$unfinished_pilots" != 0 ]]; then
-    log "Найдены незавершённые pilot: $unfinished_pilots. Новый pilot/run не создаётся."
-    collector collection backlog
+  pilot_decision_json=$(collector collection subscriptions pilot-control-decision)
+  pilot_state=$(python3 -c \
+    'import json,sys; p=json.load(sys.stdin); print("|".join(str(p.get(k) or "") for k in ("action","run_id","scope","next_wakeup_at"))); print(",".join(p.get("pilot_ids", [])))' \
+    <<< "$pilot_decision_json")
+  IFS='|' read -r pilot_decision pilot_run_id pilot_scope pilot_wakeup <<< "$(head -n 1 <<< "$pilot_state")"
+  pilot_ids=$(tail -n 1 <<< "$pilot_state")
+  if [[ "$pilot_decision" == wait ]]; then
+    [[ "$pilot_scope" == subscriptions_pilot ]] \
+      || die "Незавершённый $pilot_scope требует явного операторского решения."
+    log "Pilot $pilot_run_id ожидает persisted retry до $pilot_wakeup; новый pilot не создаётся."
+    return
+  fi
+  if [[ "$pilot_decision" == operator_required ]]; then
+    die "Неоднозначные/несовместимые pilot: $pilot_ids. Выполните: collector collection subscriptions pilot-preview; затем cancel-pilot --run-id ID --confirm."
+  fi
+  if [[ "$pilot_decision" == resume ]]; then
+    [[ "$pilot_scope" == subscriptions_pilot ]] \
+      || die "Hourly-control не возобновляет $pilot_scope автоматически; используйте pilot-preview."
+    log "Совместимый existing Pilot A будет возобновлён по run ID $pilot_run_id."
+  fi
+  campaign_decision_json=$(collector collection campaign control-decision)
+  plan_state=$(python3 -c \
+    'import json,sys; p=json.load(sys.stdin); print("|".join(str(p.get(k) or "") for k in ("action","run_id","scope")))' \
+    <<< "$campaign_decision_json")
+  IFS='|' read -r campaign_action renew_run_id run_phase <<< "$plan_state"
+  if [[ "$campaign_action" == operator_required || "$campaign_action" == operator_paused ]]; then
+    die "Campaign требует операторского решения: $campaign_decision_json"
+  fi
+  if [[ "$campaign_action" == reuse_active ]]; then
+    log "Активная campaign уже имеет runnable/waiting work: $campaign_decision_json"
+    collector collection campaign status
     return
   fi
   if [[ "$active_runs" != 0 ]]; then
@@ -291,11 +318,6 @@ start_subscriptions() {
     'from pathlib import Path; p=Path("/app/backups/'"$(basename "$latest_backup")"'"); f=p.open("rb"); assert f.read(5) == b"PGDMP"' \
     || die 'Collector UID не может прочитать PGDMP header после настройки ACL.'
 
-  log 'Фиксирую безопасный лимит подписок: 50 на пользователя и включаю phase A.'
-  set_env_value COLLECTION_SUBSCRIPTIONS_ENABLED true
-  set_env_value COLLECTION_SUBSCRIPTIONS_MAX_PER_USER 50
-  set_env_value COLLECTION_SUBSCRIPTIONS_PAGE_SIZE 50
-
   log 'Останавливаю worker на время измеряемого Pilot A.'
   compose stop -t 360 collector-worker
   WORKER_STOPPED=1
@@ -303,17 +325,9 @@ start_subscriptions() {
 
   report_path="$DEPLOY_DIR/exports/stage2-pilot/subscription-gate-a.json"
   gate_applied=0
-  run_id=$(psql_query -Atqc \
-    "SELECT r.id
-       FROM collection_runs r
-       JOIN collection_campaigns c ON c.id=r.campaign_id
-      WHERE r.scope='subscription_discovery'
-        AND r.status::text='paused_capacity_limit'
-        AND c.status='paused_capacity_limit'
-      ORDER BY r.created_at DESC
-      LIMIT 1")
+  run_id=$renew_run_id
   if [[ -n "$run_id" && -s "$report_path" ]]; then
-    log "Пробую применить уже измеренный Gate A к незапущенному run $run_id."
+    log "Пробую renewal Gate A для существующего $run_phase run $run_id; новый discovery не создаётся."
     if collector collection capacity-apply \
       --run-id "$run_id" \
       --source /app/exports/stage2-pilot/subscription-gate-a.json \
@@ -327,7 +341,12 @@ start_subscriptions() {
   if [[ "$gate_applied" -eq 0 ]]; then
     for pilot_attempt in 1 2 3; do
       log "Запускаю Pilot A подписок, попытка $pilot_attempt/3 (capacity gate не обходится)."
-      collector collection subscriptions pilot
+      if [[ "$pilot_decision" == resume ]]; then
+        collector collection subscriptions pilot --run-id "$pilot_run_id"
+        pilot_decision=continued
+      else
+        collector collection subscriptions pilot
+      fi
       [[ -s "$report_path" ]] || die "Pilot A не создал отчёт: $report_path"
       pilot_state=$(python3 -c \
         'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); m=p["measured"]; allowed=p["production_allowed"] is True; retry=(not allowed and m["planned_entities"] > 0 and m["completed_entities"] == 0 and m["failed_entities"] == 0 and m["skipped_entities"] == m["planned_entities"]); deferred=(not allowed and m.get("deferred_entities", 0) > 0); print(f"{str(allowed).lower()}|{str(retry).lower()}|{str(deferred).lower()}")' \
@@ -335,7 +354,7 @@ start_subscriptions() {
       IFS='|' read -r production_allowed retryable_pilot deferred_pilot <<< "$pilot_state"
       [[ "$production_allowed" == true ]] && break
       if [[ "$deferred_pilot" == true ]]; then
-        log 'Pilot сохранил transient retry в PostgreSQL; продолжение выполнит следующий hourly-control.'
+        log 'Pilot сохранил transient retry; следующий hourly-control выберет тот же run ID.'
         restart_worker
         trap - EXIT
         return
@@ -347,18 +366,40 @@ start_subscriptions() {
       die 'Pilot A завершён, но capacity report не разрешает production run.'
     done
 
-    log 'Создаю или переиспользую кампанию и первый discovery cohort.'
-    plan_output=$(collector collection campaign plan --apply)
+    if [[ -n "$renew_run_id" ]]; then
+      log "Применяю свежий Gate A и metadata evidence к existing $run_phase run $renew_run_id."
+      collector collection capacity-apply \
+        --run-id "$renew_run_id" \
+        --source /app/exports/stage2-pilot/subscription-gate-a.json \
+        --backup "/app/backups/$(basename "$latest_backup")"
+      run_id=$renew_run_id
+    else
+      log 'Создаю или переиспользую кампанию и первый discovery cohort.'
+    plan_output=$(collector collection campaign plan --apply \
+      --source /app/exports/stage2-pilot/subscription-gate-a.json \
+      --backup "/app/backups/$(basename "$latest_backup")")
     printf '%s\n' "$plan_output"
     run_id=$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
       <<< "$plan_output" | tail -n 1)
     [[ -n "$run_id" ]] || die 'Не удалось получить run ID из production plan.'
+    campaign_id=$run_id
     run_id=$(psql_query -Atqc \
       "SELECT r.id FROM collection_runs r
         JOIN collection_campaigns c ON c.id=r.campaign_id
-       WHERE c.id='$run_id'::uuid AND r.scope='subscription_discovery'
+       WHERE c.id='$campaign_id'::uuid
+         AND r.scope IN ('subscription_discovery','subscription_metadata')
        ORDER BY r.created_at DESC LIMIT 1")
-    [[ -n "$run_id" ]] || die 'Кампания не создала discovery cohort.'
+    if [[ -z "$run_id" ]]; then
+      plan_state=$(psql_query -Atqc \
+        "SELECT status FROM collection_campaigns WHERE id='$campaign_id'::uuid")
+      if [[ "$plan_state" == completed ]]; then
+        log 'Snapshot не содержит due discovery/metadata work; campaign завершена как no-op.'
+        restart_worker
+        trap - EXIT
+        return
+      fi
+      die 'Кампания не создала runnable discovery/metadata cohort.'
+    fi
     plan_state=$(psql_query -AtF '|' -c \
       "SELECT status::text, total_jobs FROM collection_runs WHERE id='$run_id'::uuid")
     if [[ "$plan_state" == 'completed|0' ]]; then
@@ -367,14 +408,9 @@ start_subscriptions() {
       trap - EXIT
       return
     fi
-    [[ "$plan_state" == "paused_capacity_limit|"* ]] \
-      || die "Production plan имеет неожиданный status/jobs: $plan_state"
-
-    log "Применяю проверенный Gate A к run $run_id."
-    collector collection capacity-apply \
-      --run-id "$run_id" \
-      --source /app/exports/stage2-pilot/subscription-gate-a.json \
-      --backup "/app/backups/$(basename "$latest_backup")"
+      [[ "$plan_state" == "planned|"* || "$plan_state" == "completed|0" ]] \
+        || die "Production plan имеет неожиданный status/jobs: $plan_state"
+    fi
   fi
 
   restart_worker
@@ -419,7 +455,7 @@ POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
 ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20260815_0009 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20260815_0010 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 report
 if [[ "$ACTION" == start-subscriptions ]]; then

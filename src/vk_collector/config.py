@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     collection_subscriptions_users_per_run: int = Field(default=10000, ge=1)
     collection_subscriptions_ttl_days: int = Field(default=30, ge=1)
     collection_campaign_cohort_users: int = Field(default=10_000, ge=1, le=10_000)
+    collection_light_repair_cohort_size: int = Field(default=10_000, ge=1, le=10_000)
     collection_community_metadata_batch_size: int = Field(default=100, ge=1, le=100)
     collection_community_metadata_ttl_days: int = Field(default=30, ge=1)
     collection_scheduler_quantum: int = Field(default=10, ge=1, le=100)

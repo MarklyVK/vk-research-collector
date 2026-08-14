@@ -49,9 +49,19 @@ cooldown, probe и числом успешных запросов.
 configuration hash, курсоры cohort и metadata, wakeup и ошибку. Узкая таблица
 `collection_campaign_users` материализует только пары campaign/user: изменение
 membership, `is_closed` или `can_access_closed` после этого не меняет набор. Preview
-оценивает её как 96 bytes/user; для 1,45 млн users это около 133 MiB до фактического
-измерения PostgreSQL. Материализация выполняется только явным `campaign plan --apply`,
-а jobs создаются cohort до 10 000. Повторный planner snapshot не пересоздаёт.
+оценивается по измерению PostgreSQL 16. На временной таблице той же формы с 100 000
+строк получено: heap 6 029 312 bytes, primary key 4 079 616 bytes, всего 10 133 504
+bytes, или 101,34 bytes/user. Планировщик консервативно использует 64 bytes heap +
+48 bytes PK на пользователя. Отдельное измерение 10 000 строк формы
+`collection_jobs` дало 3 219 456 bytes, или 321,95 bytes/job; projection использует
+768 bytes/job и общий reserve factor 1,30. Это локальное измерение, а не заново
+проверенный production-срез.
+
+`campaign plan` полностью read-only. Материализация разрешена только командой
+`campaign plan --apply --source REPORT --backup DUMP`: свежесть/конфигурация Pilot A,
+PGDMP fingerprint, текущий диск, snapshot heap/PK, initial cohort jobs и reserve
+проверяются до первого INSERT в `collection_campaign_users`. Campaign, snapshot и
+первый cohort затем создаются одной транзакцией уже с immutable gate evidence.
 
 Частичный уникальный индекс PostgreSQL запрещает вторую активную кампанию одного типа
 при любом configuration hash. Hash включает только immutable planning configuration;
@@ -95,18 +105,32 @@ gate нет.
 paused full runs показываются в report, но не блокируют новую campaign и не
 возобновляются автоматически.
 
+Light-repair выбирает approved group gaps только по `GroupCollectionState`, обновляет
+`GroupCandidate`, `VKCommunity` и `GroupCollectionState` одним metadata batch workflow.
+Каждый cohort содержит не более 10 000 jobs, имеет deterministic bounds в immutable
+configuration и создаётся под PostgreSQL advisory transaction lock. Перед INSERT
+проверяются disk projection и reserve; следующий cohort создаётся повторным явным
+`light-repair --apply` после terminal предыдущего. Partial `groups.getById` использует
+persisted exponential backoff: три batch misses, затем single-ID diagnostics; второй
+single miss фиксирует conservative terminal unavailable. Transport/API errors в этот
+счётчик terminal misses не входят.
+
 ## CLI
 
 ```bash
 collector collection backlog --json
 collector collection campaign plan
-collector collection campaign plan --apply
+collector collection campaign plan --apply --source REPORT --backup DUMP
 collector collection campaign status [--campaign-id UUID]
+collector collection campaign control-decision
 collector collection campaign metadata-preview --campaign-id UUID
 collector collection campaign pause --campaign-id UUID
 collector collection campaign resume --campaign-id UUID
 collector collection method-limits [--method groups.get]
 collector collection light-repair [--apply]
+collector collection subscriptions pilot-preview
+collector collection subscriptions pilot --run-id UUID
+collector collection subscriptions cancel-pilot --run-id UUID --confirm
 collector collection repair-stale-leases
 collector collection repair-stale-leases --confirm
 ```
@@ -127,8 +151,9 @@ campaign нет достаточного измеренного healthy throughp
 3. Создать `pg_dump -Fc`, проверить `pg_restore --list` и SHA-256.
 4. Развернуть код и выполнить `alembic upgrade head`.
 5. Выполнить новый Pilot A только если нет свежего совместимого Gate A.
-6. `collection campaign plan --apply`, затем применить Gate A к первому run через
-   `collection capacity-apply --run-id ... --source ... --backup ...`.
+6. `collection campaign plan --apply --source ... --backup ...`; все gate checks
+   выполняются до materialized snapshot, отдельного post-snapshot `capacity-apply`
+   для первого discovery cohort нет.
 7. Проверить stub metadata NULL, bulk links, checkpoint, отсутствие новых deadlock,
    coverage и переход между cohort без нового pilot.
 8. После полного discovery проверить `metadata-preview`, затем маленький batch

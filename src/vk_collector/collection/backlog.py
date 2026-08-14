@@ -426,7 +426,9 @@ async def canonical_backlog(
             ),
             "data_provenance": {
                 "app_env": settings.app_env,
-                "production_verified": settings.app_env == "production",
+                "environment_is_production": settings.app_env == "production",
+                "production_snapshot_verified": False,
+                "verification_note": "APP_ENV является marker среды, а не доказательством среза",
             },
             "campaign_types_with_multiple_active": duplicate_active_campaign_types,
             "active_run_configuration_mismatches": runtime_configuration_mismatches,

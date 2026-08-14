@@ -45,6 +45,54 @@ ACTIVE_JOB_STATUSES = (
 )
 
 
+def choose_campaign_control_action(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Choose a phase-aware production-control action without mutating campaign state."""
+    if not rows:
+        return {"action": "pilot_required", "reason": "active campaign отсутствует"}
+    campaign_ids = {str(row["campaign_id"]) for row in rows}
+    if len(campaign_ids) != 1:
+        return {
+            "action": "operator_required",
+            "campaign_ids": sorted(campaign_ids),
+            "reason": "обнаружено несколько active campaign",
+        }
+    if any(not bool(row.get("compatible")) for row in rows):
+        return {
+            "action": "operator_required",
+            "campaign_ids": sorted(campaign_ids),
+            "reason": "campaign несовместима с runtime configuration",
+        }
+    if any(row.get("campaign_status") == CampaignStatus.PAUSED.value for row in rows):
+        return {
+            "action": "operator_paused",
+            "campaign_id": next(iter(campaign_ids)),
+            "reason": "campaign поставлена оператором на паузу",
+        }
+    paused = [row for row in rows if row.get("run_status") == "paused_capacity_limit"]
+    if len(paused) > 1:
+        return {
+            "action": "operator_required",
+            "campaign_ids": sorted(campaign_ids),
+            "run_ids": [str(row["run_id"]) for row in paused],
+            "reason": "несколько capacity-paused runs",
+        }
+    if paused:
+        row = paused[0]
+        scope = str(row["scope"])
+        return {
+            "action": "renew_metadata" if scope == "subscription_metadata" else "renew_discovery",
+            "campaign_id": next(iter(campaign_ids)),
+            "run_id": str(row["run_id"]),
+            "scope": scope,
+            "reason": "существующий phase run требует свежие report/backup/disk evidence",
+        }
+    return {
+        "action": "reuse_active",
+        "campaign_id": next(iter(campaign_ids)),
+        "reason": "active campaign уже имеет runnable или waiting work",
+    }
+
+
 class CampaignManager:
     """Plan and reconcile a fixed-snapshot phased subscription campaign."""
 
@@ -87,7 +135,16 @@ class CampaignManager:
             "apply": False,
             "campaign_type": "subscription_enrichment",
             "snapshot_users": users,
-            "estimated_snapshot_bytes": users * 96,
+            "snapshot_storage_estimate": {
+                "method": "local PostgreSQL 16 measurement with conservative rounding",
+                "heap_bytes": users * 64,
+                "primary_key_bytes": users * 48,
+                "initial_cohort_jobs_bytes": min(
+                    users, self._settings.collection_campaign_cohort_users
+                )
+                * 768,
+                "reserve_factor": 1.30,
+            },
             "cohort_users": self._settings.collection_campaign_cohort_users,
             "subscription_limit": self._settings.collection_subscriptions_max_per_user,
             "planning_configuration_hash": configuration_hash,
@@ -100,12 +157,43 @@ class CampaignManager:
             "initial_status": "paused_capacity_limit",
         }
 
-    async def plan(self) -> uuid.UUID:
+    async def control_decision(self) -> dict[str, object]:
+        """Return a read-only phase-aware decision for production hourly-control."""
+        configuration_hash = hashlib.sha256(
+            json.dumps(self.configuration(), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(CollectionCampaign, CollectionRun)
+                    .outerjoin(CollectionRun, CollectionRun.campaign_id == CollectionCampaign.id)
+                    .where(CollectionCampaign.status.in_(ACTIVE_CAMPAIGN_STATUSES))
+                    .order_by(CollectionCampaign.created_at, CollectionRun.created_at)
+                )
+            ).all()
+        payload = [
+            {
+                "campaign_id": campaign.id,
+                "campaign_status": campaign.status,
+                "compatible": campaign.configuration_hash == configuration_hash,
+                "run_id": run.id if run is not None else None,
+                "scope": run.scope if run is not None else None,
+                "run_status": run.status.value if run is not None else None,
+            }
+            for campaign, run in rows
+        ]
+        return {"campaigns": payload, "decision": choose_campaign_control_action(payload)}
+
+    async def plan(self, *, gate_evidence: dict[str, object]) -> uuid.UUID:
         """Create or reuse one active campaign for the exact configuration."""
+        if gate_evidence.get("decision") != "passed":
+            raise ValueError("Campaign materialization требует проверенный capacity gate")
         configuration = self.configuration()
         configuration_hash = hashlib.sha256(
             json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        if gate_evidence.get("planning_configuration_hash") != configuration_hash:
+            raise ValueError("Capacity evidence относится к другой planning configuration")
         now = datetime.now(UTC)
         async with self._sessions() as session:
             await session.execute(
@@ -128,6 +216,16 @@ class CampaignManager:
                         "immutable planning configuration"
                     )
                 return existing.id
+            eligible_count = int(
+                await session.scalar(
+                    select(func.count(VKUser.vk_id)).where(self._eligible_user_predicate(now))
+                )
+                or 0
+            )
+            if gate_evidence.get("snapshot_users") != eligible_count:
+                raise ValueError(
+                    "Eligible snapshot изменился после preview; повторите capacity checks"
+                )
             snapshot_max = int(
                 await session.scalar(
                     select(func.coalesce(func.max(VKUser.vk_id), 0)).where(
@@ -145,6 +243,11 @@ class CampaignManager:
                 configuration=configuration,
                 configuration_hash=configuration_hash,
             )
+            campaign.configuration = {
+                **campaign.configuration,
+                "capacity_gate": "passed",
+                **gate_evidence,
+            }
             session.add(campaign)
             await session.flush()
             snapshot_select = select(literal(campaign.id), VKUser.vk_id).where(
@@ -164,10 +267,23 @@ class CampaignManager:
                 )
                 or 0
             )
-            if await self._plan_discovery_cohort(session, campaign) is None:
+            if campaign.snapshot_user_count != eligible_count:
+                raise ValueError(
+                    "Eligible snapshot изменился во время materialization; "
+                    "transaction отменена, повторите capacity checks"
+                )
+            if campaign.snapshot_user_count == 0:
                 campaign.status = CampaignStatus.COMPLETED.value
                 campaign.phase = CampaignPhase.COMPLETED.value
                 campaign.finished_at = now
+                campaign.error_message = "Snapshot пуст; campaign завершена без jobs"
+            elif await self._plan_discovery_cohort(session, campaign) is None:
+                campaign.phase = CampaignPhase.SUBSCRIPTION_METADATA.value
+                campaign.last_metadata_vk_id = 0
+                if await self._plan_metadata_cohort(session, campaign) is None:
+                    campaign.status = CampaignStatus.COMPLETED.value
+                    campaign.phase = CampaignPhase.COMPLETED.value
+                    campaign.finished_at = now
             await session.commit()
             return campaign.id
 

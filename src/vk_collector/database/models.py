@@ -419,8 +419,6 @@ class CollectionCampaignUser(Base):
     """Minimal immutable user-ID snapshot belonging to one campaign."""
 
     __tablename__ = "collection_campaign_users"
-    __table_args__ = (Index("ix_collection_campaign_users_plan", "campaign_id", "user_id"),)
-
     campaign_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("collection_campaigns.id", ondelete="CASCADE"),

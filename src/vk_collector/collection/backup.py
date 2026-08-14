@@ -10,7 +10,7 @@ class BackupVerifier:
     def __init__(self) -> None:
         self._verified: set[tuple[str, int, int, str]] = set()
 
-    def fingerprint(self, backup: Path) -> dict[str, object]:
+    def fingerprint(self, backup: Path, *, cache: bool = True) -> dict[str, object]:
         """Read and hash a PostgreSQL custom-format backup."""
         resolved, size, modified_ns = self._stat(backup)
         digest = hashlib.sha256()
@@ -30,7 +30,8 @@ class BackupVerifier:
             "modified_ns": modified_ns,
             "sha256": digest.hexdigest(),
         }
-        self._verified.add(self._cache_key(metadata))
+        if cache:
+            self._verified.add(self._cache_key(metadata))
         return metadata
 
     def verify(self, backup: Path, expected: dict[str, object]) -> dict[str, object]:
@@ -46,10 +47,10 @@ class BackupVerifier:
         key = self._cache_key(expected)
         if key in self._verified:
             return dict(expected)
-        actual = self.fingerprint(resolved)
+        actual = self.fingerprint(resolved, cache=False)
         if actual != expected:
-            self._verified.discard(key)
             raise ValueError("Проверенный backup отсутствует или изменился после capacity-apply")
+        self._verified.add(key)
         return actual
 
     @staticmethod

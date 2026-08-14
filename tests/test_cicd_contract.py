@@ -218,7 +218,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20260815_0009",
+        "20260815_0010",
     )
     assert all(item in script for item in required)
     forbidden = (
@@ -253,18 +253,22 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
 
     required = (
         "flock -n",
-        "20260815_0009",
+        "20260815_0010",
         "collection subscriptions pilot",
         "subscription-gate-a.json",
         "production_allowed",
         "collection campaign plan --apply",
         "collection capacity-apply",
+        "pilot-control-decision",
+        "campaign control-decision",
+        "pilot --run-id",
+        "cancel-pilot --run-id ID --confirm",
         "--backup",
         "setfacl -m u:10001:r",
         "setfacl -m u:10001:rx",
         'chmod 0700 "$backup_dir"',
         "Collector UID не может прочитать PGDMP header",
-        "Пробую применить уже измеренный Gate A",
+        "Пробую renewal Gate A",
         "COLLECTION_SUBSCRIPTIONS_MAX_PER_USER 50",
         "compose stop -t 360 collector-worker",
         "compose up -d --no-deps --no-build collector-worker",
@@ -274,7 +278,6 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "Подходящих пользователей для новой cohort сейчас нет",
         "collection_campaigns",
         "subscription_discovery",
-        "unfinished_pilots",
         "distinct_entities",
         "stale_running_leases",
         "sanitized_message",
@@ -286,7 +289,7 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "безопасный self-heal",
         "'subscription_discovery','subscription_metadata'",
         "deferred_pilot",
-        "продолжение выполнит следующий hourly-control",
+        "следующий hourly-control выберет тот же run ID",
     )
     assert all(item in script for item in required)
     active_run_query = script.split("active_runs=$(", 1)[1].split(
@@ -294,8 +297,11 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
     )[0]
     assert "'full'" not in active_run_query
     assert "'incremental'" not in active_run_query
+    assert "subscriptions_pilot" not in active_run_query
     assert "paused_capacity_limit" not in active_run_query
     assert "Переиспользую paused-capacity campaign" in script
+    assert 'collection subscriptions pilot --run-id "$pilot_run_id"' in script
+    assert '--run-id "$renew_run_id"' in script
     forbidden = (
         "capacity_gate = 'passed'",
         "UPDATE collection_runs",

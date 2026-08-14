@@ -26,6 +26,7 @@ from vk_collector.database.models import (
     CollectionRunStatus,
     CommunityPostCollectionState,
     GroupCandidate,
+    GroupCollectionState,
     GroupLabel,
     GroupMembership,
     GroupPost,
@@ -786,14 +787,22 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
                     )
                     await session.commit()
                 manager = CampaignManager(sessions, settings)
-                campaign_id = await manager.plan()
-                assert await manager.plan() == campaign_id
+                gate = {
+                    "decision": "passed",
+                    **{
+                        key: (await manager.plan_preview())[key]
+                        for key in ("planning_configuration_hash", "snapshot_users")
+                    },
+                    "capacity_report": "test",
+                }
+                campaign_id = await manager.plan(gate_evidence=gate)
+                assert await manager.plan(gate_evidence=gate) == campaign_id
                 incompatible = CampaignManager(
                     sessions,
                     settings.model_copy(update={"collection_community_metadata_ttl_days": 32}),
                 )
-                with pytest.raises(ValueError, match="другой immutable planning"):
-                    await incompatible.plan()
+                with pytest.raises(ValueError, match=r"другой.*planning"):
+                    await incompatible.plan(gate_evidence=gate)
                 async with sessions() as session:
                     campaign = await session.get(CollectionCampaign, campaign_id)
                     assert campaign is not None
@@ -1028,6 +1037,18 @@ async def test_metadata_batch_partial_deactivated_and_transient_are_safe() -> No
                             for index in range(5)
                         ]
                     )
+                    deactivated_candidate = GroupCandidate(
+                        id=marker + 10_000,
+                        vk_id=marker + 1,
+                        name="Удалено",
+                        description="",
+                        status_text="",
+                        address=f"https://vk.com/{marker + 1}",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        classification_status=ClassificationStatus.APPROVED,
+                    )
+                    session.add(deactivated_candidate)
                     partial_run = CollectionRun(
                         scope="subscription_metadata", status=CollectionRunStatus.PLANNED
                     )
@@ -1063,10 +1084,12 @@ async def test_metadata_batch_partial_deactivated_and_transient_are_safe() -> No
                     )
                     deleted = await session.get(VKCommunity, marker + 1)
                     missing = await session.get(VKCommunity, marker + 2)
+                    deactivated_state = await session.get(GroupCollectionState, marker + 10_000)
                     assert statuses[marker] == JobStatus.COMPLETED
                     assert statuses[marker + 1] == JobStatus.COMPLETED
                     assert statuses[marker + 2] == JobStatus.RETRY_WAIT
                     assert deleted is not None and deleted.deactivated == "deleted"
+                    assert deactivated_state is not None and deactivated_state.unavailable
                     assert missing is not None and missing.deactivated is None
 
                     transient_run = CollectionRun(
@@ -1103,6 +1126,18 @@ async def test_metadata_batch_partial_deactivated_and_transient_are_safe() -> No
                         ).all()
                     )
                     assert transient_statuses == {JobStatus.PENDING, JobStatus.RETRY_WAIT}
+                    transient_checkpoints = list(
+                        (
+                            await session.scalars(
+                                select(CollectionJob.checkpoint).where(
+                                    CollectionJob.collection_run_id == transient_run_id
+                                )
+                            )
+                        ).all()
+                    )
+                    assert all(
+                        "metadata_miss_count" not in value for value in transient_checkpoints
+                    )
             finally:
                 await outer.rollback()
     finally:

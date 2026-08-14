@@ -54,6 +54,7 @@ class _MethodState:
     consecutive_flood_hits: int = 0
     consecutive_quota_hits: int = 0
     last_error_code: int | None = None
+    last_error_at: float | None = None
     last_success_at: float | None = None
     next_probe_at: float = 0.0
 
@@ -171,13 +172,17 @@ class TokenPool:
                 )
                 if not method_capable:
                     retry_at = min(method_retry) if method_retry else None
-                    codes = [
-                        state.methods[method].last_error_code
+                    events = [
+                        (
+                            state.methods[method].last_error_at or float("-inf"),
+                            state.methods[method].last_error_code,
+                        )
                         for state in enabled
                         if method in state.methods
                         and state.methods[method].last_error_code in {9, 29}
                     ]
-                    raise VKMethodUnavailable(method, retry_at, codes[-1] if codes else None)
+                    latest_code = max(events, default=(0.0, None), key=lambda item: item[0])[1]
+                    raise VKMethodUnavailable(method, retry_at, latest_code)
                 wait_until = min(global_retry) if global_retry else now + self._probe_seconds
             await self._sleep(max(0.0, wait_until - self._clock()))
 
@@ -239,6 +244,7 @@ class TokenPool:
             method_state.blocked_until = max(method_state.blocked_until, now + duration)
             method_state.next_probe_at = min(method_state.blocked_until, now + self._probe_seconds)
             method_state.last_error_code = error_code
+            method_state.last_error_at = self._clock()
             state.limit_events = [
                 event for event in state.limit_events if event[0] >= now - self._escalation_window
             ]
@@ -594,12 +600,17 @@ class TokenPool:
                 await session.commit()
                 if not method_capable:
                     delay = max(0.0, (min(method_retry) - now_dt).total_seconds())
-                    codes = [
-                        row.last_error_code for row in method_rows if row.last_error_code in {9, 29}
+                    events = [
+                        (row.last_error_at or datetime.min.replace(tzinfo=UTC), row.last_error_code)
+                        for row in method_rows
+                        if row.last_error_code in {9, 29}
                     ]
-                    raise VKMethodUnavailable(
-                        method, self._clock() + delay, codes[-1] if codes else None
-                    )
+                    latest_code = max(
+                        events,
+                        default=(datetime.min.replace(tzinfo=UTC), None),
+                        key=lambda item: item[0],
+                    )[1]
+                    raise VKMethodUnavailable(method, self._clock() + delay, latest_code)
                 wait_for = (
                     max(0.0, (min(global_retry) - now_dt).total_seconds())
                     if global_retry

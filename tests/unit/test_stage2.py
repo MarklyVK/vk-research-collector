@@ -10,17 +10,20 @@ from pydantic import SecretStr, ValidationError
 
 from vk_collector.cli.app import _validate_autonomous_run, _validated_backup_metadata
 from vk_collector.collection.backup import BackupVerifier
+from vk_collector.collection.campaigns import choose_campaign_control_action
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
     write_capacity_report,
 )
 from vk_collector.collection.notifications import notify
+from vk_collector.collection.pilots import choose_pilot_control_action
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import bounded_wakeup_delay
 from vk_collector.collection.safety import inspect_disk, sanitize_message
 from vk_collector.collection.worker import normalize_attachment
 from vk_collector.config import Settings
+from vk_collector.vk import TokenPool, VKMethodUnavailable
 
 
 def test_blank_optional_limits_are_supported() -> None:
@@ -38,6 +41,89 @@ def test_subscription_limit_accepts_50_but_rejects_more() -> None:
     )
     with pytest.raises(ValidationError):
         Settings(collection_subscriptions_max_per_user=51)
+
+
+def test_pilot_control_decision_is_run_id_specific_and_terminal_safe() -> None:
+    base = {
+        "run_id": str(uuid.uuid4()),
+        "classification": "compatible_recoverable",
+        "nearest_retry": None,
+        "scope": "subscriptions_pilot",
+    }
+    assert choose_pilot_control_action([base]) == {
+        "action": "resume",
+        "run_id": base["run_id"],
+        "scope": "subscriptions_pilot",
+        "reason": "compatible_recoverable",
+    }
+    waiting = {
+        **base,
+        "classification": "waiting",
+        "nearest_retry": "2026-08-15T12:00:00+00:00",
+    }
+    assert choose_pilot_control_action([waiting])["action"] == "wait"
+    stale = {**base, "classification": "stale_running_lease"}
+    assert choose_pilot_control_action([stale])["action"] == "resume"
+    incompatible = {**base, "classification": "incompatible_configuration"}
+    assert (
+        choose_pilot_control_action([incompatible, {**incompatible, "run_id": "other"}])["action"]
+        == "operator_required"
+    )
+    terminal = {**base, "classification": "terminal"}
+    assert choose_pilot_control_action([terminal])["action"] == "create"
+
+
+def test_campaign_control_renews_existing_metadata_run_not_discovery() -> None:
+    campaign_id = str(uuid.uuid4())
+    discovery_id = str(uuid.uuid4())
+    metadata_id = str(uuid.uuid4())
+    rows: list[dict[str, object]] = [
+        {
+            "campaign_id": campaign_id,
+            "campaign_status": "paused_capacity_limit",
+            "compatible": True,
+            "run_id": discovery_id,
+            "scope": "subscription_discovery",
+            "run_status": "completed",
+        },
+        {
+            "campaign_id": campaign_id,
+            "campaign_status": "paused_capacity_limit",
+            "compatible": True,
+            "run_id": metadata_id,
+            "scope": "subscription_metadata",
+            "run_status": "paused_capacity_limit",
+        },
+    ]
+    decision = choose_campaign_control_action(rows)
+    assert decision["action"] == "renew_metadata"
+    assert decision["run_id"] == metadata_id
+    assert decision["scope"] == "subscription_metadata"
+
+
+@pytest.mark.asyncio
+async def test_mixed_method_codes_choose_latest_causal_event() -> None:
+    current = [100.0]
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    pool = TokenPool(
+        ("token-a", "token-b"),
+        rps=100,
+        clock=lambda: current[0],
+        sleep=no_sleep,
+        flood_initial_cooldown=1000,
+        quota_initial_cooldown=1000,
+    )
+    first = await pool.acquire("groups.get")
+    await pool.method_cooldown(first, 9)
+    current[0] += 1
+    second = await pool.acquire("groups.get")
+    await pool.method_cooldown(second, 29)
+    with pytest.raises(VKMethodUnavailable) as captured:
+        await pool.acquire("groups.get")
+    assert captured.value.error_code == 29
 
 
 def test_secret_masking_removes_tokens_and_database_urls() -> None:
@@ -303,6 +389,18 @@ def test_backup_stat_change_stops_before_cached_use(tmp_path: Path) -> None:
     backup.write_bytes(b"PGDMP\x01changed-size-content")
     with pytest.raises(ValueError, match="изменился"):
         verifier.verify(backup, expected)
+
+
+def test_backup_mismatch_is_not_cached_as_verified(tmp_path: Path) -> None:
+    backup = tmp_path / "mismatch.dump"
+    backup.write_bytes(b"PGDMP\x01same-stat-content")
+    expected = BackupVerifier().fingerprint(backup)
+    mismatched = {**expected, "sha256": "0" * 64}
+    verifier = BackupVerifier()
+    with pytest.raises(ValueError, match="изменился"):
+        verifier.verify(backup, mismatched)
+    assert not verifier._verified  # mismatch не должен становиться успешным cache entry
+    assert verifier.verify(backup, expected) == expected
 
 
 @pytest.mark.asyncio
