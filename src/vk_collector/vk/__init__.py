@@ -2,7 +2,7 @@
 
 from .client import VKClient
 from .errors import VKAPIError, VKError, VKMethodUnavailable, VKTokensUnavailable
-from .models import VKGroup, VKSearchPage
+from .models import VKGroup, VKSearchPage, VKSubscriptionIDsPage
 from .tokens import TokenLease, TokenPool, load_tokens, token_fingerprint
 
 __all__ = [
@@ -14,6 +14,7 @@ __all__ = [
     "VKGroup",
     "VKMethodUnavailable",
     "VKSearchPage",
+    "VKSubscriptionIDsPage",
     "VKTokensUnavailable",
     "load_tokens",
     "token_fingerprint",

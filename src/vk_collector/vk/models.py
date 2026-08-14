@@ -36,3 +36,15 @@ class VKSearchPage:
     raw_count: int = 0
     private_count: int = 0
     deleted_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class VKSubscriptionIDsPage:
+    """Normalized ID-only page returned by ``groups.get``."""
+
+    total_reported: int
+    group_ids: tuple[int, ...]
+    offset: int
+    requested_count: int
+    returned_count: int
+    next_offset: int

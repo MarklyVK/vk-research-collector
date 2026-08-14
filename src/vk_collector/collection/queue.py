@@ -15,7 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from vk_collector.collection.notifications import notify
 from vk_collector.config import Settings
 from vk_collector.database.models import (
+    CampaignStatus,
     ClassificationStatus,
+    CollectionCampaign,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
@@ -124,6 +126,11 @@ class CollectionQueue:
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
             "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,
             "subscriptions_ttl_days": self._settings.collection_subscriptions_ttl_days,
+            "campaign_cohort_users": self._settings.collection_campaign_cohort_users,
+            "community_metadata_batch_size": (
+                self._settings.collection_community_metadata_batch_size
+            ),
+            "community_metadata_ttl_days": (self._settings.collection_community_metadata_ttl_days),
             "subscription_pilot_users": self._settings.collection_subscription_pilot_users,
             "subscription_pilot_min_users": (
                 self._settings.collection_subscription_pilot_min_users
@@ -353,9 +360,12 @@ class CollectionQueue:
                 )
                 .values(
                     status=JobStatus.PENDING,
+                    attempt_count=func.greatest(CollectionJob.attempt_count - 1, 0),
                     locked_at=None,
                     locked_by=None,
                     heartbeat_at=None,
+                    last_error_type="lease_expired_recovered",
+                    last_error_message="Истёк lease; job безопасно возвращён в pending",
                 )
             )
             await session.commit()
@@ -375,6 +385,7 @@ class CollectionQueue:
             "members": "collect_group_members",
             "users": "refresh_user_profile",
             "subscriptions": "collect_user_subscriptions",
+            "metadata": "refresh_community_metadata",
             "subscription_posts": "collect_subscription_group_posts",
         }.get(scope or "")
         async with self._sessions() as session:
@@ -719,6 +730,53 @@ class CollectionQueue:
             await session.commit()
             return claimed
 
+    async def claim_metadata_batch(self, run_id: uuid.UUID, *, limit: int) -> list[ClaimedJob]:
+        """Claim extra community metadata jobs for one groups.getById request."""
+        if limit <= 0:
+            return []
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            jobs = list(
+                (
+                    await session.scalars(
+                        select(CollectionJob)
+                        .where(
+                            CollectionJob.collection_run_id == run_id,
+                            CollectionJob.job_type == "refresh_community_metadata",
+                            CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY_WAIT]),
+                            or_(
+                                CollectionJob.next_attempt_at.is_(None),
+                                CollectionJob.next_attempt_at <= now,
+                            ),
+                        )
+                        .order_by(CollectionJob.entity_id)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+            claimed: list[ClaimedJob] = []
+            for job in jobs:
+                job.status = JobStatus.RUNNING
+                job.locked_at = now
+                job.heartbeat_at = now
+                job.locked_by = self._settings.collection_worker_id
+                job.started_at = job.started_at or now
+                job.attempt_count += 1
+                claimed.append(
+                    ClaimedJob(
+                        job.id,
+                        job.collection_run_id,
+                        job.job_type,
+                        job.entity_type,
+                        job.entity_id,
+                        dict(job.checkpoint),
+                        job.attempt_count,
+                    )
+                )
+            await session.commit()
+            return claimed
+
     async def release(self, jobs: list[ClaimedJob]) -> None:
         """Вернуть дополнительные batch jobs после неуспешного общего API-запроса."""
         if not jobs:
@@ -729,6 +787,7 @@ class CollectionQueue:
                 .where(CollectionJob.id.in_([job.id for job in jobs]))
                 .values(
                     status=JobStatus.PENDING,
+                    attempt_count=func.greatest(CollectionJob.attempt_count - 1, 0),
                     locked_at=None,
                     locked_by=None,
                     heartbeat_at=None,
@@ -762,6 +821,14 @@ class CollectionQueue:
                 job.finished_at = now
             await session.commit()
         await self.refresh_run(job.collection_run_id)
+        async with self._sessions() as session:
+            campaign_id = await session.scalar(
+                select(CollectionRun.campaign_id).where(CollectionRun.id == job.collection_run_id)
+            )
+        if campaign_id is not None:
+            from vk_collector.collection.campaigns import CampaignManager
+
+            await CampaignManager(self._sessions, self._settings).reconcile(campaign_id)
 
     async def defer_method(self, job: ClaimedJob, *, retry_at: datetime, message: str) -> None:
         """Отложить job из-за method limit, не расходуя обычную попытку."""
@@ -784,6 +851,18 @@ class CollectionQueue:
                     retry_at if run.next_wakeup_at is None else min(run.next_wakeup_at, retry_at)
                 )
                 run.error_message = message
+                if run.campaign_id is not None:
+                    campaign = await session.get(
+                        CollectionCampaign, run.campaign_id, with_for_update=True
+                    )
+                    if campaign is not None:
+                        campaign.status = CampaignStatus.WAITING_METHOD_LIMIT.value
+                        campaign.next_wakeup_at = (
+                            retry_at
+                            if campaign.next_wakeup_at is None
+                            else min(campaign.next_wakeup_at, retry_at)
+                        )
+                        campaign.error_message = message
             await session.commit()
 
     async def pending_job_types(self, run_id: uuid.UUID) -> set[str]:

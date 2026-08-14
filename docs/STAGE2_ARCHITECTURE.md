@@ -180,3 +180,10 @@ Subscription planner исключает как свежие успешные с�
 принимает только реальный pilot с минимальным числом наблюдений, положительным ростом,
 нулём failed jobs и прогнозом в пределах 7 GiB и свободного места. Production run также
 привязан к неизменному backup по пути, размеру, mtime и SHA-256.
+# Дополнение: phased subscription campaign
+
+Актуальная схема discovery -> metadata и durable campaign описана в
+`docs/PHASED_SUBSCRIPTION_IMPLEMENTATION.md`. Discovery использует только integer
+ID и bulk writes; metadata jobs не существуют до полного завершения snapshot.
+Worker планирует разрешённые run round-robin по VK method, поэтому endpoint cooldown
+не останавливает независимый backlog.

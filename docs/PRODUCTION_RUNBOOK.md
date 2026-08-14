@@ -113,3 +113,10 @@ docker compose -f compose.yaml -f compose.production.yaml run --rm collector \
 
 Deploy не создаёт search или incremental run автоматически. Их разрешает оператор
 только после полной reclassification, импорта, независимого аудита и capacity gate.
+# Дополнение: rollout phased subscriptions
+
+Production rollout не выполняется автоматически. Последовательность, стоп-условия,
+Gate A inheritance и запрет subscription posts приведены в
+`docs/PHASED_SUBSCRIPTION_IMPLEMENTATION.md`. Перед любым apply обязательны
+read-only backlog, проверка active pilot/campaign/run, method states, диск,
+`pg_dump -Fc`, `pg_restore --list` и SHA-256.

@@ -218,7 +218,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20260810_0007",
+        "20260815_0008",
     )
     assert all(item in script for item in required)
     forbidden = (
@@ -253,11 +253,11 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
 
     required = (
         "flock -n",
-        "20260810_0007",
+        "20260815_0008",
         "collection subscriptions pilot",
         "subscription-gate-a.json",
         "production_allowed",
-        "collection subscriptions plan",
+        "collection campaign plan --apply",
         "collection capacity-apply",
         "--backup",
         "setfacl -m u:10001:r",
@@ -270,10 +270,13 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "compose up -d --no-deps --no-build collector-worker",
         "group_keyword_matches",
         "vk_token_method_states",
-        "Следующая cohort пока не нужна",
+        "Дубли не создаются",
         "Подходящих пользователей для новой cohort сейчас нет",
-        "created_at > coalesce",
-        "status::text IN ('completed','completed_with_errors')",
+        "collection_campaigns",
+        "subscription_discovery",
+        "unfinished_pilots",
+        "distinct_entities",
+        "stale_running_leases",
         "sanitized_message",
         "j.status = 'failed'",
         "for pilot_attempt in 1 2 3",
@@ -281,7 +284,7 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "terminal-состояний",
         "ensure_worker_healthy",
         "безопасный self-heal",
-        "scope IN ('full','incremental','subscriptions','subscription_posts')",
+        "'subscription_discovery','subscription_metadata'",
         "deferred_pilot",
         "продолжение выполнит следующий hourly-control",
     )

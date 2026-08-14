@@ -28,13 +28,13 @@ def test_blank_optional_limits_are_supported() -> None:
     assert settings.collection_subscriptions_max_per_user == 50
 
 
-def test_subscription_limit_accepts_100_but_rejects_more() -> None:
+def test_subscription_limit_accepts_50_but_rejects_more() -> None:
     assert (
-        Settings(collection_subscriptions_max_per_user=100).collection_subscriptions_max_per_user
-        == 100
+        Settings(collection_subscriptions_max_per_user=50).collection_subscriptions_max_per_user
+        == 50
     )
     with pytest.raises(ValidationError):
-        Settings(collection_subscriptions_max_per_user=101)
+        Settings(collection_subscriptions_max_per_user=51)
 
 
 def test_secret_masking_removes_tokens_and_database_urls() -> None:

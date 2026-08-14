@@ -47,7 +47,14 @@ async def latest_runnable_run_id(
             select(CollectionRun.id)
             .where(
                 CollectionRun.scope.in_(
-                    ["full", "incremental", "subscriptions", "subscription_posts"]
+                    [
+                        "full",
+                        "incremental",
+                        "subscriptions",
+                        "subscription_posts",
+                        "subscription_discovery",
+                        "subscription_metadata",
+                    ]
                 ),
                 CollectionRun.status.in_(
                     [
@@ -62,6 +69,41 @@ async def latest_runnable_run_id(
             .limit(1)
         )
         return run_id
+
+
+async def runnable_run_ids(
+    sessions: async_sessionmaker[AsyncSession],
+) -> list[uuid.UUID]:
+    """Return every operator-authorized non-pilot run for fair autonomous scheduling."""
+    async with sessions() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(CollectionRun.id)
+                    .where(
+                        CollectionRun.scope.in_(
+                            [
+                                "full",
+                                "incremental",
+                                "subscriptions",
+                                "subscription_posts",
+                                "subscription_discovery",
+                                "subscription_metadata",
+                            ]
+                        ),
+                        CollectionRun.status.in_(
+                            [
+                                CollectionRunStatus.PLANNED,
+                                CollectionRunStatus.RUNNING,
+                                CollectionRunStatus.WAITING_METHOD_LIMIT,
+                            ]
+                        ),
+                        CollectionRun.configuration["capacity_gate"].astext == "passed",
+                    )
+                    .order_by(CollectionRun.created_at, CollectionRun.id)
+                )
+            ).all()
+        )
 
 
 async def run_summary(

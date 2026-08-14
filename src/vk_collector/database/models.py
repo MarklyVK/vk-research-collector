@@ -19,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -59,6 +60,27 @@ class CollectionRunStatus(StrEnum):
     WAITING_METHOD_LIMIT = "waiting_method_limit"
     COMPLETED = "completed"
     COMPLETED_WITH_ERRORS = "completed_with_errors"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class CampaignStatus(StrEnum):
+    PLANNED = "planned"
+    RUNNING = "running"
+    PAUSED = "paused"
+    WAITING_METHOD_LIMIT = "waiting_method_limit"
+    PAUSED_CAPACITY_LIMIT = "paused_capacity_limit"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class CampaignPhase(StrEnum):
+    SUBSCRIPTION_DISCOVERY = "subscription_discovery"
+    SUBSCRIPTION_METADATA = "subscription_metadata"
+    WAITING_METHOD_LIMIT = "waiting_method_limit"
+    PAUSED_CAPACITY_LIMIT = "paused_capacity_limit"
+    COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -332,11 +354,76 @@ class ClassificationReview(Base):
     )
 
 
-class CollectionRun(TimestampMixin, Base):
-    __tablename__ = "collection_runs"
-    __table_args__ = (Index("ix_collection_runs_status_created_at", "status", "created_at"),)
+class CollectionCampaign(TimestampMixin, Base):
+    """Durable fixed-snapshot orchestration for phased subscription enrichment."""
+
+    __tablename__ = "collection_campaigns"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('planned','running','paused','waiting_method_limit',"
+            "'paused_capacity_limit','completed','failed','cancelled')",
+            name="collection_campaign_status_allowed",
+        ),
+        CheckConstraint(
+            "phase IN ('subscription_discovery','subscription_metadata',"
+            "'waiting_method_limit','paused_capacity_limit','completed','failed','cancelled')",
+            name="collection_campaign_phase_allowed",
+        ),
+        Index("ix_collection_campaigns_status_phase", "status", "phase", "created_at"),
+        Index(
+            "uq_collection_campaigns_active_configuration",
+            "campaign_type",
+            "configuration_hash",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('planned','running','paused','waiting_method_limit',"
+                "'paused_capacity_limit')"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default=CampaignStatus.PLANNED, server_default="planned"
+    )
+    phase: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default=CampaignPhase.SUBSCRIPTION_DISCOVERY,
+        server_default="subscription_discovery",
+    )
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    snapshot_max_user_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    configuration: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    configuration_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_planned_user_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    last_metadata_vk_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_wakeup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class CollectionRun(TimestampMixin, Base):
+    __tablename__ = "collection_runs"
+    __table_args__ = (
+        Index("ix_collection_runs_status_created_at", "status", "created_at"),
+        Index("ix_collection_runs_campaign_status", "campaign_id", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_campaigns.id", ondelete="SET NULL")
+    )
     scope: Mapped[str] = mapped_column(String(50), nullable=False)
     status: Mapped[CollectionRunStatus] = mapped_column(
         Enum(
@@ -621,6 +708,9 @@ class VKCommunity(Base):
 
 class UserSubscriptionState(Base):
     __tablename__ = "user_subscription_states"
+    __table_args__ = (
+        Index("ix_user_subscription_states_campaign", "last_campaign_id", "last_success_at"),
+    )
 
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), primary_key=True
@@ -631,9 +721,14 @@ class UserSubscriptionState(Base):
     collected_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     collected_limit: Mapped[int] = mapped_column(Integer, nullable=False, server_default="50")
     privacy_denied: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    terminal_reason: Mapped[str | None] = mapped_column(String(100))
     last_error_code: Mapped[int | None] = mapped_column(Integer)
     last_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+    last_campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_campaigns.id", ondelete="SET NULL")
     )
     next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -698,6 +793,8 @@ class VKTokenMethodState(Base):
     last_error_code: Mapped[int | None] = mapped_column(Integer)
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    successful_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cooldown_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

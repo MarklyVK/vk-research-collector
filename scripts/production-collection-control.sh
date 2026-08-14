@@ -186,6 +186,20 @@ SELECT id, scope, status::text AS status, created_at, started_at, finished_at,
        left(coalesce(error_message, ''), 180) AS error
 FROM collection_runs ORDER BY created_at DESC LIMIT 10;
 
+\echo '=== КАМПАНИИ И КАНОНИЧЕСКИЙ BACKLOG ==='
+SELECT id, campaign_type, status, phase, snapshot_at, started_at, finished_at,
+       next_wakeup_at, left(coalesce(error_message, ''), 180) AS error
+FROM collection_campaigns ORDER BY created_at DESC LIMIT 10;
+
+SELECT job_type, status::text AS status, count(*) AS job_rows,
+       count(DISTINCT (entity_type, entity_id)) AS distinct_entities
+FROM collection_jobs GROUP BY job_type, status ORDER BY job_type, status;
+
+SELECT count(*) FILTER (WHERE status='running' AND locked_at < now() - interval '5 minutes')
+         AS stale_running_leases,
+       count(*) FILTER (WHERE status IN ('pending','retry_wait')) AS queued_rows
+FROM collection_jobs;
+
 \echo '=== ОШИБКИ И METHOD-AWARE COOLDOWN ==='
 SELECT endpoint, error_category, coalesce(vk_error_code, 0) AS vk_error_code, count(*) AS errors
 FROM collection_job_errors GROUP BY endpoint, error_category, vk_error_code
@@ -221,15 +235,35 @@ SQL
 }
 
 start_subscriptions() {
-  local active_runs gate_applied latest_backup pilot_attempt pilot_state plan_state report_path
+  local active_campaigns active_runs unfinished_pilots gate_applied latest_backup
+  local pilot_attempt pilot_state plan_state report_path
   local deferred_pilot production_allowed plan_output retryable_pilot run_id
+  active_campaigns=$(psql_query -Atqc \
+    "SELECT count(*) FROM collection_campaigns
+      WHERE campaign_type='subscription_enrichment'
+        AND status IN ('planned','running','paused','waiting_method_limit','paused_capacity_limit')")
   active_runs=$(psql_query -Atqc \
     "SELECT count(*)
        FROM collection_runs
-      WHERE scope IN ('full','incremental','subscriptions','subscription_posts')
-        AND status::text IN ('planned','running','waiting_method_limit')")
-  if [[ "$active_runs" != 0 ]]; then
-    log "Активных collection runs: $active_runs. Следующая cohort пока не нужна."
+      WHERE scope IN ('full','incremental','subscriptions','subscription_posts',
+                      'subscription_discovery','subscription_metadata',
+                      'subscriptions_pilot','subscription_posts_pilot')
+        AND status::text IN ('planned','running','paused','paused_no_tokens',
+                             'paused_capacity_limit','waiting_method_limit')")
+  unfinished_pilots=$(psql_query -Atqc \
+    "SELECT count(*) FROM collection_runs
+      WHERE scope IN ('subscriptions_pilot','subscription_posts_pilot')
+        AND status::text IN ('planned','running','paused','paused_no_tokens',
+                             'waiting_method_limit')")
+  if [[ "$unfinished_pilots" != 0 ]]; then
+    log "Найдены незавершённые pilot: $unfinished_pilots. Новый pilot/run не создаётся."
+    collector collection backlog
+    return
+  fi
+  if [[ "$active_campaigns" != 0 || "$active_runs" != 0 ]]; then
+    log "Активные кампании=$active_campaigns, runs=$active_runs. Дубли не создаются."
+    collector collection campaign status
+    collector collection backlog
     return
   fi
 
@@ -256,18 +290,13 @@ start_subscriptions() {
   report_path="$DEPLOY_DIR/exports/stage2-pilot/subscription-gate-a.json"
   gate_applied=0
   run_id=$(psql_query -Atqc \
-    "SELECT id
-       FROM collection_runs
-      WHERE scope='subscriptions'
-        AND status::text='paused_capacity_limit'
-        AND created_at > coalesce(
-          (SELECT max(finished_at)
-             FROM collection_runs
-            WHERE scope='subscriptions'
-              AND status::text IN ('completed','completed_with_errors')),
-          '-infinity'::timestamptz
-        )
-      ORDER BY created_at DESC
+    "SELECT r.id
+       FROM collection_runs r
+       JOIN collection_campaigns c ON c.id=r.campaign_id
+      WHERE r.scope='subscription_discovery'
+        AND r.status::text='paused_capacity_limit'
+        AND c.status='paused_capacity_limit'
+      ORDER BY r.created_at DESC
       LIMIT 1")
   if [[ -n "$run_id" && -s "$report_path" ]]; then
     log "Пробую применить уже измеренный Gate A к незапущенному run $run_id."
@@ -304,12 +333,18 @@ start_subscriptions() {
       die 'Pilot A завершён, но capacity report не разрешает production run.'
     done
 
-    log 'Создаю production cohort подписок.'
-    plan_output=$(collector collection subscriptions plan)
+    log 'Создаю или переиспользую кампанию и первый discovery cohort.'
+    plan_output=$(collector collection campaign plan --apply)
     printf '%s\n' "$plan_output"
     run_id=$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
       <<< "$plan_output" | tail -n 1)
     [[ -n "$run_id" ]] || die 'Не удалось получить run ID из production plan.'
+    run_id=$(psql_query -Atqc \
+      "SELECT r.id FROM collection_runs r
+        JOIN collection_campaigns c ON c.id=r.campaign_id
+       WHERE c.id='$run_id'::uuid AND r.scope='subscription_discovery'
+       ORDER BY r.created_at DESC LIMIT 1")
+    [[ -n "$run_id" ]] || die 'Кампания не создала discovery cohort.'
     plan_state=$(psql_query -AtF '|' -c \
       "SELECT status::text, total_jobs FROM collection_runs WHERE id='$run_id'::uuid")
     if [[ "$plan_state" == 'completed|0' ]]; then
@@ -331,7 +366,7 @@ start_subscriptions() {
   restart_worker
   trap - EXIT
   sleep 20
-  collector collection subscriptions status --run-id "$run_id"
+  collector collection campaign status
   printf 'STARTED_SUBSCRIPTIONS_RUN_ID=%s\n' "$run_id"
   printf 'CAPACITY_REPORT=%s\n' "$report_path"
   printf 'VERIFIED_BACKUP=%s\n' "$latest_backup"
@@ -370,7 +405,7 @@ POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
 ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20260810_0007 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20260815_0008 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 report
 if [[ "$ACTION" == start-subscriptions ]]; then

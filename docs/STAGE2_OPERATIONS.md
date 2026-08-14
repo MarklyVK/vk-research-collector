@@ -113,3 +113,10 @@ docker compose run --rm collector collection resume --run-id RUN_ID
 
 Формат: `backups/stage2-PURPOSE-YYYYMMDD-HHMMSSZ.dump`. После `pg_dump -Fc` обязательно
 проверить ненулевой размер и `pg_restore --list`. Каталог исключён из Git.
+# Дополнение: операции с кампанией
+
+Используйте `collection backlog`, `collection campaign status` и
+`collection method-limits` для read-only диагностики. `campaign pause/resume`
+сохраняет jobs и checkpoint. Не сбрасывайте cooldown вручную и не увеличивайте
+concurrency: bottleneck `groups.get` определяется квотой метода. Старые pending jobs
+не равны backlog; gaps определяются только state-таблицами.

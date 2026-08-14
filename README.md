@@ -1495,3 +1495,21 @@ data не должны попадать в Git.
 Репозиторий приватный. Условия лицензирования и распространения отдельно не объявлены;
 не считайте отсутствие файла `LICENSE` разрешением на публичное использование или
 перераспространение.
+# Многофазный сбор подписок (2026-08)
+
+Новая production-схема разделяет ID-only discovery и metadata enrichment.
+`groups.get` вызывается с `extended=0`, создаёт минимальные `vk_communities` с
+`metadata_updated_at=NULL` и bulk-связи; только после завершения фиксированного
+snapshot кампании создаются пакетные `groups.getById` jobs. Подробный контракт,
+CLI и rollout: [docs/PHASED_SUBSCRIPTION_IMPLEMENTATION.md](docs/PHASED_SUBSCRIPTION_IMPLEMENTATION.md).
+
+Быстрая read-only диагностика:
+
+```bash
+collector collection backlog --json
+collector collection campaign status
+collector collection method-limits
+```
+
+Лимит подписок жёстко ограничен 50. Массовый сбор постов найденных communities
+по-прежнему выключен и не входит в автоматическую кампанию.

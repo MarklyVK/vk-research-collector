@@ -171,7 +171,13 @@ class TokenPool:
                 )
                 if not method_capable:
                     retry_at = min(method_retry) if method_retry else None
-                    raise VKMethodUnavailable(method, retry_at, None)
+                    codes = [
+                        state.methods[method].last_error_code
+                        for state in enabled
+                        if method in state.methods
+                        and state.methods[method].last_error_code in {9, 29}
+                    ]
+                    raise VKMethodUnavailable(method, retry_at, codes[-1] if codes else None)
                 wait_until = min(global_retry) if global_retry else now + self._probe_seconds
             await self._sleep(max(0.0, wait_until - self._clock()))
 
@@ -275,6 +281,7 @@ class TokenPool:
                         consecutive_limit_hits=hits,
                         last_error_code=error_code,
                         last_error_at=now_dt,
+                        cooldown_seconds=duration,
                     )
                     .on_conflict_do_update(
                         constraint="uq_vk_token_method_state",
@@ -286,6 +293,7 @@ class TokenPool:
                             "consecutive_limit_hits": hits,
                             "last_error_code": error_code,
                             "last_error_at": now_dt,
+                            "cooldown_seconds": VKTokenMethodState.cooldown_seconds + duration,
                         },
                     )
                 )
@@ -332,17 +340,24 @@ class TokenPool:
                     .values(last_success_at=now_dt)
                 )
                 await session.execute(
-                    update(VKTokenMethodState)
-                    .where(
-                        VKTokenMethodState.token_fingerprint == lease.fingerprint,
-                        VKTokenMethodState.method == lease.method,
-                    )
+                    insert(VKTokenMethodState)
                     .values(
+                        token_fingerprint=lease.fingerprint,
+                        method=lease.method,
                         consecutive_limit_hits=0,
-                        last_error_code=None,
-                        blocked_until=None,
-                        next_probe_at=None,
                         last_success_at=now_dt,
+                        successful_requests=1,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_vk_token_method_state",
+                        set_={
+                            "consecutive_limit_hits": 0,
+                            "last_error_code": None,
+                            "blocked_until": None,
+                            "next_probe_at": None,
+                            "last_success_at": now_dt,
+                            "successful_requests": (VKTokenMethodState.successful_requests + 1),
+                        },
                     )
                 )
                 await session.commit()
@@ -579,7 +594,12 @@ class TokenPool:
                 await session.commit()
                 if not method_capable:
                     delay = max(0.0, (min(method_retry) - now_dt).total_seconds())
-                    raise VKMethodUnavailable(method, self._clock() + delay, None)
+                    codes = [
+                        row.last_error_code for row in method_rows if row.last_error_code in {9, 29}
+                    ]
+                    raise VKMethodUnavailable(
+                        method, self._clock() + delay, codes[-1] if codes else None
+                    )
                 wait_for = (
                     max(0.0, (min(global_retry) - now_dt).total_seconds())
                     if global_retry

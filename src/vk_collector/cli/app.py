@@ -8,7 +8,7 @@ import logging
 import signal
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -28,6 +28,8 @@ from vk_collector.classification.service import (
     import_classification,
 )
 from vk_collector.collection import CollectionQueue, CollectionWorker
+from vk_collector.collection.backlog import canonical_backlog
+from vk_collector.collection.campaigns import CampaignManager
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
@@ -39,13 +41,15 @@ from vk_collector.collection.reporting import (
     database_metrics,
     global_summary,
     latest_run_id,
-    latest_runnable_run_id,
     run_summary,
+    runnable_run_ids,
     verify_run,
 )
 from vk_collector.collection.safety import inspect_disk
 from vk_collector.config import Settings, get_settings, load_keyword_config
 from vk_collector.database.models import (
+    CampaignStatus,
+    CollectionCampaign,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
@@ -71,11 +75,13 @@ groups_app = typer.Typer(help="Поиск и статистика групп.")
 classification_app = typer.Typer(help="Пакеты ручной классификации.")
 collection_app = typer.Typer(help="Возобновляемый сбор публичных approved-данных.")
 subscriptions_app = typer.Typer(help="Обогащение существующих пользователей подписками.")
+campaign_app = typer.Typer(help="Многофазная кампания подписок с фиксированным snapshot.")
 privacy_app = typer.Typer(help="Проверка и минимизация персональных данных.")
 app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
 app.add_typer(collection_app, name="collection")
 collection_app.add_typer(subscriptions_app, name="subscriptions")
+collection_app.add_typer(campaign_app, name="campaign")
 app.add_typer(privacy_app, name="privacy")
 
 
@@ -545,7 +551,7 @@ async def _execute_collection(
                     raise ValueError(
                         "Pilot запускается только явной командой subscriptions pilot/posts-pilot"
                     )
-            elif run.scope == "subscriptions":
+            elif run.scope in {"subscriptions", "subscription_discovery", "subscription_metadata"}:
                 if not settings.collection_subscriptions_enabled:
                     raise ValueError("Сбор подписок выключен COLLECTION_SUBSCRIPTIONS_ENABLED")
                 report_path = run.configuration.get("capacity_report")
@@ -641,6 +647,7 @@ def run_collection(
         "members",
         "users",
         "subscriptions",
+        "metadata",
         "subscription_posts",
     }:
         typer.echo("Неизвестный scope.", err=True)
@@ -656,40 +663,113 @@ def run_collection(
 
 
 async def _collection_worker_service() -> None:
-    """Ожидать разрешённый full run и выполнять его независимо от CLI-сессии."""
+    """Fairly process all authorized runs with one shared VK client and token pool."""
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     stop_event = asyncio.Event()
+    client: VKClient | None = None
+    worker: CollectionWorker | None = None
+    run_cursor = 0
     loop = asyncio.get_running_loop()
     for handled_signal in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(handled_signal, stop_event.set)
     try:
         while not stop_event.is_set():
-            target = await latest_runnable_run_id(sessions)
-            if target is None:
+            targets = await runnable_run_ids(sessions)
+            if not targets:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
                     )
                 continue
-            try:
-                await _execute_collection(
-                    target,
-                    None,
-                    None,
-                    until_idle=False,
-                    stop_event=stop_event,
+            if client is None:
+                try:
+                    tokens = load_tokens(settings.vk_tokens_file)
+                except VKTokensUnavailable as exc:
+                    logger.warning("VK-токены пока недоступны: %s", exc)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
+                        )
+                    continue
+                pool = _token_pool(settings, tokens, sessions)
+                client = VKClient(
+                    pool,
+                    api_version=settings.vk_api_version,
+                    timeout=settings.vk_request_timeout_seconds,
                 )
-            except ValueError as exc:
-                queue = CollectionQueue(sessions, settings)
-                await queue.set_run_status(
-                    target, CollectionRunStatus.PAUSED_CAPACITY_LIMIT, str(exc)
-                )
-                logger.error("Автономный run %s безопасно отклонён: %s", target, exc)
+                worker = CollectionWorker(sessions, client, settings)
+            ordered = targets[run_cursor:] + targets[:run_cursor]
+            run_cursor = (run_cursor + 1) % len(targets)
+            processed = 0
+            for target in ordered:
+                if stop_event.is_set():
+                    break
+                try:
+                    await _validate_autonomous_run(sessions, settings, target)
+                    assert worker is not None
+                    processed += await worker.run(
+                        target,
+                        max_jobs=settings.collection_scheduler_quantum,
+                        stop_event=stop_event,
+                        until_idle=True,
+                    )
+                except ValueError as exc:
+                    queue = CollectionQueue(sessions, settings)
+                    await queue.set_run_status(
+                        target, CollectionRunStatus.PAUSED_CAPACITY_LIMIT, str(exc)
+                    )
+                    logger.error("Автономный run %s безопасно отклонён: %s", target, exc)
+            if processed == 0:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
+                    )
     finally:
+        if client is not None:
+            await client.aclose()
         await engine.dispose()
+
+
+async def _validate_autonomous_run(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    run_id: uuid.UUID,
+) -> None:
+    """Revalidate immutable configuration, report and backup before autonomous claim."""
+    queue = CollectionQueue(sessions, settings)
+    async with sessions() as session:
+        run = await session.get(CollectionRun, run_id)
+        if run is None or run.configuration.get("capacity_gate") != "passed":
+            raise ValueError("Run не имеет разрешающего capacity gate")
+        if run.configuration.get("collection") != queue.collection_configuration():
+            raise ValueError("Runtime-конфигурация не совпадает с immutable run")
+        if run.scope in {
+            "subscriptions",
+            "subscription_discovery",
+            "subscription_metadata",
+            "subscription_posts",
+        }:
+            report_path = run.configuration.get("capacity_report")
+            backup = run.configuration.get("verified_backup")
+            expected = run.configuration.get("collection")
+            if (
+                not isinstance(report_path, str)
+                or not isinstance(backup, dict)
+                or not isinstance(backup.get("path"), str)
+                or not isinstance(expected, dict)
+            ):
+                raise ValueError("Run не содержит проверенные report/backup")
+            phase: Literal["A", "B"] = "B" if run.scope == "subscription_posts" else "A"
+            validate_capacity_report(
+                Path(report_path),
+                phase=phase,
+                configuration=expected,
+                max_age_days=settings.collection_capacity_report_max_age_days,
+            )
+            _validated_backup_metadata(Path(str(backup["path"])), expected=backup)
 
 
 @collection_app.command("worker")
@@ -741,6 +821,96 @@ async def _plan_subscriptions(pilot: bool) -> uuid.UUID:
         return await CollectionQueue(sessions, settings).plan_subscriptions(pilot=pilot)
     finally:
         await engine.dispose()
+
+
+async def _campaign_operation(
+    action: Literal["plan", "status", "pause", "resume", "metadata-preview"],
+    campaign_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        manager = CampaignManager(sessions, settings)
+        if action == "plan":
+            return {"campaign_id": str(await manager.plan())}
+        if action == "status":
+            return await manager.status(campaign_id)
+        if campaign_id is None:
+            raise ValueError("Укажите --campaign-id")
+        if action == "metadata-preview":
+            return await manager.metadata_preview(campaign_id)
+        await manager.change_status(campaign_id, pause=action == "pause")
+        return await manager.status(campaign_id)
+    finally:
+        await engine.dispose()
+
+
+def _show_campaign_operation(
+    action: Literal["plan", "status", "pause", "resume", "metadata-preview"],
+    campaign_id: uuid.UUID | None = None,
+) -> None:
+    try:
+        payload = asyncio.run(_campaign_operation(action, campaign_id))
+    except ValueError as exc:
+        typer.echo(f"Операция с кампанией отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@campaign_app.command("plan")
+def campaign_plan(
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Создать или переиспользовать кампанию и первый cohort."),
+    ] = False,
+) -> None:
+    """Создать campaign только явно; без --apply показать неизменяющий preview."""
+    if not apply:
+        settings = get_settings()
+        typer.echo(
+            json.dumps(
+                {
+                    "apply": False,
+                    "campaign_type": "subscription_enrichment",
+                    "cohort_users": settings.collection_campaign_cohort_users,
+                    "subscription_limit": settings.collection_subscriptions_max_per_user,
+                    "initial_status": "paused_capacity_limit",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    _show_campaign_operation("plan")
+
+
+@campaign_app.command("status")
+def campaign_status(
+    campaign_id: Annotated[uuid.UUID | None, typer.Option("--campaign-id")] = None,
+) -> None:
+    """Показать фазу, coverage, усечения и следующее пробуждение."""
+    _show_campaign_operation("status", campaign_id)
+
+
+@campaign_app.command("pause")
+def campaign_pause(campaign_id: Annotated[uuid.UUID, typer.Option("--campaign-id")]) -> None:
+    """Поставить кампанию на паузу без удаления jobs и checkpoint."""
+    _show_campaign_operation("pause", campaign_id)
+
+
+@campaign_app.command("resume")
+def campaign_resume(campaign_id: Annotated[uuid.UUID, typer.Option("--campaign-id")]) -> None:
+    """Возобновить кампанию с сохранённого checkpoint."""
+    _show_campaign_operation("resume", campaign_id)
+
+
+@campaign_app.command("metadata-preview")
+def campaign_metadata_preview(
+    campaign_id: Annotated[uuid.UUID, typer.Option("--campaign-id")],
+) -> None:
+    """Read-only preview DISTINCT communities будущей metadata-фазы."""
+    _show_campaign_operation("metadata-preview", campaign_id)
 
 
 @subscriptions_app.command("plan")
@@ -910,13 +1080,26 @@ async def _method_limits(method: str | None = None) -> list[dict[str, object]]:
             if method:
                 query = query.where(VKTokenMethodState.method == method)
             rows = list((await session.scalars(query)).all())
+            now = datetime.now(UTC)
             return [
                 {
-                    "token_fingerprint": row.token_fingerprint,
+                    "token_fingerprint": row.token_fingerprint[:12],
                     "method": row.method,
+                    "state": (
+                        "blocked"
+                        if row.blocked_until is not None and row.blocked_until > now
+                        else "enabled"
+                    ),
                     "blocked_until": row.blocked_until.isoformat() if row.blocked_until else None,
+                    "next_probe_at": row.next_probe_at.isoformat() if row.next_probe_at else None,
                     "consecutive_limit_hits": row.consecutive_limit_hits,
                     "last_error_code": row.last_error_code,
+                    "last_error_at": row.last_error_at.isoformat() if row.last_error_at else None,
+                    "last_success_at": (
+                        row.last_success_at.isoformat() if row.last_success_at else None
+                    ),
+                    "successful_requests": row.successful_requests,
+                    "cooldown_seconds": row.cooldown_seconds,
                 }
                 for row in rows
             ]
@@ -932,38 +1115,109 @@ def method_limits(
     typer.echo(json.dumps(asyncio.run(_method_limits(method)), ensure_ascii=False, indent=2))
 
 
-async def _reset_method_limits(method: str) -> int:
+async def _backlog() -> dict[str, Any]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     try:
-        async with sessions() as session:
-            result = await session.execute(
-                update(VKTokenMethodState)
-                .where(VKTokenMethodState.method == method)
-                .values(
-                    blocked_until=None,
-                    next_probe_at=None,
-                    consecutive_limit_hits=0,
-                    last_error_code=None,
-                )
-            )
-            await session.commit()
-            return int(result.rowcount or 0)  # type: ignore[attr-defined]
+        payload = await canonical_backlog(sessions, settings)
+        disk = inspect_disk(
+            settings.collection_export_dir,
+            settings.disk_warning_percent,
+            settings.disk_stop_percent,
+        )
+        payload["disk"] = {
+            "used_percent": disk.used_percent,
+            "free_bytes": disk.free_bytes,
+            "warning": disk.warning,
+            "stop": disk.stop,
+        }
+        return payload
     finally:
         await engine.dispose()
 
 
-@collection_app.command("method-limits-reset")
-def method_limits_reset(
-    method: Annotated[str, typer.Option("--method")],
-    yes: Annotated[bool, typer.Option("--yes", help="Подтвердить точечный reset.")] = False,
+@collection_app.command("backlog")
+def collection_backlog(
+    as_json: Annotated[bool, typer.Option("--json", help="Вывести полный JSON.")] = False,
 ) -> None:
-    """Сбросить cooldown одного метода, не меняя токены и collection data."""
-    if not yes:
-        raise typer.BadParameter("Для reset укажите --yes")
-    count = asyncio.run(_reset_method_limits(method))
-    typer.echo(f"Сброшено method states: {count}")
+    """Показать read-only backlog по каноническим state-таблицам."""
+    payload = asyncio.run(_backlog())
+    if as_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    typer.echo(f"Сформировано: {payload['generated_at']}")
+    for title, key in (
+        ("Approved-группы", "approved_groups"),
+        ("Пользователи", "users"),
+        ("Подписки", "subscriptions"),
+        ("Сообщества подписок", "subscription_communities"),
+        ("Посты сообществ подписок", "subscription_posts"),
+    ):
+        typer.echo(f"{title}: {json.dumps(payload[key], ensure_ascii=False)}")
+    typer.echo(
+        "Jobs показаны отдельно как история: rows и distinct_entities не являются "
+        "каноническим backlog."
+    )
+    typer.echo(
+        f"Зависшие lease: {payload['stale_running_leases']}; "
+        f"незавершённые pilot: {payload['unfinished_pilots']}; "
+        f"активные кампании: {payload['active_campaigns']}"
+    )
+    typer.echo(f"Диск: {json.dumps(payload['disk'], ensure_ascii=False)}")
+
+
+async def _repair_stale_leases(*, confirm: bool) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    cutoff = datetime.now(UTC) - timedelta(seconds=settings.collection_job_lease_seconds)
+    try:
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(CollectionJob.collection_run_id, func.count(CollectionJob.id))
+                    .where(
+                        CollectionJob.status == JobStatus.RUNNING,
+                        CollectionJob.locked_at < cutoff,
+                    )
+                    .group_by(CollectionJob.collection_run_id)
+                    .order_by(CollectionJob.collection_run_id)
+                )
+            ).all()
+        preview = {str(run_id): int(count) for run_id, count in rows}
+        recovered = 0
+        if confirm:
+            queue = CollectionQueue(sessions, settings)
+            for run_id, _count in rows:
+                recovered += await queue.recover_expired(run_id)
+        return {
+            "mode": "confirm" if confirm else "preview",
+            "reason": "lease_expired_recovered",
+            "runs": preview,
+            "stale_jobs": sum(preview.values()),
+            "recovered_jobs": recovered,
+            "history_deleted": False,
+        }
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("repair-stale-leases")
+def repair_stale_leases(
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Вернуть только истёкшие running lease в pending."),
+    ] = False,
+) -> None:
+    """Сначала показать preview; изменять state только с явным --confirm."""
+    typer.echo(
+        json.dumps(
+            asyncio.run(_repair_stale_leases(confirm=confirm)),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 async def _change_run_status(run_id: uuid.UUID, status: CollectionRunStatus) -> None:
@@ -1363,11 +1617,17 @@ async def _apply_capacity(
             if not isinstance(expected, dict):
                 raise ValueError("Collection run содержит повреждённую конфигурацию")
             backup_metadata: dict[str, object] | None = None
-            if run.scope in {"subscriptions", "subscription_posts"}:
+            if run.scope in {
+                "subscriptions",
+                "subscription_discovery",
+                "subscription_posts",
+            }:
                 if backup is None:
                     raise ValueError("Для subscription capacity gate обязателен --backup")
                 backup_metadata = _validated_backup_metadata(backup)
-                phase: Literal["A", "B"] = "A" if run.scope == "subscriptions" else "B"
+                phase: Literal["A", "B"] = (
+                    "A" if run.scope in {"subscriptions", "subscription_discovery"} else "B"
+                )
                 payload = validate_capacity_report(
                     source,
                     phase=phase,
@@ -1414,6 +1674,23 @@ async def _apply_capacity(
             }
             run.status = CollectionRunStatus.PLANNED
             run.error_message = None
+            if run.campaign_id is not None:
+                campaign = await session.get(
+                    CollectionCampaign, run.campaign_id, with_for_update=True
+                )
+                if campaign is None:
+                    raise ValueError("Campaign, связанная с run, не найдена")
+                campaign.configuration = {
+                    **campaign.configuration,
+                    "capacity_gate": "passed",
+                    "projected_database_bytes": projected,
+                    "safe_limit_bytes": safe_limit,
+                    "capacity_report": str(source.resolve()),
+                    **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
+                }
+                campaign.status = CampaignStatus.RUNNING.value
+                campaign.started_at = campaign.started_at or datetime.now(UTC)
+                campaign.error_message = None
             await session.commit()
             return {"run_id": str(run_id), "status": "planned", "capacity_gate": "passed"}
     finally:

@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from vk_collector.collection.campaigns import CampaignManager
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import capacity_gate_passed, latest_runnable_run_id
 from vk_collector.collection.worker import CollectionWorker
 from vk_collector.config import Settings
 from vk_collector.database.models import (
     ClassificationStatus,
+    CollectionCampaign,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
@@ -27,13 +30,19 @@ from vk_collector.database.models import (
     JobStatus,
     UserGroupSubscription,
     UserSubscriptionState,
+    VKCommunity,
     VKTokenMethodState,
     VKTokenState,
     VKUser,
 )
 from vk_collector.database.session import create_database_engine
 from vk_collector.privacy import delete_user, inspect_user
-from vk_collector.vk import TokenPool, VKAPIError, VKMethodUnavailable
+from vk_collector.vk import (
+    TokenPool,
+    VKAPIError,
+    VKMethodUnavailable,
+    VKSubscriptionIDsPage,
+)
 from vk_collector.vk.errors import VKRetryExhausted
 
 
@@ -83,44 +92,31 @@ class FakeVK:
     async def get_users(self, user_ids: list[int]) -> list[dict[str, Any]]:
         return [{"id": user_ids[0], "first_name": "Иван", "last_name": "Тестов"}]
 
-    async def get_subscriptions_page(
+    async def get_subscription_ids_page(
         self, user_vk_id: int, offset: int, count: int
-    ) -> dict[str, Any]:
-        return {
-            "count": 1,
-            "items": [
-                {
-                    "id": 777,
-                    "name": "Подписка",
-                    "description": "Публичное описание",
-                    "screen_name": "subscription_fixture",
-                    "type": "group",
-                    "is_closed": 0,
-                }
-            ]
-            if offset == 0
-            else [],
-        }
+    ) -> VKSubscriptionIDsPage:
+        ids = (777,) if offset == 0 else ()
+        return VKSubscriptionIDsPage(1, ids, offset, count, len(ids), offset + len(ids))
 
 
 class PrivateSubscriptionsVK(FakeVK):
-    async def get_subscriptions_page(
+    async def get_subscription_ids_page(
         self, user_vk_id: int, offset: int, count: int
-    ) -> dict[str, Any]:
+    ) -> VKSubscriptionIDsPage:
         raise VKAPIError(260, "Доступ к подпискам ограничен")
 
 
 class AccessDeniedSubscriptionsVK(FakeVK):
-    async def get_subscriptions_page(
+    async def get_subscription_ids_page(
         self, user_vk_id: int, offset: int, count: int
-    ) -> dict[str, Any]:
+    ) -> VKSubscriptionIDsPage:
         raise VKAPIError(15, "Доступ запрещён")
 
 
 class FailingSubscriptionsVK(FakeVK):
-    async def get_subscriptions_page(
+    async def get_subscription_ids_page(
         self, user_vk_id: int, offset: int, count: int
-    ) -> dict[str, Any]:
+    ) -> VKSubscriptionIDsPage:
         raise VKRetryExhausted("VK API недоступен после повторов")
 
 
@@ -563,6 +559,264 @@ async def test_queue_recovery_fake_full_path_rerun_and_privacy_rollback() -> Non
                     await nested.rollback()
                     after = await inspect_user(session, 9_000_000_001)
                     assert before == after
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_discovery_bulk_writes_overlapping_communities_without_duplicates() -> None:
+    engine = create_database_engine(database_url())
+    marker = int(uuid.uuid4().hex[:10], 16)
+    settings = Settings(
+        database_url=database_url(),
+        collection_max_concurrency=2,
+        collection_subscriptions_max_per_user=50,
+        collection_subscriptions_page_size=50,
+    )
+    run_id: uuid.UUID | None = None
+    user_ids = [marker + 30_000_000_000 + index for index in range(500)]
+    community_ids = [marker + 31_000_000_000 + index for index in range(50)]
+
+    class OverlappingSubscriptionsVK(FakeVK):
+        async def get_subscription_ids_page(
+            self, user_vk_id: int, offset: int, count: int
+        ) -> VKSubscriptionIDsPage:
+            values = community_ids if user_vk_id % 2 else list(reversed(community_ids))
+            page = tuple(values[offset : offset + count])
+            return VKSubscriptionIDsPage(50, page, offset, count, len(page), offset + len(page))
+
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    storage_statements: list[str] = []
+
+    def count_storage_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.upper()
+        if any(
+            table in normalized
+            for table in (
+                "VK_COMMUNITIES",
+                "USER_GROUP_SUBSCRIPTIONS",
+                "USER_SUBSCRIPTION_STATES",
+            )
+        ):
+            storage_statements.append(normalized)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_storage_statement)
+    try:
+        async with sessions() as session:
+            now = datetime.now(UTC)
+            session.add_all(
+                [
+                    VKUser(
+                        vk_id=user_id,
+                        is_closed=False,
+                        can_access_closed=True,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                    for user_id in user_ids
+                ]
+            )
+            run = CollectionRun(scope="subscriptions_pilot", status=CollectionRunStatus.PLANNED)
+            session.add(run)
+            await session.flush()
+            session.add_all(
+                [
+                    CollectionJob(
+                        collection_run_id=run.id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=user_id,
+                    )
+                    for user_id in reversed(user_ids)
+                ]
+            )
+            await session.commit()
+            run_id = run.id
+        started_at = time.monotonic()
+        await CollectionWorker(sessions, OverlappingSubscriptionsVK(), settings).run(  # type: ignore[arg-type]
+            run_id
+        )
+        duration_seconds = time.monotonic() - started_at
+        async with sessions() as session:
+            assert (
+                await session.scalar(
+                    select(func.count(UserGroupSubscription.id)).where(
+                        UserGroupSubscription.user_id.in_(user_ids),
+                        UserGroupSubscription.vk_group_id.in_(community_ids),
+                    )
+                )
+                == len(user_ids) * 50
+            )
+            assert (
+                await session.scalar(
+                    select(VKCommunity.metadata_updated_at).where(
+                        VKCommunity.vk_id == community_ids[0]
+                    )
+                )
+                is None
+            )
+        row_by_row_baseline = len(user_ids) * 50 * 2
+        assert len(storage_statements) <= len(user_ids) * 10
+        assert len(storage_statements) < row_by_row_baseline
+        assert duration_seconds < 60
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_storage_statement)
+        async with sessions() as session:
+            if run_id is not None:
+                await session.execute(delete(CollectionRun).where(CollectionRun.id == run_id))
+            await session.execute(delete(VKUser).where(VKUser.vk_id.in_(user_ids)))
+            await session.execute(delete(VKCommunity).where(VKCommunity.vk_id.in_(community_ids)))
+            await session.commit()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None:
+    engine = create_database_engine(database_url())
+    marker = int(uuid.uuid4().hex[:10], 16)
+    settings = Settings(
+        database_url=database_url(),
+        collection_campaign_cohort_users=2,
+        collection_community_metadata_ttl_days=31,
+    )
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                now = datetime.now(UTC)
+                async with sessions() as session:
+                    group = GroupCandidate(
+                        vk_id=marker + 40_000_000_000,
+                        name="Campaign group",
+                        description="",
+                        status_text="",
+                        address=f"https://vk.com/{marker}",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        classification_status=ClassificationStatus.APPROVED,
+                    )
+                    session.add(group)
+                    await session.flush()
+                    users = [
+                        VKUser(
+                            vk_id=marker + 41_000_000_000 + index,
+                            is_closed=False,
+                            can_access_closed=True,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                        )
+                        for index in range(2)
+                    ]
+                    session.add_all(users)
+                    await session.flush()
+                    session.add_all(
+                        [
+                            GroupMembership(
+                                group_id=group.id,
+                                user_id=user.vk_id,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                                is_current=True,
+                            )
+                            for user in users
+                        ]
+                    )
+                    await session.commit()
+                manager = CampaignManager(sessions, settings)
+                campaign_id = await manager.plan()
+                assert await manager.plan() == campaign_id
+                async with sessions() as session:
+                    campaign = await session.get(CollectionCampaign, campaign_id)
+                    assert campaign is not None
+                    assert campaign.phase == "subscription_discovery"
+                    assert (
+                        await session.scalar(
+                            select(func.count(CollectionJob.id)).where(
+                                CollectionJob.job_type == "refresh_community_metadata",
+                                CollectionJob.collection_run_id.in_(
+                                    select(CollectionRun.id).where(
+                                        CollectionRun.campaign_id == campaign_id
+                                    )
+                                ),
+                            )
+                        )
+                        == 0
+                    )
+                    discovery_jobs = list(
+                        (
+                            await session.scalars(
+                                select(CollectionJob)
+                                .join(
+                                    CollectionRun,
+                                    CollectionRun.id == CollectionJob.collection_run_id,
+                                )
+                                .where(CollectionRun.campaign_id == campaign_id)
+                            )
+                        ).all()
+                    )
+                    for job in discovery_jobs:
+                        session.add(
+                            UserSubscriptionState(
+                                user_id=job.entity_id,
+                                last_success_at=now,
+                                collected_limit=50,
+                                last_run_id=job.collection_run_id,
+                                last_campaign_id=campaign_id,
+                            )
+                        )
+                        job.status = JobStatus.COMPLETED
+                    session.add(
+                        VKCommunity(
+                            vk_id=marker + 42_000_000_000,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                        )
+                    )
+                    await session.flush()
+                    for user in users:
+                        session.add(
+                            UserGroupSubscription(
+                                user_id=user.vk_id,
+                                vk_group_id=marker + 42_000_000_000,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                                is_current=True,
+                            )
+                        )
+                    await session.commit()
+                await manager.reconcile(campaign_id)
+                async with sessions() as session:
+                    campaign = await session.get(CollectionCampaign, campaign_id)
+                    assert campaign is not None
+                    assert campaign.phase == "subscription_metadata"
+                    assert (
+                        await session.scalar(
+                            select(func.count(CollectionJob.id))
+                            .join(
+                                CollectionRun,
+                                CollectionRun.id == CollectionJob.collection_run_id,
+                            )
+                            .where(
+                                CollectionRun.campaign_id == campaign_id,
+                                CollectionJob.job_type == "refresh_community_metadata",
+                            )
+                        )
+                        == 1
+                    )
             finally:
                 await outer.rollback()
     finally:
