@@ -1339,7 +1339,8 @@ docker compose run --rm collector collection subscriptions run --run-id POSTS_RU
 
 ```bash
 docker compose run --rm collector collection method-limits
-docker compose run --rm collector collection method-limits-reset --method groups.get --yes
+docker compose run --rm collector collection light-repair
+docker compose run --rm collector collection light-repair --apply
 ```
 
 ### Контейнеры и логи

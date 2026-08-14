@@ -1,13 +1,15 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import yaml
 from pydantic import SecretStr, ValidationError
 
-from vk_collector.cli.app import _validated_backup_metadata
+from vk_collector.cli.app import _validate_autonomous_run, _validated_backup_metadata
+from vk_collector.collection.backup import BackupVerifier
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
@@ -15,6 +17,7 @@ from vk_collector.collection.capacity import (
 )
 from vk_collector.collection.notifications import notify
 from vk_collector.collection.queue import CollectionQueue
+from vk_collector.collection.reporting import bounded_wakeup_delay
 from vk_collector.collection.safety import inspect_disk, sanitize_message
 from vk_collector.collection.worker import normalize_attachment
 from vk_collector.config import Settings
@@ -72,6 +75,12 @@ def test_disk_thresholds_are_monotonic(tmp_path: Path) -> None:
     state = inspect_disk(tmp_path, warning_percent=0, stop_percent=0)
     assert state.warning
     assert state.stop
+
+
+def test_nearest_durable_wakeup_uses_bound_without_sleep() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    assert bounded_wakeup_delay(now + timedelta(seconds=17), now=now, idle_seconds=5) == 17
+    assert bounded_wakeup_delay(now + timedelta(hours=2), now=now, idle_seconds=5) == 60
 
 
 def test_collection_configuration_captures_capacity_limits() -> None:
@@ -260,6 +269,92 @@ def test_verified_backup_must_remain_the_same_pg_dump(tmp_path: Path) -> None:
     backup.write_bytes(b"PGDMP\x01changed-test")
     with pytest.raises(ValueError, match="изменился"):
         _validated_backup_metadata(backup, expected=metadata)
+
+
+def test_backup_sha_is_read_once_per_worker_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = tmp_path / "before-campaign.dump"
+    backup.write_bytes(b"PGDMP\x01safe-test-content")
+    expected = BackupVerifier().fingerprint(backup)
+    verifier = BackupVerifier()
+    original_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal reads
+        if path == backup.resolve():
+            reads += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    assert verifier.verify(backup, expected) == expected
+    assert verifier.verify(backup, expected) == expected
+    assert verifier.verify(backup, expected) == expected
+    assert reads == 1
+
+
+def test_backup_stat_change_stops_before_cached_use(tmp_path: Path) -> None:
+    backup = tmp_path / "before-campaign.dump"
+    backup.write_bytes(b"PGDMP\x01safe-test-content")
+    expected = BackupVerifier().fingerprint(backup)
+    verifier = BackupVerifier()
+    verifier.verify(backup, expected)
+    backup.write_bytes(b"PGDMP\x01changed-size-content")
+    with pytest.raises(ValueError, match="изменился"):
+        verifier.verify(backup, expected)
+
+
+@pytest.mark.asyncio
+async def test_three_scheduler_quantum_hash_backup_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = tmp_path / "scheduler.dump"
+    backup.write_bytes(b"PGDMP\x01scheduler-content")
+    expected_backup = BackupVerifier().fingerprint(backup)
+    settings = Settings()
+    configuration = CollectionQueue(None, settings).collection_configuration()  # type: ignore[arg-type]
+    run = SimpleNamespace(
+        scope="subscription_discovery",
+        configuration={
+            "capacity_gate": "passed",
+            "collection": configuration,
+            "capacity_report": str(tmp_path / "gate.json"),
+            "verified_backup": expected_backup,
+        },
+    )
+
+    class FakeSession:
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, *args: object) -> object:
+            return run
+
+    class FakeSessions:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    monkeypatch.setattr("vk_collector.cli.app.validate_capacity_report", lambda *a, **k: {})
+    original_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal reads
+        if path == backup.resolve():
+            reads += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    verifier = BackupVerifier()
+    for _ in range(3):
+        await _validate_autonomous_run(  # type: ignore[arg-type]
+            FakeSessions(), settings, uuid.uuid4(), backup_verifier=verifier
+        )
+    assert reads == 1
 
 
 def test_compose_defines_restartable_autonomous_worker() -> None:

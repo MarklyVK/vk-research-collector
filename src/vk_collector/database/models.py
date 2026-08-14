@@ -371,9 +371,8 @@ class CollectionCampaign(TimestampMixin, Base):
         ),
         Index("ix_collection_campaigns_status_phase", "status", "phase", "created_at"),
         Index(
-            "uq_collection_campaigns_active_configuration",
+            "uq_collection_campaigns_active_type",
             "campaign_type",
-            "configuration_hash",
             unique=True,
             postgresql_where=text(
                 "status IN ('planned','running','paused','waiting_method_limit',"
@@ -397,6 +396,9 @@ class CollectionCampaign(TimestampMixin, Base):
     snapshot_max_user_id: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    snapshot_user_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     configuration: Mapped[dict[str, object]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
     )
@@ -411,6 +413,25 @@ class CollectionCampaign(TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_wakeup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class CollectionCampaignUser(Base):
+    """Minimal immutable user-ID snapshot belonging to one campaign."""
+
+    __tablename__ = "collection_campaign_users"
+    __table_args__ = (Index("ix_collection_campaign_users_plan", "campaign_id", "user_id"),)
+
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("collection_campaigns.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class CollectionRun(TimestampMixin, Base):

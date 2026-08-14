@@ -45,17 +45,32 @@ cooldown, probe и числом успешных запросов.
 
 ## Durable state machine
 
-`collection_campaigns` хранит фазу, статус, `snapshot_at`, верхнюю границу ID,
-immutable configuration hash, курсоры cohort и metadata, wakeup и ошибку. Частичный
-уникальный индекс PostgreSQL запрещает две активные кампании одного типа с одной
-конфигурацией. `collection_runs.campaign_id` nullable, поэтому исторические run
-остаются читаемыми. Миграция не переписывает `collection_jobs`.
+`collection_campaigns` хранит фазу, статус, `snapshot_at`, immutable planning
+configuration hash, курсоры cohort и metadata, wakeup и ошибку. Узкая таблица
+`collection_campaign_users` материализует только пары campaign/user: изменение
+membership, `is_closed` или `can_access_closed` после этого не меняет набор. Preview
+оценивает её как 96 bytes/user; для 1,45 млн users это около 133 MiB до фактического
+измерения PostgreSQL. Материализация выполняется только явным `campaign plan --apply`,
+а jobs создаются cohort до 10 000. Повторный planner snapshot не пересоздаёт.
+
+Частичный уникальный индекс PostgreSQL запрещает вторую активную кампанию одного типа
+при любом configuration hash. Hash включает только immutable planning configuration;
+capacity report, backup fingerprint, timestamps и runtime status являются operational
+evidence и hash не меняют. `collection_runs.campaign_id` nullable, поэтому
+исторические run остаются читаемыми. Migration 0009 не переписывает `collection_jobs`.
 
 Переход discovery -> metadata разрешён только когда нет active/failed discovery
 jobs и каждый eligible user имеет successful (включая truncated) либо terminal
 state. Transient error остаётся retryable и блокирует переход. После рестарта
 planner продолжает от durable курсоров; повторное планирование использует ту же
 кампанию и уникальные job constraints.
+
+Пять быстрых transient attempts сменяются persisted exponential backoff до 24 часов,
+но job и campaign не становятся `failed`. `FAILED` зарезервирован для нарушенного
+инварианта, повреждённой конфигурации или иной ошибки, которую нельзя безопасно
+повторить. Privacy/access/deleted остаются terminal. Reconciliation выполняется на
+первом terminal transition run, после startup lease recovery или явного repair, а не
+после каждого job.
 
 ## Scheduler и cooldown
 
@@ -65,6 +80,20 @@ round-robin квантами и использует один endpoint-aware tok
 Когда доступных методов нет, run/campaign получают `waiting_method_limit` и
 `next_wakeup_at`; worker остаётся healthy. Ручной reset cooldown удалён из CLI:
 он не увеличивает quota и провоцирует повторные ограничения.
+
+Полный SHA-256 backup считается при `capacity-apply` и один раз для каждого уникального
+fingerprint после старта worker-процесса. Каждый следующий scheduler quantum проверяет
+только resolved path, size и mtime; изменение любого признака ставит run/campaign на
+capacity pause. Истёкший Gate A для metadata обновляется явным `capacity-apply` того же
+metadata run с новым report и неизменившимся проверенным backup. Автоматического обхода
+gate нет.
+
+`collection light-repair` является read-only preview canonical gaps. Только
+`collection light-repair --apply` создаёт immutable run с `users.get` и
+`groups.getById`; posts, members и subscription posts туда не входят. Если
+`groups.get` ограничен, scheduler продолжает этот явно разрешённый backlog. Старые
+paused full runs показываются в report, но не блокируют новую campaign и не
+возобновляются автоматически.
 
 ## CLI
 
@@ -77,6 +106,7 @@ collector collection campaign metadata-preview --campaign-id UUID
 collector collection campaign pause --campaign-id UUID
 collector collection campaign resume --campaign-id UUID
 collector collection method-limits [--method groups.get]
+collector collection light-repair [--apply]
 collector collection repair-stale-leases
 collector collection repair-stale-leases --confirm
 ```

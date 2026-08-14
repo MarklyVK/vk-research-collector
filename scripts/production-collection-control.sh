@@ -235,7 +235,8 @@ SQL
 }
 
 start_subscriptions() {
-  local active_campaigns active_runs unfinished_pilots gate_applied latest_backup
+  local active_campaigns active_runs paused_capacity_campaigns unfinished_pilots
+  local gate_applied latest_backup
   local pilot_attempt pilot_state plan_state report_path
   local deferred_pilot production_allowed plan_output retryable_pilot run_id
   active_campaigns=$(psql_query -Atqc \
@@ -245,11 +246,15 @@ start_subscriptions() {
   active_runs=$(psql_query -Atqc \
     "SELECT count(*)
        FROM collection_runs
-      WHERE scope IN ('full','incremental','subscriptions','subscription_posts',
+      WHERE scope IN ('subscriptions','subscription_posts',
                       'subscription_discovery','subscription_metadata',
                       'subscriptions_pilot','subscription_posts_pilot')
         AND status::text IN ('planned','running','paused','paused_no_tokens',
-                             'paused_capacity_limit','waiting_method_limit')")
+                             'waiting_method_limit')")
+  paused_capacity_campaigns=$(psql_query -Atqc \
+    "SELECT count(*) FROM collection_campaigns
+      WHERE campaign_type='subscription_enrichment'
+        AND status='paused_capacity_limit'")
   unfinished_pilots=$(psql_query -Atqc \
     "SELECT count(*) FROM collection_runs
       WHERE scope IN ('subscriptions_pilot','subscription_posts_pilot')
@@ -260,11 +265,20 @@ start_subscriptions() {
     collector collection backlog
     return
   fi
-  if [[ "$active_campaigns" != 0 || "$active_runs" != 0 ]]; then
+  if [[ "$active_runs" != 0 ]]; then
     log "Активные кампании=$active_campaigns, runs=$active_runs. Дубли не создаются."
     collector collection campaign status
     collector collection backlog
     return
+  fi
+  if [[ "$active_campaigns" != 0 && "$paused_capacity_campaigns" == 0 ]]; then
+    log "Активная campaign переиспользуется worker; новый pilot/run не создаётся."
+    collector collection campaign status
+    collector collection backlog
+    return
+  fi
+  if [[ "$paused_capacity_campaigns" != 0 ]]; then
+    log "Переиспользую paused-capacity campaign; проверяю путь Gate A apply/renew."
   fi
 
   latest_backup=$(find "$DEPLOY_DIR/backups" -type f -name '*.dump' -printf '%T@ %p\n' \
@@ -405,7 +419,7 @@ POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
 ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20260815_0008 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20260815_0009 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 report
 if [[ "$ACTION" == start-subscriptions ]]; then

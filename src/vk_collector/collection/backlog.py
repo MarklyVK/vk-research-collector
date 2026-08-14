@@ -94,15 +94,22 @@ async def canonical_backlog(
                 func.count(VKUser.vk_id),
                 func.count(VKUser.vk_id).filter(UserSubscriptionState.last_success_at.is_not(None)),
                 func.count(VKUser.vk_id).filter(
-                    UserSubscriptionState.terminal_reason == "privacy_or_access"
+                    UserSubscriptionState.last_success_at.is_(None),
+                    UserSubscriptionState.terminal_reason == "privacy_or_access",
                 ),
                 func.count(VKUser.vk_id).filter(
-                    UserSubscriptionState.terminal_reason == "deleted_or_unavailable"
+                    UserSubscriptionState.last_success_at.is_(None),
+                    UserSubscriptionState.terminal_reason == "deleted_or_unavailable",
                 ),
                 func.count(VKUser.vk_id).filter(
                     UserSubscriptionState.last_success_at.is_(None),
                     UserSubscriptionState.terminal_reason.is_(None),
-                    UserSubscriptionState.next_scheduled_at.is_not(None),
+                    UserSubscriptionState.next_scheduled_at > now,
+                ),
+                func.count(VKUser.vk_id).filter(
+                    UserSubscriptionState.last_success_at.is_(None),
+                    UserSubscriptionState.terminal_reason.is_(None),
+                    UserSubscriptionState.next_scheduled_at <= now,
                 ),
                 func.count(VKUser.vk_id).filter(UserSubscriptionState.is_truncated.is_(True)),
                 func.count(VKUser.vk_id).filter(
@@ -250,6 +257,29 @@ async def canonical_backlog(
             )
             or 0
         )
+        campaign_snapshot_users = int(
+            await session.scalar(
+                select(func.coalesce(func.sum(CollectionCampaign.snapshot_user_count), 0)).where(
+                    CollectionCampaign.status.in_(
+                        [
+                            CampaignStatus.PLANNED.value,
+                            CampaignStatus.RUNNING.value,
+                            CampaignStatus.PAUSED.value,
+                            CampaignStatus.WAITING_METHOD_LIMIT.value,
+                            CampaignStatus.PAUSED_CAPACITY_LIMIT.value,
+                        ]
+                    )
+                )
+            )
+            or 0
+        )
+        nearest_transient_retry = await session.scalar(
+            select(func.min(CollectionJob.next_attempt_at)).where(
+                CollectionJob.job_type == "collect_user_subscriptions",
+                CollectionJob.status == JobStatus.RETRY_WAIT,
+                CollectionJob.next_attempt_at > now,
+            )
+        )
         duplicate_active_campaign_types = int(
             await session.scalar(
                 select(func.count()).select_from(
@@ -333,6 +363,7 @@ async def canonical_backlog(
                         "terminal_privacy",
                         "terminal_deleted",
                         "transient_deferred",
+                        "transient_due",
                         "truncated",
                         "unresolved",
                     ),
@@ -382,6 +413,21 @@ async def canonical_backlog(
             "stale_running_leases": stale_leases,
             "unfinished_pilots": unfinished_pilots,
             "active_campaigns": active_campaigns,
+            "active_campaign_snapshot_users": campaign_snapshot_users,
+            "nearest_transient_retry": (
+                nearest_transient_retry.isoformat() if nearest_transient_retry else None
+            ),
+            "next_light_backlog": (
+                "approved_group_metadata"
+                if group_values[2]
+                else "user_profiles"
+                if user_values[2] + user_values[3]
+                else None
+            ),
+            "data_provenance": {
+                "app_env": settings.app_env,
+                "production_verified": settings.app_env == "production",
+            },
             "campaign_types_with_multiple_active": duplicate_active_campaign_types,
             "active_run_configuration_mismatches": runtime_configuration_mismatches,
             "active_run_invalid_gate_artifacts": invalid_gate_artifacts,
@@ -391,4 +437,7 @@ async def canonical_backlog(
             ),
             "subscription_eta_healthy_minutes": None,
             "subscription_eta_cooldown_adjusted_minutes": None,
+            "subscription_eta_null_reason": (
+                "Нет достаточных измерений healthy throughput и cooldown duty cycle"
+            ),
         }

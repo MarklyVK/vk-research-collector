@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, exists, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -17,6 +17,7 @@ from vk_collector.database.models import (
     CampaignStatus,
     ClassificationStatus,
     CollectionCampaign,
+    CollectionCampaignUser,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
@@ -62,6 +63,43 @@ class CampaignManager:
             "collection": queue.collection_configuration(),
         }
 
+    async def plan_preview(self) -> dict[str, object]:
+        """Estimate the narrow snapshot without materializing campaign state."""
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            users = int(
+                await session.scalar(
+                    select(func.count(VKUser.vk_id)).where(self._eligible_user_predicate(now))
+                )
+                or 0
+            )
+            active = await session.scalar(
+                select(CollectionCampaign).where(
+                    CollectionCampaign.campaign_type == "subscription_enrichment",
+                    CollectionCampaign.status.in_(ACTIVE_CAMPAIGN_STATUSES),
+                )
+            )
+        configuration = self.configuration()
+        configuration_hash = hashlib.sha256(
+            json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return {
+            "apply": False,
+            "campaign_type": "subscription_enrichment",
+            "snapshot_users": users,
+            "estimated_snapshot_bytes": users * 96,
+            "cohort_users": self._settings.collection_campaign_cohort_users,
+            "subscription_limit": self._settings.collection_subscriptions_max_per_user,
+            "planning_configuration_hash": configuration_hash,
+            "compatible_active_campaign": (
+                active is not None and active.configuration_hash == configuration_hash
+            ),
+            "incompatible_active_campaign": (
+                active is not None and active.configuration_hash != configuration_hash
+            ),
+            "initial_status": "paused_capacity_limit",
+        }
+
     async def plan(self) -> uuid.UUID:
         """Create or reuse one active campaign for the exact configuration."""
         configuration = self.configuration()
@@ -71,13 +109,12 @@ class CampaignManager:
         now = datetime.now(UTC)
         async with self._sessions() as session:
             await session.execute(
-                select(func.pg_advisory_xact_lock(func.hashtext(configuration_hash)))
+                select(func.pg_advisory_xact_lock(func.hashtext("subscription_enrichment")))
             )
             existing = await session.scalar(
                 select(CollectionCampaign)
                 .where(
                     CollectionCampaign.campaign_type == "subscription_enrichment",
-                    CollectionCampaign.configuration_hash == configuration_hash,
                     CollectionCampaign.status.in_(ACTIVE_CAMPAIGN_STATUSES),
                 )
                 .order_by(CollectionCampaign.created_at.desc())
@@ -85,6 +122,11 @@ class CampaignManager:
                 .with_for_update()
             )
             if existing is not None:
+                if existing.configuration_hash != configuration_hash:
+                    raise ValueError(
+                        "Уже существует активная subscription campaign с другой "
+                        "immutable planning configuration"
+                    )
                 return existing.id
             snapshot_max = int(
                 await session.scalar(
@@ -105,6 +147,23 @@ class CampaignManager:
             )
             session.add(campaign)
             await session.flush()
+            snapshot_select = select(literal(campaign.id), VKUser.vk_id).where(
+                self._eligible_user_predicate(now),
+                VKUser.vk_id <= snapshot_max,
+            )
+            await session.execute(
+                insert(CollectionCampaignUser)
+                .from_select(["campaign_id", "user_id"], snapshot_select)
+                .on_conflict_do_nothing()
+            )
+            campaign.snapshot_user_count = int(
+                await session.scalar(
+                    select(func.count(CollectionCampaignUser.user_id)).where(
+                        CollectionCampaignUser.campaign_id == campaign.id
+                    )
+                )
+                or 0
+            )
             if await self._plan_discovery_cohort(session, campaign) is None:
                 campaign.status = CampaignStatus.COMPLETED.value
                 campaign.phase = CampaignPhase.COMPLETED.value
@@ -133,23 +192,17 @@ class CampaignManager:
     async def _plan_discovery_cohort(
         self, session: AsyncSession, campaign: CollectionCampaign
     ) -> uuid.UUID | None:
-        resolved = select(UserSubscriptionState.user_id).where(
-            or_(
-                UserSubscriptionState.last_success_at.is_not(None),
-                UserSubscriptionState.terminal_reason.is_not(None),
-            )
-        )
+        resolved = self._resolved_user_ids(campaign)
         ids = list(
             (
                 await session.scalars(
-                    select(VKUser.vk_id)
+                    select(CollectionCampaignUser.user_id)
                     .where(
-                        self._eligible_user_predicate(campaign.snapshot_at),
-                        VKUser.vk_id <= campaign.snapshot_max_user_id,
-                        VKUser.vk_id > campaign.last_planned_user_id,
-                        VKUser.vk_id.not_in(resolved),
+                        CollectionCampaignUser.campaign_id == campaign.id,
+                        CollectionCampaignUser.user_id > campaign.last_planned_user_id,
+                        CollectionCampaignUser.user_id.not_in(resolved),
                     )
-                    .order_by(VKUser.vk_id)
+                    .order_by(CollectionCampaignUser.user_id)
                     .limit(self._settings.collection_campaign_cohort_users)
                 )
             ).all()
@@ -209,15 +262,25 @@ class CampaignManager:
         keys = ("capacity_report", "verified_backup", "projected_database_bytes")
         return {key: campaign.configuration[key] for key in keys if key in campaign.configuration}
 
+    def _resolved_user_ids(self, campaign: CollectionCampaign) -> Any:
+        """Reuse canonical state only while its explicit freshness window is valid."""
+        return select(UserSubscriptionState.user_id).where(
+            UserSubscriptionState.next_scheduled_at.is_not(None),
+            UserSubscriptionState.next_scheduled_at > campaign.snapshot_at,
+            or_(
+                UserSubscriptionState.last_success_at.is_not(None),
+                UserSubscriptionState.terminal_reason.is_not(None),
+            ),
+        )
+
     async def _plan_metadata_cohort(
         self, session: AsyncSession, campaign: CollectionCampaign
     ) -> uuid.UUID | None:
         stale_before = datetime.now(UTC) - timedelta(
             days=self._settings.collection_community_metadata_ttl_days
         )
-        eligible_users = select(VKUser.vk_id).where(
-            self._eligible_user_predicate(campaign.snapshot_at),
-            VKUser.vk_id <= campaign.snapshot_max_user_id,
+        eligible_users = select(CollectionCampaignUser.user_id).where(
+            CollectionCampaignUser.campaign_id == campaign.id
         )
         ids = list(
             (
@@ -352,18 +415,12 @@ class CampaignManager:
             await session.commit()
 
     async def _unresolved_count(self, session: AsyncSession, campaign: CollectionCampaign) -> int:
-        resolved = select(UserSubscriptionState.user_id).where(
-            or_(
-                UserSubscriptionState.last_success_at.is_not(None),
-                UserSubscriptionState.terminal_reason.is_not(None),
-            )
-        )
+        resolved = self._resolved_user_ids(campaign)
         return int(
             await session.scalar(
-                select(func.count(VKUser.vk_id)).where(
-                    self._eligible_user_predicate(campaign.snapshot_at),
-                    VKUser.vk_id <= campaign.snapshot_max_user_id,
-                    VKUser.vk_id.not_in(resolved),
+                select(func.count(CollectionCampaignUser.user_id)).where(
+                    CollectionCampaignUser.campaign_id == campaign.id,
+                    CollectionCampaignUser.user_id.not_in(resolved),
                 )
             )
             or 0
@@ -420,15 +477,7 @@ class CampaignManager:
             )
             if campaign is None:
                 return {"campaign_id": None, "status": "absent"}
-            eligible = int(
-                await session.scalar(
-                    select(func.count(VKUser.vk_id)).where(
-                        self._eligible_user_predicate(campaign.snapshot_at),
-                        VKUser.vk_id <= campaign.snapshot_max_user_id,
-                    )
-                )
-                or 0
-            )
+            eligible = campaign.snapshot_user_count
             unresolved = await self._unresolved_count(session, campaign)
             truncated = int(
                 await session.scalar(
@@ -445,6 +494,7 @@ class CampaignManager:
                 "status": campaign.status,
                 "phase": campaign.phase,
                 "snapshot_at": campaign.snapshot_at.isoformat(),
+                "snapshot_users": eligible,
                 "eligible_users": eligible,
                 "resolved_users": max(0, eligible - unresolved),
                 "unresolved_users": unresolved,
@@ -467,9 +517,8 @@ class CampaignManager:
             stale_before = datetime.now(UTC) - timedelta(
                 days=self._settings.collection_community_metadata_ttl_days
             )
-            eligible_users = select(VKUser.vk_id).where(
-                self._eligible_user_predicate(campaign.snapshot_at),
-                VKUser.vk_id <= campaign.snapshot_max_user_id,
+            eligible_users = select(CollectionCampaignUser.user_id).where(
+                CollectionCampaignUser.campaign_id == campaign.id
             )
             total = int(
                 await session.scalar(

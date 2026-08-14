@@ -218,7 +218,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20260815_0008",
+        "20260815_0009",
     )
     assert all(item in script for item in required)
     forbidden = (
@@ -253,7 +253,7 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
 
     required = (
         "flock -n",
-        "20260815_0008",
+        "20260815_0009",
         "collection subscriptions pilot",
         "subscription-gate-a.json",
         "production_allowed",
@@ -289,6 +289,13 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "продолжение выполнит следующий hourly-control",
     )
     assert all(item in script for item in required)
+    active_run_query = script.split("active_runs=$(", 1)[1].split(
+        "paused_capacity_campaigns=$(", 1
+    )[0]
+    assert "'full'" not in active_run_query
+    assert "'incremental'" not in active_run_query
+    assert "paused_capacity_limit" not in active_run_query
+    assert "Переиспользую paused-capacity campaign" in script
     forbidden = (
         "capacity_gate = 'passed'",
         "UPDATE collection_runs",

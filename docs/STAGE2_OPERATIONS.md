@@ -120,3 +120,11 @@ docker compose run --rm collector collection resume --run-id RUN_ID
 сохраняет jobs и checkpoint. Не сбрасывайте cooldown вручную и не увеличивайте
 concurrency: bottleneck `groups.get` определяется квотой метода. Старые pending jobs
 не равны backlog; gaps определяются только state-таблицами.
+
+Лёгкий backlog сначала оценивается без записи командой `collection light-repair`.
+`collection light-repair --apply` разрешает только stale/missing public group metadata
+и доступные user profiles. Pause до Gate A сохраняет capacity-paused run; после apply
+операторская pause сохраняется, и jobs продолжатся только после `campaign resume`.
+Истёкший metadata Gate A обновляется повторным явным `collection capacity-apply` для
+metadata run. Исторические paused full runs видны в отчёте, но не являются причиной
+создания, возобновления или блокировки subscription campaign.

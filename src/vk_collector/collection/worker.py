@@ -54,6 +54,7 @@ JOB_METHODS = {
 }
 FAIR_JOB_TYPES = tuple(JOB_METHODS)
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
+SUBSCRIPTION_LONG_RETRY_MAX_SECONDS = 86400
 logger = logging.getLogger(__name__)
 
 
@@ -378,12 +379,24 @@ class CollectionWorker:
             await self._mark_post_failure(job, None, message, terminal=False)
         if job.job_type == "collect_user_subscriptions":
             await self._mark_subscriptions_transient(job)
-        if job.attempt_count >= len(RETRY_DELAYS):
+        durable_subscription = job.job_type == "collect_user_subscriptions" and category in {
+            "transient",
+            "vk_api",
+        }
+        if job.attempt_count >= len(RETRY_DELAYS) and not durable_subscription:
             await self._queue.finish(
                 job.id, JobStatus.FAILED, error_type=category, error_message=message
             )
             return
-        retry_at = datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS[job.attempt_count - 1])
+        if job.attempt_count <= len(RETRY_DELAYS):
+            delay = RETRY_DELAYS[job.attempt_count - 1]
+        else:
+            long_retry_step = min(2, job.attempt_count - len(RETRY_DELAYS))
+            delay = min(
+                SUBSCRIPTION_LONG_RETRY_MAX_SECONDS,
+                RETRY_DELAYS[-1] * (2**long_retry_step),
+            )
+        retry_at = datetime.now(UTC) + timedelta(seconds=delay)
         await self._queue.finish(
             job.id,
             JobStatus.RETRY_WAIT,
@@ -959,7 +972,10 @@ class CollectionWorker:
                         update(UserGroupSubscription)
                         .where(
                             UserGroupSubscription.user_id == job.entity_id,
-                            UserGroupSubscription.source_run_id != job.run_id,
+                            or_(
+                                UserGroupSubscription.source_run_id != job.run_id,
+                                UserGroupSubscription.source_run_id.is_(None),
+                            ),
                         )
                         .values(is_current=False)
                     )
@@ -1063,7 +1079,6 @@ class CollectionWorker:
                     "metadata_updated_at": now,
                 }
             )
-        missing = sorted(requested - set(by_id))
         async with self._sessions() as session:
             if normalized:
                 statement = insert(VKCommunity).values(normalized)
@@ -1084,33 +1099,26 @@ class CollectionWorker:
                         },
                     )
                 )
-            if missing:
-                await session.execute(
-                    update(VKCommunity)
-                    .where(
-                        VKCommunity.vk_id.in_(missing),
-                        VKCommunity.metadata_updated_at.is_(None),
-                    )
-                    .values(deactivated="unavailable", last_seen_at=now)
-                )
             await self._update_metrics(session, job.id, requests=1, updated=len(normalized))
             await session.commit()
         for extra in extras:
             available = extra.entity_id in by_id
             await self._queue.finish(
                 extra.id,
-                JobStatus.COMPLETED if available else JobStatus.SKIPPED,
-                error_type=None if available else "community_unavailable",
-                error_message=None
+                JobStatus.COMPLETED if available else JobStatus.RETRY_WAIT,
+                error_type=None if available else "community_partial_response",
+                error_message=None if available else "ID отсутствует в частичном groups.getById",
+                retry_at=None
                 if available
-                else "Сообщество отсутствует в ответе groups.getById",
+                else datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS[0]),
             )
         if job.entity_id not in by_id:
             await self._queue.finish(
                 job.id,
-                JobStatus.SKIPPED,
-                error_type="community_unavailable",
-                error_message="Сообщество отсутствует в ответе groups.getById",
+                JobStatus.RETRY_WAIT,
+                error_type="community_partial_response",
+                error_message="ID отсутствует в частичном groups.getById",
+                retry_at=datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS[0]),
             )
             return False
         return True
