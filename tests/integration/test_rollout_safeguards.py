@@ -15,6 +15,7 @@ from vk_collector.collection.worker import CollectionWorker
 from vk_collector.config import Settings
 from vk_collector.database.models import (
     CampaignPhase,
+    CampaignStatus,
     ClassificationStatus,
     CollectionCampaign,
     CollectionJob,
@@ -455,13 +456,25 @@ async def test_pilot_preview_reuse_and_campaign_metadata_transition() -> None:
                 replacement_pilot = await queue.plan_subscriptions(pilot=True)
                 assert replacement_pilot != pilot_id
                 manager = CampaignManager(sessions, settings)
+                campaign_preview = await manager.plan_preview()
                 gate = {
                     "decision": "passed",
                     **{
-                        key: (await manager.plan_preview())[key]
-                        for key in ("planning_configuration_hash", "snapshot_users")
+                        key: campaign_preview[key]
+                        for key in (
+                            "planning_configuration_hash",
+                            "snapshot_users",
+                            "already_resolved_users",
+                            "discovery_due_users",
+                        )
                     },
                     "capacity_report": "test",
+                    "current_database_bytes": 1,
+                    "aggregate_discovery_projected_growth_bytes": 1_000_000_000,
+                    "aggregate_projected_growth_bytes": 1_000_000_000,
+                    "projected_final_database_bytes": 7 * 1024**3 - 1,
+                    "current_disk_free_bytes": 8 * 1024**3,
+                    "safe_database_limit_bytes": 7 * 1024**3,
                 }
                 with pytest.raises(ValueError, match="capacity gate"):
                     await manager.plan(gate_evidence={"decision": "rejected"})
@@ -485,19 +498,6 @@ async def test_pilot_preview_reuse_and_campaign_metadata_transition() -> None:
                         or 0
                     )
                     assert metadata_runs == 1
-                assert await manager.plan(gate_evidence=gate) == campaign_id
-                async with sessions() as session:
-                    await session.execute(
-                        update(CollectionJob)
-                        .where(
-                            CollectionJob.collection_run_id.in_(
-                                select(CollectionRun.id).where(
-                                    CollectionRun.campaign_id == campaign_id
-                                )
-                            )
-                        )
-                        .values(status=JobStatus.COMPLETED)
-                    )
                     metadata_run = await session.scalar(
                         select(CollectionRun).where(
                             CollectionRun.campaign_id == campaign_id,
@@ -505,47 +505,47 @@ async def test_pilot_preview_reuse_and_campaign_metadata_transition() -> None:
                         )
                     )
                     assert metadata_run is not None
-                    metadata_run.status = CollectionRunStatus.COMPLETED
-                    metadata_run.completed_jobs = metadata_run.total_jobs
-                    community = await session.get(VKCommunity, marker + 1)
-                    assert community is not None
-                    community.metadata_updated_at = datetime.now(UTC)
-                    await session.commit()
-                await manager.reconcile(campaign_id)
-                fresh_campaign_id = await manager.plan(gate_evidence=gate)
-                async with sessions() as session:
-                    fresh_campaign = await session.get(CollectionCampaign, fresh_campaign_id)
-                    assert fresh_campaign is not None
-                    assert fresh_campaign.phase == CampaignPhase.COMPLETED.value
-                    assert fresh_campaign.snapshot_user_count == 1
-                    metadata_runs = int(
+                    assert metadata_run.status == CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                    assert metadata_run.total_jobs == 0
+                    assert metadata_run.configuration["metadata_gate_pending"] is True
+                    assert campaign.status == CampaignStatus.PAUSED_CAPACITY_LIMIT.value
+                    assert campaign.configuration["metadata_capacity_gate"] == "pending"
+                    assert (
                         await session.scalar(
-                            select(func.count(CollectionRun.id)).where(
-                                CollectionRun.campaign_id == fresh_campaign_id,
-                                CollectionRun.scope == "subscription_metadata",
+                            select(func.count(CollectionJob.id)).where(
+                                CollectionJob.collection_run_id == metadata_run.id
                             )
                         )
-                        or 0
+                        == 0
                     )
-                    assert metadata_runs == 0
-                    await session.execute(
-                        update(GroupMembership)
-                        .where(GroupMembership.user_id == marker)
-                        .values(is_current=False)
+                    campaign.configuration = {
+                        **campaign.configuration,
+                        "metadata_capacity_gate": "passed",
+                        "metadata_capacity_evidence": {
+                            "current_database_bytes": 1,
+                            "projected_final_database_bytes": 7 * 1024**3 - 1,
+                            "metadata_due": 1,
+                            "aggregate_projected_growth_bytes": 1024,
+                        },
+                    }
+                    assert (
+                        await manager.activate_metadata_cohort(session, campaign, metadata_run)
+                        == metadata_run.id
                     )
                     await session.commit()
-                empty_preview = await manager.plan_preview()
-                gate = {
-                    **gate,
-                    "snapshot_users": empty_preview["snapshot_users"],
-                    "planning_configuration_hash": empty_preview["planning_configuration_hash"],
-                }
-                empty_campaign_id = await manager.plan(gate_evidence=gate)
-                async with sessions() as session:
-                    empty_campaign = await session.get(CollectionCampaign, empty_campaign_id)
-                    assert empty_campaign is not None
-                    assert empty_campaign.status == "completed"
-                    assert empty_campaign.snapshot_user_count == 0
+                    assert metadata_run.total_jobs == 1
+                    assert metadata_run.status == CollectionRunStatus.PLANNED
+                    job_types = set(
+                        (
+                            await session.scalars(
+                                select(CollectionJob.job_type).where(
+                                    CollectionJob.collection_run_id == metadata_run.id
+                                )
+                            )
+                        ).all()
+                    )
+                    assert job_types == {"refresh_community_metadata"}
+                assert await manager.plan(gate_evidence=gate) == campaign_id
             finally:
                 await outer.rollback()
     finally:

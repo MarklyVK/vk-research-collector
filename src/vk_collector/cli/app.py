@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import signal
 import time
 import uuid
@@ -29,7 +31,7 @@ from vk_collector.classification.service import (
 from vk_collector.collection import CollectionQueue, CollectionWorker
 from vk_collector.collection.backlog import canonical_backlog
 from vk_collector.collection.backup import BackupVerifier
-from vk_collector.collection.campaigns import CampaignManager
+from vk_collector.collection.campaigns import CampaignManager, build_aggregate_capacity_projection
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
@@ -914,6 +916,90 @@ def _show_campaign_operation(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+async def _aggregate_campaign_preview(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    manager: CampaignManager,
+    source: Path | None,
+) -> dict[str, object]:
+    """Build a read-only full-snapshot projection from a validated completed Pilot A."""
+    preview = await manager.plan_preview()
+    async with sessions() as session:
+        database_bytes = int(
+            await session.scalar(select(func.pg_database_size(func.current_database()))) or 0
+        )
+    disk = inspect_disk(
+        settings.collection_export_dir,
+        settings.disk_warning_percent,
+        settings.disk_stop_percent,
+    )
+    report_path = source or settings.collection_export_dir / "subscription-gate-a.json"
+    if not report_path.is_file():
+        storage = preview.get("snapshot_storage_estimate")
+        heap = int(storage.get("heap_bytes", 0)) if isinstance(storage, dict) else 0
+        primary_key = int(storage.get("primary_key_bytes", 0)) if isinstance(storage, dict) else 0
+        return {
+            **preview,
+            "gate_a_target_entities": settings.collection_subscriptions_users_per_run,
+            "gate_a_projected_growth_bytes": None,
+            "aggregate_discovery_projected_growth_bytes": None,
+            "snapshot_heap_growth_bytes": heap,
+            "snapshot_primary_key_growth_bytes": primary_key,
+            "snapshot_projected_growth_bytes": None,
+            "aggregate_projected_growth_bytes": None,
+            "reserve_factor": 1.30,
+            "current_database_bytes": database_bytes,
+            "projected_final_database_bytes": None,
+            "current_disk_free_bytes": disk.free_bytes,
+            "projected_final_disk_used_percent": None,
+            "safe_database_limit_bytes": 7 * 1024**3,
+            "decision": "rejected",
+            "rejection_reasons": [
+                f"validated Pilot A capacity report отсутствует: {report_path.resolve()}"
+            ],
+        }
+    collection_configuration = manager.configuration()["collection"]
+    if not isinstance(collection_configuration, dict):
+        raise ValueError("Campaign collection configuration повреждена")
+    report = validate_capacity_report(
+        report_path,
+        phase="A",
+        configuration=collection_configuration,
+        max_age_days=settings.collection_capacity_report_max_age_days,
+    )
+    try:
+        pilot_id = uuid.UUID(str(report["run_id"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("Capacity report содержит некорректный pilot run ID") from exc
+    async with sessions() as session:
+        pilot = await session.get(CollectionRun, pilot_id)
+    if (
+        pilot is None
+        or pilot.scope != "subscriptions_pilot"
+        or pilot.status != CollectionRunStatus.COMPLETED
+    ):
+        raise ValueError("Capacity report не связан с завершённым Pilot A")
+    result = build_aggregate_capacity_projection(
+        preview=preview,
+        report=report,
+        database_bytes=database_bytes,
+        disk=disk,
+        warning_percent=settings.disk_warning_percent,
+    )
+    return {
+        **result,
+        "capacity_report_path": str(report_path.resolve()),
+        "capacity_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "disk": {
+            "total_bytes": disk.total_bytes,
+            "free_bytes": disk.free_bytes,
+            "used_percent": disk.used_percent,
+            "warning": disk.warning,
+            "stop": disk.stop,
+        },
+    }
+
+
 @campaign_app.command("plan")
 def campaign_plan(
     apply: Annotated[
@@ -937,43 +1023,8 @@ def campaign_plan(
             engine = create_database_engine(settings.sqlalchemy_url)
             sessions = create_session_factory(engine)
             try:
-                payload = await CampaignManager(sessions, settings).plan_preview()
-                async with sessions() as session:
-                    database_bytes = int(
-                        await session.scalar(select(func.pg_database_size(func.current_database())))
-                        or 0
-                    )
-                disk = inspect_disk(
-                    settings.collection_export_dir,
-                    settings.disk_warning_percent,
-                    settings.disk_stop_percent,
-                )
-                storage = payload.get("snapshot_storage_estimate")
-                projected_growth = 0
-                if isinstance(storage, dict):
-                    projected_growth = int(
-                        sum(
-                            int(storage.get(key, 0))
-                            for key in (
-                                "heap_bytes",
-                                "primary_key_bytes",
-                                "initial_cohort_jobs_bytes",
-                            )
-                        )
-                        * float(storage.get("reserve_factor", 1.30))
-                    )
-                return {
-                    **payload,
-                    "database_bytes": database_bytes,
-                    "disk": {
-                        "total_bytes": disk.total_bytes,
-                        "free_bytes": disk.free_bytes,
-                        "used_percent": disk.used_percent,
-                        "warning": disk.warning,
-                        "stop": disk.stop,
-                    },
-                    "projected_growth_with_reserve_bytes": projected_growth,
-                }
+                manager = CampaignManager(sessions, settings)
+                return await _aggregate_campaign_preview(sessions, settings, manager, source)
             finally:
                 await engine.dispose()
 
@@ -992,76 +1043,27 @@ def campaign_plan(
         sessions = create_session_factory(engine)
         try:
             manager = CampaignManager(sessions, settings)
-            preview = await manager.plan_preview()
             backup_metadata = _validated_backup_metadata(backup)
-            collection_configuration = manager.configuration()["collection"]
-            if not isinstance(collection_configuration, dict):
-                raise ValueError("Campaign collection configuration повреждена")
-            report = validate_capacity_report(
-                source,
-                phase="A",
-                configuration=collection_configuration,
-                max_age_days=settings.collection_capacity_report_max_age_days,
-            )
-            try:
-                pilot_id = uuid.UUID(str(report["run_id"]))
-            except (KeyError, ValueError) as exc:
-                raise ValueError("Capacity report содержит некорректный pilot run ID") from exc
-            async with sessions() as session:
-                pilot = await session.get(CollectionRun, pilot_id)
-                database_bytes = int(
-                    await session.scalar(select(func.pg_database_size(func.current_database())))
-                    or 0
+            evidence = await _aggregate_campaign_preview(sessions, settings, manager, source)
+            if evidence.get("decision") != "passed":
+                reasons = evidence.get("rejection_reasons")
+                reason_text = (
+                    "; ".join(str(item) for item in reasons)
+                    if isinstance(reasons, list)
+                    else "неизвестная причина"
                 )
-            if (
-                pilot is None
-                or pilot.scope != "subscriptions_pilot"
-                or pilot.status != CollectionRunStatus.COMPLETED
-            ):
-                raise ValueError("Capacity report не связан с завершённым Pilot A")
-            storage = preview.get("snapshot_storage_estimate")
-            if not isinstance(storage, dict):
-                raise ValueError("Campaign preview не содержит storage projection")
-            snapshot_growth = sum(
-                int(storage.get(key, 0))
-                for key in ("heap_bytes", "primary_key_bytes", "initial_cohort_jobs_bytes")
-            )
-            reserve_factor = float(storage.get("reserve_factor", 1.30))
-            reserved_growth = int(snapshot_growth * reserve_factor)
-            disk = inspect_disk(
-                settings.collection_export_dir,
-                settings.disk_warning_percent,
-                settings.disk_stop_percent,
-            )
-            report_projection = report.get("projected", {}).get("database_bytes")
-            projected_database = (
-                int(report_projection) + reserved_growth
-                if isinstance(report_projection, int)
-                else database_bytes + reserved_growth
-            )
-            projected_used = (
-                100.0 * (disk.total_bytes - disk.free_bytes + reserved_growth) / disk.total_bytes
-            )
-            if (
-                disk.warning
-                or disk.stop
-                or reserved_growth > disk.free_bytes
-                or projected_used >= settings.disk_warning_percent
-                or projected_database > int(report["safe_disk_limit_bytes"])
-            ):
-                raise ValueError("Campaign apply отклонён disk/capacity projection до snapshot")
-            evidence: dict[str, object] = {
-                "decision": "passed",
-                "planning_configuration_hash": preview["planning_configuration_hash"],
-                "snapshot_users": preview["snapshot_users"],
+                raise ValueError(
+                    "aggregate capacity rejected: "
+                    + reason_text
+                    + "; требуется дополнительно "
+                    + f"{evidence.get('additional_disk_required_bytes')} bytes"
+                )
+            evidence = {
+                **evidence,
                 "capacity_report": str(source.resolve()),
+                "capacity_report_path": str(source.resolve()),
                 "verified_backup": backup_metadata,
-                "projected_database_bytes": projected_database,
-                "snapshot_projected_growth_bytes": reserved_growth,
-                "disk_free_bytes": disk.free_bytes,
-                "disk_used_percent": disk.used_percent,
-                "projected_disk_used_percent": projected_used,
-                "reserve_factor": reserve_factor,
+                "projected_database_bytes": evidence["projected_final_database_bytes"],
                 "verified_at": datetime.now(UTC).isoformat(),
             }
             campaign_id = await manager.plan(gate_evidence=evidence)
@@ -1961,7 +1963,10 @@ async def _apply_capacity(
             run = await session.get(CollectionRun, run_id, with_for_update=True)
             if run is None:
                 raise ValueError("Collection run не найден")
-            if run.status != CollectionRunStatus.PAUSED_CAPACITY_LIMIT or run.total_jobs <= 0:
+            metadata_gate_pending = bool(run.configuration.get("metadata_gate_pending"))
+            if run.status != CollectionRunStatus.PAUSED_CAPACITY_LIMIT or (
+                run.total_jobs <= 0 and not metadata_gate_pending
+            ):
                 raise ValueError(
                     "Capacity gate можно применить только к непустому run на capacity-паузе"
                 )
@@ -2022,6 +2027,13 @@ async def _apply_capacity(
                 raise ValueError("Capacity report нельзя применить к этому scope")
             metadata_evidence: dict[str, object] | None = None
             if run.scope == "subscription_metadata":
+                if run.campaign_id is None:
+                    raise ValueError("Metadata run не связан с campaign")
+                manager = CampaignManager(sessions, settings)
+                metadata_counts = await manager.metadata_preview(run.campaign_id)
+                metadata_due = int(metadata_counts["metadata_due"])
+                if metadata_due <= 0:
+                    raise ValueError("Metadata backlog пуст; gate не требуется")
                 average_row_bytes = int(
                     await session.scalar(
                         text(
@@ -2033,7 +2045,12 @@ async def _apply_capacity(
                 )
                 reserve_factor = 1.30
                 per_job_bytes = max(1024, average_row_bytes + 512)
-                projected_metadata_growth = int(run.total_jobs * per_job_bytes * reserve_factor)
+                projected_metadata_growth = math.ceil(metadata_due * per_job_bytes * reserve_factor)
+                current_database = int(
+                    await session.scalar(select(func.pg_database_size(func.current_database())))
+                    or 0
+                )
+                projected_metadata_database = current_database + projected_metadata_growth
                 disk = inspect_disk(
                     settings.collection_export_dir,
                     settings.disk_warning_percent,
@@ -2049,18 +2066,27 @@ async def _apply_capacity(
                     or disk.stop
                     or projected_metadata_growth > disk.free_bytes
                     or projected_used >= settings.disk_warning_percent
+                    or projected_metadata_database > int(safe_limit)
                 ):
-                    raise ValueError("Metadata capacity renewal отклонён disk projection")
+                    raise ValueError(
+                        "Metadata aggregate capacity отклонён: "
+                        f"projected_database={projected_metadata_database}, "
+                        f"safe_limit={safe_limit}, disk_free={disk.free_bytes}"
+                    )
                 metadata_evidence = {
-                    "kind": "metadata_lightweight_capacity",
+                    "kind": "metadata_aggregate_capacity",
                     "checked_at": datetime.now(UTC).isoformat(),
-                    "jobs": run.total_jobs,
+                    "metadata_distinct_communities": int(metadata_counts["unique_communities"]),
+                    "metadata_due": metadata_due,
                     "measured_average_community_row_bytes": average_row_bytes,
                     "conservative_per_job_bytes": per_job_bytes,
-                    "projected_growth_bytes": projected_metadata_growth,
+                    "aggregate_projected_growth_bytes": projected_metadata_growth,
+                    "current_database_bytes": current_database,
+                    "projected_final_database_bytes": projected_metadata_database,
+                    "safe_database_limit_bytes": int(safe_limit),
                     "reserve_factor": reserve_factor,
-                    "disk_free_bytes": disk.free_bytes,
-                    "projected_disk_used_percent": projected_used,
+                    "current_disk_free_bytes": disk.free_bytes,
+                    "projected_final_disk_used_percent": projected_used,
                 }
             run.configuration = {
                 **run.configuration,
@@ -2104,12 +2130,22 @@ async def _apply_capacity(
                         if metadata_evidence is not None
                         else {}
                     ),
+                    **(
+                        {"metadata_capacity_gate": "passed"}
+                        if metadata_evidence is not None
+                        else {}
+                    ),
                 }
                 campaign.status = (
                     CampaignStatus.PAUSED.value if operator_paused else CampaignStatus.RUNNING.value
                 )
                 campaign.started_at = campaign.started_at or datetime.now(UTC)
                 campaign.error_message = None
+                if metadata_evidence is not None and metadata_gate_pending:
+                    manager = CampaignManager(sessions, settings)
+                    planned = await manager.activate_metadata_cohort(session, campaign, run)
+                    if planned is None:
+                        raise ValueError("Metadata gate passed, но bounded cohort не создан")
             await session.commit()
             return {
                 "run_id": str(run_id),

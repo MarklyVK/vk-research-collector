@@ -40,7 +40,7 @@ jobs:
       - name: Подтвердить commit и действие
         shell: bash
         env:
-          CONTROL_ACTION: ${{ github.event_name == 'schedule' && 'start-subscriptions' || inputs.action }}
+          CONTROL_ACTION: ${{ github.event_name == 'schedule' && 'report' || inputs.action }}
           CONTROL_CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -Eeuo pipefail
@@ -49,9 +49,8 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           case "$CONTROL_ACTION" in
             start-subscriptions)
-              if [[ "$GITHUB_EVENT_NAME" != schedule ]]; then
-                test "$CONTROL_CONFIRMATION" = START_SUBSCRIPTIONS
-              fi
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              test "$CONTROL_CONFIRMATION" = START_SUBSCRIPTIONS
               ;;
             report) ;;
             *) exit 2 ;;
@@ -59,7 +58,7 @@ jobs:
       - name: Выполнить production control
         shell: bash
         env:
-          CONTROL_ACTION: ${{ github.event_name == 'schedule' && 'start-subscriptions' || inputs.action }}
+          CONTROL_ACTION: ${{ github.event_name == 'schedule' && 'report' || inputs.action }}
           DEPLOY_ROOT: /opt/vk-research-collector
         run: |
           set -Eeuo pipefail

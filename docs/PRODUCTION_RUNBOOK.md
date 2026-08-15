@@ -2,10 +2,18 @@
 
 ## Ежедневная диагностика
 
-Workflow `Production collection control` каждый час проверяет очередь. Если разрешённый
-run ещё активен, scheduled-запуск завершается без изменений. Если партия подписок
-завершена, workflow повторно проходит Gate A и создаёт следующую cohort. Ручной запуск
-`start-subscriptions` по-прежнему требует подтверждение `START_SUBSCRIPTIONS`.
+Workflow `Production collection control` каждый час выполняет только read-only
+`action=report`: scheduled-запуск не создаёт Pilot A, campaign, runs или jobs.
+`start-subscriptions` доступен только через `workflow_dispatch` и требует точного
+подтверждения `START_SUBSCRIPTIONS`.
+
+При rolling deploy старый active subscriptions-run не удаляется и не отменяется:
+его ID, status и job counts фиксируются в report. Несовпадающая immutable runtime
+configuration переводит run в `paused_capacity_limit`; jobs и checkpoints остаются
+без изменений. Новая campaign строит `discovery_due` только по каноническому
+`UserSubscriptionState`: свежие successful/terminal состояния переиспользуются, а
+остальные eligible users попадают в новый snapshot независимо от исторических job
+rows. Старый run нельзя cancel до подтверждения полного coverage новой campaign.
 
 Деплой и ручная очистка не удаляют backup, указанный в `verified_backup` незавершённого
 запуска. После изменения прав каталога деплой восстанавливает для UID collector только

@@ -10,7 +10,10 @@ from pydantic import SecretStr, ValidationError
 
 from vk_collector.cli.app import _validate_autonomous_run, _validated_backup_metadata
 from vk_collector.collection.backup import BackupVerifier
-from vk_collector.collection.campaigns import choose_campaign_control_action
+from vk_collector.collection.campaigns import (
+    build_aggregate_capacity_projection,
+    choose_campaign_control_action,
+)
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
@@ -20,7 +23,7 @@ from vk_collector.collection.notifications import notify
 from vk_collector.collection.pilots import choose_pilot_control_action
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import bounded_wakeup_delay
-from vk_collector.collection.safety import inspect_disk, sanitize_message
+from vk_collector.collection.safety import DiskState, inspect_disk, sanitize_message
 from vk_collector.collection.worker import normalize_attachment
 from vk_collector.config import Settings
 from vk_collector.vk import TokenPool, VKMethodUnavailable
@@ -41,6 +44,57 @@ def test_subscription_limit_accepts_50_but_rejects_more() -> None:
     )
     with pytest.raises(ValidationError):
         Settings(collection_subscriptions_max_per_user=51)
+
+
+def test_aggregate_capacity_scales_gate_a_to_full_discovery_snapshot() -> None:
+    preview = {
+        "snapshot_users": 20_000,
+        "already_resolved_users": 0,
+        "discovery_due_users": 20_000,
+        "snapshot_storage_estimate": {
+            "heap_bytes": 20_000 * 64,
+            "primary_key_bytes": 20_000 * 48,
+        },
+    }
+    report = {
+        "limits": {"production_users": 10_000},
+        "projected": {"database_growth_bytes": 200_000_000, "reserve_factor": 1.30},
+    }
+    rejected = build_aggregate_capacity_projection(
+        preview=preview,
+        report=report,
+        database_bytes=7 * 1024**3 - 300_000_000,
+        disk=DiskState(
+            used_percent=70.0,
+            warning=False,
+            stop=False,
+            total_bytes=10 * 1024**3,
+            free_bytes=3 * 1024**3,
+        ),
+        warning_percent=85,
+    )
+    assert rejected["gate_a_target_entities"] == 10_000
+    assert rejected["gate_a_projected_growth_bytes"] == 200_000_000
+    assert rejected["aggregate_discovery_projected_growth_bytes"] == 400_000_000
+    assert rejected["decision"] == "rejected"
+    assert rejected["rejection_reasons"]
+
+    passed = build_aggregate_capacity_projection(
+        preview=preview,
+        report=report,
+        database_bytes=1_000_000_000,
+        disk=DiskState(
+            used_percent=20.0,
+            warning=False,
+            stop=False,
+            total_bytes=10 * 1024**3,
+            free_bytes=8 * 1024**3,
+        ),
+        warning_percent=85,
+    )
+    assert passed["decision"] == "passed"
+    assert passed["snapshot_projected_growth_bytes"] == 2_912_000
+    assert passed["aggregate_projected_growth_bytes"] == 402_912_000
 
 
 def test_pilot_control_decision_is_run_id_specific_and_terminal_safe() -> None:
@@ -182,6 +236,7 @@ def test_collection_configuration_captures_capacity_limits() -> None:
     assert small.collection_configuration()["posts_max_per_group"] == 100
     assert small.collection_configuration()["members_max_per_group"] == 200
     assert small.collection_configuration()["subscription_posts_ttl_days"] == 30
+    assert small.collection_configuration()["subscription_posts_enabled"] is False
 
 
 def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) -> None:

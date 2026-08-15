@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from vk_collector.collection.campaigns import CampaignManager
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import capacity_gate_passed, latest_runnable_run_id
+from vk_collector.collection.safety import DiskState
 from vk_collector.collection.worker import CollectionWorker
 from vk_collector.config import Settings
 from vk_collector.database.models import (
@@ -787,13 +788,25 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
                     )
                     await session.commit()
                 manager = CampaignManager(sessions, settings)
+                campaign_preview = await manager.plan_preview()
                 gate = {
                     "decision": "passed",
                     **{
-                        key: (await manager.plan_preview())[key]
-                        for key in ("planning_configuration_hash", "snapshot_users")
+                        key: campaign_preview[key]
+                        for key in (
+                            "planning_configuration_hash",
+                            "snapshot_users",
+                            "already_resolved_users",
+                            "discovery_due_users",
+                        )
                     },
                     "capacity_report": "test",
+                    "current_database_bytes": 1,
+                    "aggregate_discovery_projected_growth_bytes": 1_000_000_000,
+                    "aggregate_projected_growth_bytes": 1_000_000_000,
+                    "projected_final_database_bytes": 7 * 1024**3 - 1,
+                    "current_disk_free_bytes": 8 * 1024**3,
+                    "safe_database_limit_bytes": 7 * 1024**3,
                 }
                 campaign_id = await manager.plan(gate_evidence=gate)
                 assert await manager.plan(gate_evidence=gate) == campaign_id
@@ -906,6 +919,7 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
                     campaign = await session.get(CollectionCampaign, campaign_id)
                     assert campaign is not None
                     assert campaign.phase == "subscription_metadata"
+                    assert campaign.status == "paused_capacity_limit"
                     assert (
                         await session.scalar(
                             select(func.count(CollectionJob.id))
@@ -917,6 +931,256 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
                                 CollectionRun.campaign_id == campaign_id,
                                 CollectionJob.job_type == "refresh_community_metadata",
                             )
+                        )
+                        == 0
+                    )
+                    metadata_run = await session.scalar(
+                        select(CollectionRun).where(
+                            CollectionRun.campaign_id == campaign_id,
+                            CollectionRun.scope == "subscription_metadata",
+                        )
+                    )
+                    assert metadata_run is not None
+                    assert metadata_run.status == CollectionRunStatus.PAUSED_CAPACITY_LIMIT
+                    assert metadata_run.total_jobs == 0
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_campaign_apply_rolls_back_when_eligible_or_resolved_counts_change() -> None:
+    engine = create_database_engine(database_url())
+    marker = int(uuid.uuid4().hex[:10], 16) + 60_000_000_000
+    settings = Settings(database_url=database_url(), collection_campaign_cohort_users=2)
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+            )
+            try:
+                now = datetime.now(UTC)
+                async with sessions() as session:
+                    group = GroupCandidate(
+                        vk_id=marker,
+                        name="Aggregate race group",
+                        description="",
+                        status_text="",
+                        address=f"https://vk.com/{marker}",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        classification_status=ClassificationStatus.APPROVED,
+                    )
+                    user = VKUser(
+                        vk_id=marker,
+                        is_closed=False,
+                        can_access_closed=True,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                    session.add_all([group, user])
+                    await session.flush()
+                    session.add(
+                        GroupMembership(
+                            group_id=group.id,
+                            user_id=user.vk_id,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                            is_current=True,
+                        )
+                    )
+                    await session.commit()
+                manager = CampaignManager(sessions, settings)
+                preview = await manager.plan_preview()
+                gate = {
+                    "decision": "passed",
+                    **{
+                        key: preview[key]
+                        for key in (
+                            "planning_configuration_hash",
+                            "snapshot_users",
+                            "already_resolved_users",
+                            "discovery_due_users",
+                        )
+                    },
+                    "current_database_bytes": 1,
+                    "aggregate_discovery_projected_growth_bytes": 1_000_000,
+                    "aggregate_projected_growth_bytes": 1_000_000,
+                    "projected_final_database_bytes": 2_000_000_000,
+                    "current_disk_free_bytes": 8 * 1024**3,
+                    "safe_database_limit_bytes": 7 * 1024**3,
+                }
+                async with sessions() as session:
+                    second = VKUser(
+                        vk_id=marker + 1,
+                        is_closed=False,
+                        can_access_closed=True,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                    session.add(second)
+                    await session.flush()
+                    session.add(
+                        GroupMembership(
+                            group_id=group.id,
+                            user_id=second.vk_id,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                            is_current=True,
+                        )
+                    )
+                    await session.commit()
+                with pytest.raises(ValueError, match="Eligible/resolved counts"):
+                    await manager.plan(gate_evidence=gate)
+                async with sessions() as session:
+                    assert (
+                        int(await session.scalar(select(func.count(CollectionCampaign.id))) or 0)
+                        == 0
+                    )
+                    assert (
+                        int(
+                            await session.scalar(select(func.count(CollectionCampaignUser.user_id)))
+                            or 0
+                        )
+                        == 0
+                    )
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_next_discovery_cohort_pauses_when_durable_budget_is_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_database_engine(database_url())
+    marker = int(uuid.uuid4().hex[:10], 16) + 70_000_000_000
+    settings = Settings(database_url=database_url(), collection_campaign_cohort_users=2)
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+            )
+            try:
+                now = datetime.now(UTC)
+                async with sessions() as session:
+                    group = GroupCandidate(
+                        vk_id=marker,
+                        name="Durable budget group",
+                        description="",
+                        status_text="",
+                        address=f"https://vk.com/{marker}",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        classification_status=ClassificationStatus.APPROVED,
+                    )
+                    session.add(group)
+                    await session.flush()
+                    users = [
+                        VKUser(
+                            vk_id=marker + index,
+                            is_closed=False,
+                            can_access_closed=True,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                        )
+                        for index in range(3)
+                    ]
+                    session.add_all(users)
+                    await session.flush()
+                    session.add_all(
+                        [
+                            GroupMembership(
+                                group_id=group.id,
+                                user_id=user.vk_id,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                                is_current=True,
+                            )
+                            for user in users
+                        ]
+                    )
+                    initial_database = int(
+                        await session.scalar(select(func.pg_database_size(func.current_database())))
+                        or 0
+                    )
+                    await session.commit()
+                manager = CampaignManager(sessions, settings)
+                preview = await manager.plan_preview()
+                gate = {
+                    "decision": "passed",
+                    **{
+                        key: preview[key]
+                        for key in (
+                            "planning_configuration_hash",
+                            "snapshot_users",
+                            "already_resolved_users",
+                            "discovery_due_users",
+                        )
+                    },
+                    "current_database_bytes": initial_database,
+                    "aggregate_discovery_projected_growth_bytes": 100,
+                    "aggregate_projected_growth_bytes": 100,
+                    "projected_final_database_bytes": initial_database + 100,
+                    "current_disk_free_bytes": 8 * 1024**3,
+                    "safe_database_limit_bytes": 7 * 1024**3,
+                }
+                campaign_id = await manager.plan(gate_evidence=gate)
+                async with sessions() as session:
+                    first_run = await session.scalar(
+                        select(CollectionRun).where(CollectionRun.campaign_id == campaign_id)
+                    )
+                    assert first_run is not None and first_run.total_jobs == 2
+                    jobs = list(
+                        (
+                            await session.scalars(
+                                select(CollectionJob).where(
+                                    CollectionJob.collection_run_id == first_run.id
+                                )
+                            )
+                        ).all()
+                    )
+                    for job in jobs:
+                        job.status = JobStatus.COMPLETED
+                        session.add(
+                            UserSubscriptionState(
+                                user_id=job.entity_id,
+                                last_success_at=now,
+                                next_scheduled_at=now + timedelta(days=30),
+                                last_run_id=first_run.id,
+                                last_campaign_id=campaign_id,
+                            )
+                        )
+                    await session.commit()
+                monkeypatch.setattr(
+                    "vk_collector.collection.campaigns.inspect_disk",
+                    lambda *_args, **_kwargs: DiskState(
+                        used_percent=85.0,
+                        warning=True,
+                        stop=False,
+                        total_bytes=10 * 1024**3,
+                        free_bytes=1,
+                    ),
+                )
+                await manager.reconcile(campaign_id)
+                async with sessions() as session:
+                    campaign = await session.get(CollectionCampaign, campaign_id)
+                    assert campaign is not None
+                    assert campaign.status == "paused_capacity_limit"
+                    assert campaign.last_planned_user_id == jobs[-1].entity_id
+                    assert "Следующий discovery cohort отклонён" in str(campaign.error_message)
+                    assert (
+                        int(
+                            await session.scalar(
+                                select(func.count(CollectionRun.id)).where(
+                                    CollectionRun.campaign_id == campaign_id
+                                )
+                            )
+                            or 0
                         )
                         == 1
                     )

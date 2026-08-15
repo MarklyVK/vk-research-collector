@@ -248,8 +248,9 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
     assert job["runs-on"] == ["self-hosted", "linux", "x64", "production", "vk-collector"]
     assert job["environment"] == {"name": "production"}
     assert "START_SUBSCRIPTIONS" in workflow_text
-    assert "github.event_name == 'schedule'" in workflow_text
-    assert '"$GITHUB_EVENT_NAME" != schedule' in workflow_text
+    assert "github.event_name == 'schedule' && 'report'" in workflow_text
+    assert 'test "$GITHUB_EVENT_NAME" = workflow_dispatch' in workflow_text
+    assert "schedule' && 'start-subscriptions'" not in workflow_text
 
     required = (
         "flock -n",

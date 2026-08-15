@@ -57,11 +57,20 @@ bytes, или 101,34 bytes/user. Планировщик консервативн
 768 bytes/job и общий reserve factor 1,30. Это локальное измерение, а не заново
 проверенный production-срез.
 
-`campaign plan` полностью read-only. Материализация разрешена только командой
+`campaign plan` полностью read-only и масштабирует измеренный прогноз Pilot A не на
+первую cohort, а на всех `discovery_due_users` фиксируемого snapshot. Отдельно
+учитываются heap и primary key `collection_campaign_users`; исторические строки
+`collection_jobs` входят в измеренный per-user рост. Итог с reserve не меньше 1,30
+должен одновременно помещаться в 7 GiB, свободный диск и порог 85%.
+Материализация разрешена только командой
 `campaign plan --apply --source REPORT --backup DUMP`: свежесть/конфигурация Pilot A,
-PGDMP fingerprint, текущий диск, snapshot heap/PK, initial cohort jobs и reserve
+PGDMP fingerprint, текущий диск, полный discovery backlog, snapshot heap/PK и reserve
 проверяются до первого INSERT в `collection_campaign_users`. Campaign, snapshot и
 первый cohort затем создаются одной транзакцией уже с immutable gate evidence.
+
+Перед каждой следующей discovery cohort повторно проверяются текущий размер БД,
+свободный диск и оставшийся durable budget. Превышение evidence переводит campaign в
+`paused_capacity_limit`, не меняя snapshot, cursor и завершённые checkpoints.
 
 Частичный уникальный индекс PostgreSQL запрещает вторую активную кампанию одного типа
 при любом configuration hash. Hash включает только immutable planning configuration;
@@ -71,7 +80,10 @@ evidence и hash не меняют. `collection_runs.campaign_id` nullable, по
 
 Переход discovery -> metadata разрешён только когда нет active/failed discovery
 jobs и каждый eligible user имеет successful (включая truncated) либо terminal
-state. Transient error остаётся retryable и блокирует переход. После рестарта
+state. Transient error остаётся retryable и блокирует переход. После полного discovery
+сначала сохраняются distinct communities, весь `metadata_due`, aggregate metadata
+projection и live disk evidence. Создаётся только paused gate-run без jobs; bounded
+metadata cohort появляется лишь после явного capacity decision. После рестарта
 planner продолжает от durable курсоров; повторное планирование использует ту же
 кампанию и уникальные job constraints.
 
