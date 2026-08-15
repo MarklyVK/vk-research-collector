@@ -113,3 +113,42 @@ docker compose run --rm collector collection resume --run-id RUN_ID
 
 Формат: `backups/stage2-PURPOSE-YYYYMMDD-HHMMSSZ.dump`. После `pg_dump -Fc` обязательно
 проверить ненулевой размер и `pg_restore --list`. Каталог исключён из Git.
+# Дополнение: операции с кампанией
+
+Используйте `collection backlog`, `collection campaign status` и
+`collection method-limits` для read-only диагностики. `campaign pause/resume`
+сохраняет jobs и checkpoint. Не сбрасывайте cooldown вручную и не увеличивайте
+concurrency: bottleneck `groups.get` определяется квотой метода. Старые pending jobs
+не равны backlog; gaps определяются только state-таблицами.
+
+Лёгкий backlog сначала оценивается без записи командой `collection light-repair`.
+`collection light-repair --apply` разрешает только stale/missing public group metadata
+и доступные user profiles, выполняет disk gate и создаёт cohort не более 10 000 jobs.
+Повторная apply после terminal cohort планирует следующий deterministic cohort.
+Pause до Gate A сохраняет capacity-paused run; после apply
+операторская pause сохраняется, и jobs продолжатся только после `campaign resume`.
+Истёкший metadata Gate A обновляется повторным явным `collection capacity-apply` для
+конкретного metadata run. Renewal дополнительно измеряет средний размер строки
+`vk_communities`, проверяет metadata jobs, reserve 1,30 и текущий диск; новый discovery
+run/campaign не создаётся. Исторические paused full runs видны в отчёте, но не являются причиной
+создания, возобновления или блокировки subscription campaign.
+
+Перед созданием production campaign выполните только read-only preview, затем atomic
+apply с уже проверенными артефактами:
+
+```bash
+docker compose run --rm collector collection campaign plan
+docker compose run --rm collector collection campaign plan --apply \
+  --source /app/exports/stage2-pilot/subscription-gate-a.json \
+  --backup /app/backups/VERIFIED.dump
+```
+
+Незавершённый Pilot A диагностируется и продолжается только по его ID:
+
+```bash
+docker compose run --rm collector collection subscriptions pilot-preview
+docker compose run --rm collector collection subscriptions pilot --run-id PILOT_RUN_ID
+# obsolete/incompatible — только после read-only preview:
+docker compose run --rm collector collection subscriptions cancel-pilot \
+  --run-id PILOT_RUN_ID --confirm --reason "операторское решение"
+```

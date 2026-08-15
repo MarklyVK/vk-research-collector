@@ -70,10 +70,15 @@ class Settings(BaseSettings):
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
     collection_subscriptions_enabled: bool = False
-    collection_subscriptions_max_per_user: int = Field(default=50, ge=1, le=100)
+    collection_subscriptions_max_per_user: int = Field(default=50, ge=1, le=50)
     collection_subscriptions_page_size: int = Field(default=50, ge=1, le=1000)
     collection_subscriptions_users_per_run: int = Field(default=10000, ge=1)
     collection_subscriptions_ttl_days: int = Field(default=30, ge=1)
+    collection_campaign_cohort_users: int = Field(default=10_000, ge=1, le=10_000)
+    collection_light_repair_cohort_size: int = Field(default=10_000, ge=1, le=10_000)
+    collection_community_metadata_batch_size: int = Field(default=100, ge=1, le=100)
+    collection_community_metadata_ttl_days: int = Field(default=30, ge=1)
+    collection_scheduler_quantum: int = Field(default=10, ge=1, le=100)
     collection_subscription_pilot_users: int = Field(default=500, ge=1, le=500)
     collection_subscription_pilot_min_users: int = Field(default=100, ge=1, le=500)
     collection_subscription_group_posts_enabled: bool = False

@@ -103,7 +103,8 @@ async def test_method_limit_switches_token_and_keeps_other_methods(error_code: i
 
 
 @pytest.mark.asyncio
-async def test_all_tokens_limited_for_exact_method_raise_unavailable() -> None:
+@pytest.mark.parametrize("error_code", [9, 29])
+async def test_all_tokens_limited_for_exact_method_raise_unavailable(error_code: int) -> None:
     time = FakeTime()
     pool = TokenPool(
         ["a", "b"],
@@ -113,11 +114,12 @@ async def test_all_tokens_limited_for_exact_method_raise_unavailable() -> None:
         flood_initial_cooldown=10,
     )
     first = await pool.acquire("groups.get")
-    await pool.method_cooldown(first, 9)
+    await pool.method_cooldown(first, error_code)
     second = await pool.acquire("groups.get")
-    await pool.method_cooldown(second, 9)
-    with pytest.raises(VKMethodUnavailable):
+    await pool.method_cooldown(second, error_code)
+    with pytest.raises(VKMethodUnavailable) as limited:
         await pool.acquire("groups.get")
+    assert limited.value.error_code == error_code
     assert (await pool.acquire("wall.get")).fingerprint in {
         first.fingerprint,
         second.fingerprint,
@@ -367,3 +369,64 @@ async def test_subscriptions_request_uses_extended_objects_and_requested_limit()
     assert captured["extended"] == "1"
     assert captured["count"] == "100"
     assert "description" in captured["fields"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_ids_page_is_strict_sorted_deduplicated_and_id_only() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={"response": {"count": 70, "items": [9, 2, 9, 5]}})
+
+    time = FakeTime()
+    pool = TokenPool(["fake"], rps=1000, clock=time.clock, sleep=time.sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        page = await VKClient(pool, http_client=http).get_subscription_ids_page(42, 10, 40)
+    assert captured == {
+        "user_id": "42",
+        "offset": "10",
+        "count": "40",
+        "extended": "0",
+        "access_token": "fake",
+        "v": "5.199",
+    }
+    assert page.total_reported == 70
+    assert page.group_ids == (2, 5, 9)
+    assert page.returned_count == 4
+    assert page.next_offset == 14
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [[], {"count": 1, "items": "bad"}, {"count": 1, "items": [True]}, {"count": 1, "items": [0]}],
+)
+async def test_subscription_ids_page_rejects_invalid_response(response: object) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": response})
+
+    time = FakeTime()
+    pool = TokenPool(["fake"], rps=1000, clock=time.clock, sleep=time.sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        with pytest.raises(VKAPIError):
+            await VKClient(pool, http_client=http).get_subscription_ids_page(1, 0, 50)
+
+
+@pytest.mark.asyncio
+async def test_subscription_ids_page_accepts_empty_items() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": {"count": 0, "items": []}})
+
+    time = FakeTime()
+    pool = TokenPool(["fake"], rps=1000, clock=time.clock, sleep=time.sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        page = await VKClient(pool, http_client=http).get_subscription_ids_page(1, 0, 50)
+    assert page.group_ids == ()
+    assert page.next_offset == 0

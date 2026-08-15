@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import distinct, func, select
@@ -47,7 +48,15 @@ async def latest_runnable_run_id(
             select(CollectionRun.id)
             .where(
                 CollectionRun.scope.in_(
-                    ["full", "incremental", "subscriptions", "subscription_posts"]
+                    [
+                        "full",
+                        "incremental",
+                        "subscriptions",
+                        "subscription_posts",
+                        "subscription_discovery",
+                        "subscription_metadata",
+                        "light_repair",
+                    ]
                 ),
                 CollectionRun.status.in_(
                     [
@@ -62,6 +71,98 @@ async def latest_runnable_run_id(
             .limit(1)
         )
         return run_id
+
+
+async def runnable_run_ids(
+    sessions: async_sessionmaker[AsyncSession],
+) -> list[uuid.UUID]:
+    """Return every operator-authorized non-pilot run for fair autonomous scheduling."""
+    async with sessions() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(CollectionRun.id)
+                    .where(
+                        CollectionRun.scope.in_(
+                            [
+                                "full",
+                                "incremental",
+                                "subscriptions",
+                                "subscription_posts",
+                                "subscription_discovery",
+                                "subscription_metadata",
+                                "light_repair",
+                            ]
+                        ),
+                        CollectionRun.status.in_(
+                            [
+                                CollectionRunStatus.PLANNED,
+                                CollectionRunStatus.RUNNING,
+                                CollectionRunStatus.WAITING_METHOD_LIMIT,
+                            ]
+                        ),
+                        CollectionRun.configuration["capacity_gate"].astext == "passed",
+                    )
+                    .order_by(CollectionRun.created_at, CollectionRun.id)
+                )
+            ).all()
+        )
+
+
+async def next_runnable_wakeup(
+    sessions: async_sessionmaker[AsyncSession],
+) -> datetime | None:
+    """Return the nearest persisted run/job wakeup for authorized work."""
+    async with sessions() as session:
+        runnable = select(CollectionRun.id).where(
+            CollectionRun.scope.in_(
+                [
+                    "full",
+                    "incremental",
+                    "subscriptions",
+                    "subscription_posts",
+                    "subscription_discovery",
+                    "subscription_metadata",
+                    "light_repair",
+                ]
+            ),
+            CollectionRun.status.in_(
+                [
+                    CollectionRunStatus.PLANNED,
+                    CollectionRunStatus.RUNNING,
+                    CollectionRunStatus.WAITING_METHOD_LIMIT,
+                ]
+            ),
+            CollectionRun.configuration["capacity_gate"].astext == "passed",
+        )
+        now = datetime.now(UTC)
+        run_wakeup = await session.scalar(
+            select(func.min(CollectionRun.next_wakeup_at)).where(
+                CollectionRun.id.in_(runnable), CollectionRun.next_wakeup_at > now
+            )
+        )
+        job_wakeup = await session.scalar(
+            select(func.min(CollectionJob.next_attempt_at)).where(
+                CollectionJob.collection_run_id.in_(runnable),
+                CollectionJob.status == JobStatus.RETRY_WAIT,
+                CollectionJob.next_attempt_at > now,
+            )
+        )
+        values = [value for value in (run_wakeup, job_wakeup) if value is not None]
+        return min(values) if values else None
+
+
+def bounded_wakeup_delay(
+    wakeup: datetime | None,
+    *,
+    now: datetime,
+    idle_seconds: float,
+    stop_check_seconds: float = 60.0,
+) -> float:
+    """Choose the durable wakeup while bounding stop-signal latency."""
+    if wakeup is None:
+        return idle_seconds
+    return min(stop_check_seconds, max(0.1, (wakeup - now).total_seconds()))
 
 
 async def run_summary(

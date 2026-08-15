@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from .errors import VKAPIError, VKRetryExhausted
-from .models import VKGroup, VKSearchPage
+from .models import VKGroup, VKSearchPage, VKSubscriptionIDsPage
 from .tokens import TokenPool
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -231,3 +231,42 @@ class VKClient:
         if not isinstance(response, dict):
             raise VKAPIError(-1, "Некорректный ответ groups.get")
         return response
+
+    async def get_subscription_ids_page(
+        self, user_vk_id: int, offset: int, count: int
+    ) -> VKSubscriptionIDsPage:
+        """Получить только ID сообществ без расширенных group-объектов."""
+        response = await self.call(
+            "groups.get",
+            {
+                "user_id": user_vk_id,
+                "offset": offset,
+                "count": count,
+                "extended": 0,
+            },
+        )
+        if not isinstance(response, dict):
+            raise VKAPIError(-1, "Некорректный ответ groups.get: ожидался объект")
+        raw_total = response.get("count")
+        raw_items = response.get("items")
+        if (
+            not isinstance(raw_total, int)
+            or isinstance(raw_total, bool)
+            or raw_total < 0
+            or not isinstance(raw_items, list)
+        ):
+            raise VKAPIError(-1, "Некорректный ответ groups.get: count/items")
+        group_ids: set[int] = set()
+        for value in raw_items:
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise VKAPIError(-1, "Некорректный ID сообщества в groups.get")
+            group_ids.add(value)
+        returned_count = len(raw_items)
+        return VKSubscriptionIDsPage(
+            total_reported=raw_total,
+            group_ids=tuple(sorted(group_ids)),
+            offset=offset,
+            requested_count=count,
+            returned_count=returned_count,
+            next_offset=offset + returned_count,
+        )

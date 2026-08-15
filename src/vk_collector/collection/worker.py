@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -49,10 +49,14 @@ JOB_METHODS = {
     "collect_group_members": "groups.getMembers",
     "refresh_user_profile": "users.get",
     "collect_user_subscriptions": "groups.get",
+    "refresh_community_metadata": "groups.getById",
     "collect_subscription_group_posts": "wall.get",
 }
 FAIR_JOB_TYPES = tuple(JOB_METHODS)
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
+SUBSCRIPTION_LONG_RETRY_MAX_SECONDS = 86400
+METADATA_BATCH_MISS_LIMIT = 3
+METADATA_SINGLE_MISS_LIMIT = 2
 logger = logging.getLogger(__name__)
 
 
@@ -219,6 +223,7 @@ class CollectionWorker:
                     "members": "collect_group_members",
                     "users": "refresh_user_profile",
                     "subscriptions": "collect_user_subscriptions",
+                    "metadata": "refresh_community_metadata",
                     "subscription_posts": "collect_subscription_group_posts",
                 }.get(scope, "")
             )
@@ -271,6 +276,9 @@ class CollectionWorker:
                 await self._refresh_user(job)
             elif job.job_type == "collect_user_subscriptions":
                 await self._collect_subscriptions(job)
+            elif job.job_type == "refresh_community_metadata":
+                if not await self._refresh_community_metadata(job):
+                    return
             elif job.job_type == "collect_subscription_group_posts":
                 await self._collect_subscription_posts(job)
             else:
@@ -373,12 +381,24 @@ class CollectionWorker:
             await self._mark_post_failure(job, None, message, terminal=False)
         if job.job_type == "collect_user_subscriptions":
             await self._mark_subscriptions_transient(job)
-        if job.attempt_count >= len(RETRY_DELAYS):
+        durable_subscription = job.job_type == "collect_user_subscriptions" and category in {
+            "transient",
+            "vk_api",
+        }
+        if job.attempt_count >= len(RETRY_DELAYS) and not durable_subscription:
             await self._queue.finish(
                 job.id, JobStatus.FAILED, error_type=category, error_message=message
             )
             return
-        retry_at = datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS[job.attempt_count - 1])
+        if job.attempt_count <= len(RETRY_DELAYS):
+            delay = RETRY_DELAYS[job.attempt_count - 1]
+        else:
+            long_retry_step = min(2, job.attempt_count - len(RETRY_DELAYS))
+            delay = min(
+                SUBSCRIPTION_LONG_RETRY_MAX_SECONDS,
+                RETRY_DELAYS[-1] * (2**long_retry_step),
+            )
+        retry_at = datetime.now(UTC) + timedelta(seconds=delay)
         await self._queue.finish(
             job.id,
             JobStatus.RETRY_WAIT,
@@ -391,6 +411,9 @@ class CollectionWorker:
         """Отложить transient-user, чтобы он не блокировал каждую следующую cohort."""
         now = datetime.now(UTC)
         async with self._sessions() as session:
+            campaign_id = await session.scalar(
+                select(CollectionRun.campaign_id).where(CollectionRun.id == job.run_id)
+            )
             await session.execute(
                 insert(UserSubscriptionState)
                 .values(
@@ -398,8 +421,11 @@ class CollectionWorker:
                     last_attempt_at=now,
                     collected_limit=self._settings.collection_subscriptions_max_per_user,
                     privacy_denied=False,
+                    is_truncated=False,
+                    terminal_reason=None,
                     last_error_code=None,
                     last_run_id=job.run_id,
+                    last_campaign_id=campaign_id,
                     next_scheduled_at=now + timedelta(days=1),
                 )
                 .on_conflict_do_update(
@@ -407,8 +433,11 @@ class CollectionWorker:
                     set_={
                         "last_attempt_at": now,
                         "privacy_denied": False,
+                        "is_truncated": False,
+                        "terminal_reason": None,
                         "last_error_code": None,
                         "last_run_id": job.run_id,
+                        "last_campaign_id": campaign_id,
                         "next_scheduled_at": now + timedelta(days=1),
                     },
                 )
@@ -828,77 +857,61 @@ class CollectionWorker:
         maximum = self._settings.collection_subscriptions_max_per_user
         page_size = self._settings.collection_subscriptions_page_size
         total = 0
+        async with self._sessions() as session:
+            campaign_id = await session.scalar(
+                select(CollectionRun.campaign_id).where(CollectionRun.id == job.run_id)
+            )
         while offset < maximum:
             count = min(page_size, maximum - offset)
-            response = await self._client.get_subscriptions_page(job.entity_id, offset, count)
-            raw_items = response.get("items", [])
-            communities = (
-                [
-                    item
-                    for item in raw_items
-                    if isinstance(item, dict) and isinstance(item.get("id"), int)
-                ]
-                if isinstance(raw_items, list)
-                else []
-            )
-            total = int(response.get("count", 0))
+            page = await self._client.get_subscription_ids_page(job.entity_id, offset, count)
+            group_ids = sorted(set(page.group_ids))
+            total = page.total_reported
             now = datetime.now(UTC)
+            next_offset = page.next_offset
+            truncated = total > maximum
+            last_page = (
+                next_offset >= maximum or next_offset >= total or page.returned_count < count
+            )
+            full_snapshot = last_page and next_offset >= total and not truncated
             async with self._sessions() as session:
-                for value in communities:
-                    group_id = int(value["id"])
+                if group_ids:
                     await session.execute(
                         insert(VKCommunity)
                         .values(
-                            vk_id=group_id,
-                            name=str(value.get("name", "")),
-                            description=str(value.get("description", "")),
-                            status_text=str(value.get("status", "")),
-                            screen_name=str(value["screen_name"])
-                            if value.get("screen_name")
-                            else None,
-                            community_type=str(value["type"]) if value.get("type") else None,
-                            is_closed=bool(value.get("is_closed", False)),
-                            deactivated=str(value["deactivated"])
-                            if value.get("deactivated")
-                            else None,
-                            members_count=value.get("members_count")
-                            if isinstance(value.get("members_count"), int)
-                            else None,
-                            first_seen_at=now,
-                            last_seen_at=now,
-                            metadata_updated_at=now,
+                            [
+                                {
+                                    "vk_id": group_id,
+                                    "name": "",
+                                    "description": "",
+                                    "status_text": "",
+                                    "first_seen_at": now,
+                                    "last_seen_at": now,
+                                    "metadata_updated_at": None,
+                                }
+                                for group_id in group_ids
+                            ]
                         )
                         .on_conflict_do_update(
                             index_elements=[VKCommunity.vk_id],
                             set_={
-                                "name": str(value.get("name", "")),
-                                "description": str(value.get("description", "")),
-                                "status_text": str(value.get("status", "")),
-                                "screen_name": str(value["screen_name"])
-                                if value.get("screen_name")
-                                else None,
-                                "community_type": str(value["type"]) if value.get("type") else None,
-                                "is_closed": bool(value.get("is_closed", False)),
-                                "deactivated": str(value["deactivated"])
-                                if value.get("deactivated")
-                                else None,
-                                "members_count": value.get("members_count")
-                                if isinstance(value.get("members_count"), int)
-                                else None,
-                                "last_seen_at": now,
-                                "metadata_updated_at": now,
+                                "last_seen_at": func.greatest(VKCommunity.last_seen_at, now),
                             },
                         )
                     )
                     await session.execute(
                         insert(UserGroupSubscription)
                         .values(
-                            user_id=job.entity_id,
-                            vk_group_id=group_id,
-                            first_seen_at=now,
-                            last_seen_at=now,
-                            is_current=True,
-                            source_run_id=job.run_id,
+                            [
+                                {
+                                    "user_id": job.entity_id,
+                                    "vk_group_id": group_id,
+                                    "first_seen_at": now,
+                                    "last_seen_at": now,
+                                    "is_current": True,
+                                    "source_run_id": job.run_id,
+                                }
+                                for group_id in group_ids
+                            ]
                         )
                         .on_conflict_do_update(
                             constraint="uq_user_group_subscriptions",
@@ -909,90 +922,86 @@ class CollectionWorker:
                             },
                         )
                     )
-                offset += len(raw_items) if isinstance(raw_items, list) else 0
                 await session.execute(
                     insert(UserSubscriptionState)
                     .values(
                         user_id=job.entity_id,
                         last_attempt_at=now,
                         total_reported=total,
-                        collected_count=offset,
+                        collected_count=next_offset,
                         collected_limit=maximum,
                         privacy_denied=False,
+                        is_truncated=truncated,
+                        terminal_reason=None,
                         last_error_code=None,
                         last_run_id=job.run_id,
+                        last_campaign_id=campaign_id,
+                        last_success_at=now if last_page else None,
+                        next_scheduled_at=now
+                        + timedelta(days=self._settings.collection_subscriptions_ttl_days)
+                        if last_page
+                        else None,
                     )
                     .on_conflict_do_update(
                         index_elements=[UserSubscriptionState.user_id],
                         set_={
                             "last_attempt_at": now,
                             "total_reported": total,
-                            "collected_count": offset,
+                            "collected_count": next_offset,
                             "collected_limit": maximum,
                             "privacy_denied": False,
+                            "is_truncated": truncated,
+                            "terminal_reason": None,
                             "last_error_code": None,
                             "last_run_id": job.run_id,
+                            "last_campaign_id": campaign_id,
+                            **({"last_success_at": now} if last_page else {}),
+                            **(
+                                {
+                                    "next_scheduled_at": now
+                                    + timedelta(
+                                        days=self._settings.collection_subscriptions_ttl_days
+                                    )
+                                }
+                                if last_page
+                                else {}
+                            ),
                         },
                     )
                 )
+                if full_snapshot:
+                    await session.execute(
+                        update(UserGroupSubscription)
+                        .where(
+                            UserGroupSubscription.user_id == job.entity_id,
+                            or_(
+                                UserGroupSubscription.source_run_id != job.run_id,
+                                UserGroupSubscription.source_run_id.is_(None),
+                            ),
+                        )
+                        .values(is_current=False)
+                    )
                 await self._checkpoint(
                     session,
                     job.id,
-                    {"offset": offset, "total": total, "truncated": total > maximum},
+                    {"offset": next_offset, "total": total, "truncated": truncated},
                     1,
-                    len(communities),
+                    len(group_ids),
                 )
                 await session.commit()
-            if not raw_items or offset >= total or len(raw_items) < count:
+            offset = next_offset
+            if last_page:
                 break
-        full_snapshot = offset >= total and total <= maximum
-        async with self._sessions() as session:
-            if full_snapshot:
-                await session.execute(
-                    update(UserGroupSubscription)
-                    .where(
-                        UserGroupSubscription.user_id == job.entity_id,
-                        UserGroupSubscription.source_run_id != job.run_id,
-                    )
-                    .values(is_current=False)
-                )
-            now = datetime.now(UTC)
-            await session.execute(
-                insert(UserSubscriptionState)
-                .values(
-                    user_id=job.entity_id,
-                    last_attempt_at=now,
-                    last_success_at=now,
-                    total_reported=total,
-                    collected_count=offset,
-                    collected_limit=maximum,
-                    privacy_denied=False,
-                    last_run_id=job.run_id,
-                    next_scheduled_at=now
-                    + timedelta(days=self._settings.collection_subscriptions_ttl_days),
-                )
-                .on_conflict_do_update(
-                    index_elements=[UserSubscriptionState.user_id],
-                    set_={
-                        "last_attempt_at": now,
-                        "last_success_at": now,
-                        "total_reported": total,
-                        "collected_count": offset,
-                        "collected_limit": maximum,
-                        "privacy_denied": False,
-                        "last_run_id": job.run_id,
-                        "next_scheduled_at": now
-                        + timedelta(days=self._settings.collection_subscriptions_ttl_days),
-                    },
-                )
-            )
-            await session.commit()
 
     async def _mark_subscriptions_terminal(self, job: ClaimedJob, error_code: int) -> None:
         """Не включать terminal-ошибку подписок в каждую следующую cohort."""
         now = datetime.now(UTC)
         privacy_denied = error_code in {15, 30, 260}
         async with self._sessions() as session:
+            campaign_id = await session.scalar(
+                select(CollectionRun.campaign_id).where(CollectionRun.id == job.run_id)
+            )
+            terminal_reason = "privacy_or_access" if privacy_denied else "deleted_or_unavailable"
             await session.execute(
                 insert(UserSubscriptionState)
                 .values(
@@ -1000,8 +1009,11 @@ class CollectionWorker:
                     last_attempt_at=now,
                     collected_limit=self._settings.collection_subscriptions_max_per_user,
                     privacy_denied=privacy_denied,
+                    is_truncated=False,
+                    terminal_reason=terminal_reason,
                     last_error_code=error_code,
                     last_run_id=job.run_id,
+                    last_campaign_id=campaign_id,
                     next_scheduled_at=now
                     + timedelta(days=self._settings.collection_subscriptions_ttl_days),
                 )
@@ -1010,14 +1022,234 @@ class CollectionWorker:
                     set_={
                         "last_attempt_at": now,
                         "privacy_denied": privacy_denied,
+                        "is_truncated": False,
+                        "terminal_reason": terminal_reason,
                         "last_error_code": error_code,
                         "last_run_id": job.run_id,
+                        "last_campaign_id": campaign_id,
                         "next_scheduled_at": now
                         + timedelta(days=self._settings.collection_subscriptions_ttl_days),
                     },
                 )
             )
             await session.commit()
+
+    async def _refresh_community_metadata(self, job: ClaimedJob) -> bool:
+        """Process several community jobs with one groups.getById request."""
+        extras = (
+            await self._queue.claim_metadata_batch(
+                job.run_id,
+                limit=self._settings.collection_community_metadata_batch_size - 1,
+            )
+            if int(job.checkpoint.get("metadata_miss_count", 0)) < METADATA_BATCH_MISS_LIMIT
+            else []
+        )
+        batch = sorted([job, *extras], key=lambda item: item.entity_id)
+        requested_ids = [item.entity_id for item in batch]
+        try:
+            rows = await self._client.get_groups(requested_ids)
+        except Exception:
+            await self._queue.release(extras)
+            raise
+        by_id: dict[int, dict[str, Any]] = {}
+        requested = set(requested_ids)
+        for value in rows:
+            raw_id = value.get("id")
+            if (
+                isinstance(raw_id, int)
+                and not isinstance(raw_id, bool)
+                and raw_id > 0
+                and raw_id in requested
+            ):
+                by_id[raw_id] = value
+        now = datetime.now(UTC)
+        normalized = []
+        for community_id in sorted(by_id):
+            value = by_id[community_id]
+            normalized.append(
+                {
+                    "vk_id": community_id,
+                    "name": str(value.get("name", "")),
+                    "description": str(value.get("description", "")),
+                    "status_text": str(value.get("status", "")),
+                    "screen_name": str(value["screen_name"]) if value.get("screen_name") else None,
+                    "community_type": str(value["type"]) if value.get("type") else None,
+                    "is_closed": bool(value.get("is_closed", False)),
+                    "deactivated": str(value["deactivated"]) if value.get("deactivated") else None,
+                    "members_count": value.get("members_count")
+                    if isinstance(value.get("members_count"), int)
+                    and not isinstance(value.get("members_count"), bool)
+                    else None,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "metadata_updated_at": now,
+                }
+            )
+        async with self._sessions() as session:
+            if normalized:
+                statement = insert(VKCommunity).values(normalized)
+                await session.execute(
+                    statement.on_conflict_do_update(
+                        index_elements=[VKCommunity.vk_id],
+                        set_={
+                            "name": statement.excluded.name,
+                            "description": statement.excluded.description,
+                            "status_text": statement.excluded.status_text,
+                            "screen_name": statement.excluded.screen_name,
+                            "community_type": statement.excluded.community_type,
+                            "is_closed": statement.excluded.is_closed,
+                            "deactivated": statement.excluded.deactivated,
+                            "members_count": statement.excluded.members_count,
+                            "last_seen_at": statement.excluded.last_seen_at,
+                            "metadata_updated_at": statement.excluded.metadata_updated_at,
+                        },
+                    )
+                )
+            candidates = list(
+                (
+                    await session.scalars(
+                        select(GroupCandidate).where(GroupCandidate.vk_id.in_(by_id))
+                    )
+                ).all()
+            )
+            for candidate in candidates:
+                value = by_id[candidate.vk_id]
+                candidate.name = str(value.get("name", candidate.name))
+                candidate.description = str(value.get("description", ""))
+                candidate.status_text = str(value.get("status", ""))
+                candidate.screen_name = (
+                    str(value["screen_name"]) if value.get("screen_name") else candidate.screen_name
+                )
+                candidate.last_seen_at = now
+                deactivated = value.get("deactivated")
+                await session.execute(
+                    insert(GroupCollectionState)
+                    .values(
+                        group_id=candidate.id,
+                        last_group_success_at=None if deactivated else now,
+                        next_scheduled_at=now
+                        + timedelta(days=self._settings.collection_community_metadata_ttl_days),
+                        unavailable=bool(deactivated),
+                        skip_reason=(f"deactivated:{deactivated}" if deactivated else None),
+                        last_error_type=("community_deactivated" if deactivated else None),
+                        last_error_message=(
+                            "VK явно пометил сообщество как deactivated" if deactivated else None
+                        ),
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[GroupCollectionState.group_id],
+                        set_={
+                            "last_group_success_at": None if deactivated else now,
+                            "next_scheduled_at": now
+                            + timedelta(days=self._settings.collection_community_metadata_ttl_days),
+                            "unavailable": bool(deactivated),
+                            "skip_reason": (f"deactivated:{deactivated}" if deactivated else None),
+                            "last_error_type": ("community_deactivated" if deactivated else None),
+                            "last_error_message": (
+                                "VK явно пометил сообщество как deactivated"
+                                if deactivated
+                                else None
+                            ),
+                        },
+                    )
+                )
+            await self._update_metrics(session, job.id, requests=1, updated=len(normalized))
+            await session.commit()
+        for extra in extras:
+            available = extra.entity_id in by_id
+            if available:
+                await self._queue.finish(extra.id, JobStatus.COMPLETED)
+            else:
+                await self._finish_metadata_miss(extra)
+        if job.entity_id not in by_id:
+            await self._finish_metadata_miss(job)
+            return False
+        return True
+
+    async def _finish_metadata_miss(self, job: ClaimedJob) -> None:
+        """Persist bounded batch-to-single diagnostics for an omitted community ID."""
+        previous_misses = int(job.checkpoint.get("metadata_miss_count", 0))
+        miss_count = previous_misses + 1
+        single_attempt = max(0, miss_count - METADATA_BATCH_MISS_LIMIT)
+        terminal = single_attempt >= METADATA_SINGLE_MISS_LIMIT
+        stage = "single" if miss_count > METADATA_BATCH_MISS_LIMIT else "batch"
+        checkpoint = {**job.checkpoint, "metadata_miss_count": miss_count, "stage": stage}
+        message = (
+            f"groups.getById не вернул ID; stage={stage}; "
+            f"attempt={job.attempt_count}; miss={miss_count}; single_miss={single_attempt}"
+        )
+        await self._record_error(job, "community_partial_response", message)
+        if terminal:
+            now = datetime.now(UTC)
+            async with self._sessions() as session:
+                await session.execute(
+                    insert(VKCommunity)
+                    .values(
+                        vk_id=job.entity_id,
+                        name="",
+                        description="",
+                        status_text="",
+                        deactivated="unavailable",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        metadata_updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[VKCommunity.vk_id],
+                        set_={
+                            "deactivated": "unavailable",
+                            "last_seen_at": now,
+                            "metadata_updated_at": now,
+                        },
+                    )
+                )
+                candidate_id = await session.scalar(
+                    select(GroupCandidate.id).where(GroupCandidate.vk_id == job.entity_id)
+                )
+                if candidate_id is not None:
+                    await session.execute(
+                        insert(GroupCollectionState)
+                        .values(
+                            group_id=candidate_id,
+                            next_scheduled_at=now
+                            + timedelta(days=self._settings.collection_community_metadata_ttl_days),
+                            unavailable=True,
+                            skip_reason="missing_from_groups_get_by_id",
+                            last_error_type="community_missing_terminal",
+                            last_error_message=message,
+                        )
+                        .on_conflict_do_update(
+                            index_elements=[GroupCollectionState.group_id],
+                            set_={
+                                "next_scheduled_at": now
+                                + timedelta(
+                                    days=self._settings.collection_community_metadata_ttl_days
+                                ),
+                                "unavailable": True,
+                                "skip_reason": "missing_from_groups_get_by_id",
+                                "last_error_type": "community_missing_terminal",
+                                "last_error_message": message,
+                            },
+                        )
+                    )
+                await session.commit()
+            await self._queue.finish(
+                job.id,
+                JobStatus.SKIPPED,
+                error_type="community_missing_terminal",
+                error_message=message,
+                checkpoint=checkpoint,
+            )
+            return
+        delay = RETRY_DELAYS[min(miss_count - 1, len(RETRY_DELAYS) - 1)]
+        await self._queue.finish(
+            job.id,
+            JobStatus.RETRY_WAIT,
+            error_type="community_partial_response",
+            error_message=message,
+            retry_at=datetime.now(UTC) + timedelta(seconds=delay),
+            checkpoint=checkpoint,
+        )
 
     async def _collect_subscription_posts(self, job: ClaimedJob) -> None:
         """Сохранить не более 20 последних постов канонического сообщества."""

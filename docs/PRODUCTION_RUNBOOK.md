@@ -2,10 +2,18 @@
 
 ## Ежедневная диагностика
 
-Workflow `Production collection control` каждый час проверяет очередь. Если разрешённый
-run ещё активен, scheduled-запуск завершается без изменений. Если партия подписок
-завершена, workflow повторно проходит Gate A и создаёт следующую cohort. Ручной запуск
-`start-subscriptions` по-прежнему требует подтверждение `START_SUBSCRIPTIONS`.
+Workflow `Production collection control` каждый час выполняет только read-only
+`action=report`: scheduled-запуск не создаёт Pilot A, campaign, runs или jobs.
+`start-subscriptions` доступен только через `workflow_dispatch` и требует точного
+подтверждения `START_SUBSCRIPTIONS`.
+
+При rolling deploy старый active subscriptions-run не удаляется и не отменяется:
+его ID, status и job counts фиксируются в report. Несовпадающая immutable runtime
+configuration переводит run в `paused_capacity_limit`; jobs и checkpoints остаются
+без изменений. Новая campaign строит `discovery_due` только по каноническому
+`UserSubscriptionState`: свежие successful/terminal состояния переиспользуются, а
+остальные eligible users попадают в новый snapshot независимо от исторических job
+rows. Старый run нельзя cancel до подтверждения полного coverage новой campaign.
 
 Деплой и ручная очистка не удаляют backup, указанный в `verified_backup` незавершённого
 запуска. После изменения прав каталога деплой восстанавливает для UID collector только
@@ -113,3 +121,10 @@ docker compose -f compose.yaml -f compose.production.yaml run --rm collector \
 
 Deploy не создаёт search или incremental run автоматически. Их разрешает оператор
 только после полной reclassification, импорта, независимого аудита и capacity gate.
+# Дополнение: rollout phased subscriptions
+
+Production rollout не выполняется автоматически. Последовательность, стоп-условия,
+Gate A inheritance и запрет subscription posts приведены в
+`docs/PHASED_SUBSCRIPTION_IMPLEMENTATION.md`. Перед любым apply обязательны
+read-only backlog, проверка active pilot/campaign/run, method states, диск,
+`pg_dump -Fc`, `pg_restore --list` и SHA-256.

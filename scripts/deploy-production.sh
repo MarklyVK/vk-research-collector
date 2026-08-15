@@ -4,6 +4,10 @@ set -Eeuo pipefail
 
 umask 077
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=deploy-transition-decision.sh
+source "$SCRIPT_DIR/deploy-transition-decision.sh"
+
 DRY_RUN=0
 SOURCE_DIR="${GITHUB_WORKSPACE:-$(pwd)}"
 DEPLOY_DIR="${DEPLOY_ROOT:-/opt/vk-research-collector}"
@@ -25,6 +29,7 @@ BASELINE_FAILED=0
 ROLLBACK_ALLOWED=0
 REPORT_STATUS=failed
 PROTECTED_BACKUPS=()
+DEPLOYMENT_TRANSITION=not_checked
 
 usage() {
   cat <<'EOF'
@@ -117,6 +122,26 @@ psql_query() {
   compose exec -T postgres psql \
     -X -v ON_ERROR_STOP=1 -P pager=off \
     -U "$(env_value POSTGRES_USER)" -d "$(env_value POSTGRES_DB)" "$@"
+}
+
+transition_data_snapshot() {
+  local run_id=$1
+  psql_query -AtF '|' -v target_run_id="$run_id" -c \
+    "SELECT
+       (SELECT count(*) FROM collection_campaigns),
+       (SELECT count(*) FROM collection_jobs),
+       (SELECT count(*) FROM collection_jobs
+         WHERE collection_run_id = :'target_run_id'::uuid),
+       (SELECT md5(coalesce(string_agg(
+           id::text || ':' || coalesce(checkpoint::text, 'null'),
+           '|' ORDER BY id::text
+         ), ''))
+          FROM collection_jobs
+         WHERE collection_run_id = :'target_run_id'::uuid),
+       (SELECT count(*) FROM collection_jobs
+         WHERE collection_run_id = :'target_run_id'::uuid
+           AND status::text = 'running'
+           AND (locked_at IS NOT NULL OR locked_by IS NOT NULL))"
 }
 
 load_protected_backups() {
@@ -279,6 +304,7 @@ write_report() {
     printf 'RUNNING=%s\n' "${running:-unknown}"
     printf 'RETRY=%s\n' "${retry:-unknown}"
     printf 'FAILED=%s\n' "${failed:-unknown}"
+    printf 'DEPLOYMENT_TRANSITION=%s\n' "$DEPLOYMENT_TRANSITION"
     printf 'DB_SIZE=%s\n' "$db_size"
     printf 'DISK_USAGE=%s\n' "$disk_usage"
     printf 'DURATION_SECONDS=%s\n' "$duration"
@@ -307,6 +333,7 @@ write_report() {
       printf '| Run ID | `%s` |\n' "${RUN_ID:-не задан}"
       printf '| Completed / Pending / Running / Retry / Failed | `%s / %s / %s / %s / %s` |\n' \
         "${completed:-?}" "${pending:-?}" "${running:-?}" "${retry:-?}" "${failed:-?}"
+      printf '| Deployment transition | `%s` |\n' "$DEPLOYMENT_TRANSITION"
       printf '| DB size | `%s bytes` |\n' "$db_size"
       printf '| Disk usage | `%s` |\n' "$disk_usage"
       printf '| Duration | `%s s` |\n' "$duration"
@@ -402,6 +429,7 @@ for required in \
   compose.production.yaml \
   config/keywords.yml \
   scripts/deploy-production.sh \
+  scripts/deploy-transition-decision.sh \
   scripts/postgres-init-readonly.sh \
   scripts/telegram-monitor.py \
   deploy/systemd/vk-collector-telegram-health.service \
@@ -508,6 +536,8 @@ ROLLBACK_ALLOWED=0
 compose_cli alembic upgrade head
 compose_cli alembic check
 ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
+[[ "$ALEMBIC_REVISION" == *20260815_0010* ]] \
+  || die "Alembic находится не на ожидаемом head 20260815_0010: $ALEMBIC_REVISION"
 
 ROLLBACK_ALLOWED=1
 if [[ -n "$RUN_ID" ]]; then
@@ -518,8 +548,13 @@ else
 fi
 BASELINE_COMPLETED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number completed || true)
 BASELINE_FAILED=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_number failed || true)
+BASELINE_RUN_STATUS=$(printf '%s\n' "$BASELINE_STATUS_JSON" | json_string status || true)
 BASELINE_COMPLETED=${BASELINE_COMPLETED:-0}
 BASELINE_FAILED=${BASELINE_FAILED:-0}
+BASELINE_TRANSITION_SNAPSHOT=""
+if [[ -n "$RUN_ID" ]]; then
+  BASELINE_TRANSITION_SNAPSHOT=$(transition_data_snapshot "$RUN_ID")
+fi
 atomic_text "$DEPLOY_DIR/.deploy/current-image" "$IMAGE"
 compose up -d --no-deps --no-build collector-worker
 
@@ -571,6 +606,7 @@ if [[ -n "$RUN_ID" ]]; then
   sleep "$PROGRESS_WAIT"
   FINAL_STATUS_JSON=$(compose_cli collection status --run-id "$RUN_ID")
   RUN_STATUS=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string status || true)
+  RUN_ERROR_MESSAGE=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_string error_message || true)
   FINAL_COMPLETED=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number completed || true)
   FINAL_PENDING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number pending || true)
   FINAL_RUNNING=$(printf '%s\n' "$FINAL_STATUS_JSON" | json_number running || true)
@@ -583,9 +619,22 @@ if [[ -n "$RUN_ID" ]]; then
   FINAL_FAILED=${FINAL_FAILED:-0}
   [[ "$RUN_STATUS" != failed ]] || die 'Collection run перешёл в failed во время проверки прогресса.'
   (( FINAL_FAILED <= BASELINE_FAILED )) || die 'Количество failed jobs увеличилось во время проверки прогресса.'
-  if (( FINAL_COMPLETED <= BASELINE_COMPLETED && FINAL_RUNNING == 0 && FINAL_RETRY == 0 && FINAL_PENDING > 0 )); then
-    die 'Worker не показал прогресс и не находится в running/retry ожидании.'
+  FINAL_TRANSITION_SNAPSHOT=$(transition_data_snapshot "$RUN_ID")
+  IFS='|' read -r _ _ _ _ FINAL_RUNNING_LEASES <<< "$FINAL_TRANSITION_SNAPSHOT"
+  TRANSITION_DATA_UNCHANGED=0
+  if [[ "${BASELINE_TRANSITION_SNAPSHOT%|*}" == "${FINAL_TRANSITION_SNAPSHOT%|*}" ]]; then
+    TRANSITION_DATA_UNCHANGED=1
   fi
+  TRANSITION_HEALTH_OK=$HEALTH_OK
+  TRANSITION_IMAGE_OK=1
+  TRANSITION_ALEMBIC_OK=1
+  set +e
+  TRANSITION_RESULT=$(deployment_transition_decision 2>&1)
+  TRANSITION_CODE=$?
+  set -e
+  [[ "$TRANSITION_CODE" -eq 0 ]] || die "$TRANSITION_RESULT"
+  DEPLOYMENT_TRANSITION=$TRANSITION_RESULT
+  log "$TRANSITION_RESULT"
 fi
 
 DISK_AFTER=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')

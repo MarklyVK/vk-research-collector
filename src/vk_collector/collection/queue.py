@@ -8,19 +8,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import and_, exists, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.collection.notifications import notify
 from vk_collector.config import Settings
 from vk_collector.database.models import (
+    CampaignStatus,
     ClassificationStatus,
+    CollectionCampaign,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
     CommunityPostCollectionState,
     GroupCandidate,
+    GroupCollectionState,
     GroupLabel,
     GroupMembership,
     JobStatus,
@@ -124,6 +127,12 @@ class CollectionQueue:
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
             "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,
             "subscriptions_ttl_days": self._settings.collection_subscriptions_ttl_days,
+            "campaign_cohort_users": self._settings.collection_campaign_cohort_users,
+            "light_repair_cohort_size": self._settings.collection_light_repair_cohort_size,
+            "community_metadata_batch_size": (
+                self._settings.collection_community_metadata_batch_size
+            ),
+            "community_metadata_ttl_days": (self._settings.collection_community_metadata_ttl_days),
             "subscription_pilot_users": self._settings.collection_subscription_pilot_users,
             "subscription_pilot_min_users": (
                 self._settings.collection_subscription_pilot_min_users
@@ -341,6 +350,273 @@ class CollectionQueue:
             await session.commit()
             return run.id
 
+    async def light_repair_preview(self) -> dict[str, object]:
+        """Read-only canonical gaps safe for users.get/groups.getById repair."""
+        now = datetime.now(UTC)
+        profile_stale = now - timedelta(days=self._settings.collection_user_profile_ttl_days)
+        metadata_stale = now - timedelta(days=self._settings.collection_community_metadata_ttl_days)
+        group_due = and_(
+            func.coalesce(GroupCollectionState.unavailable, False).is_(False),
+            or_(
+                GroupCollectionState.group_id.is_(None),
+                GroupCollectionState.last_group_success_at.is_(None),
+                GroupCollectionState.last_group_success_at < metadata_stale,
+            ),
+        )
+        user_due = and_(
+            VKUser.deactivated.is_(None),
+            or_(VKUser.is_closed.is_(False), VKUser.can_access_closed.is_(True)),
+            or_(
+                VKUser.profile_updated_at.is_(None),
+                VKUser.profile_updated_at < profile_stale,
+            ),
+            exists(
+                select(GroupMembership.id)
+                .join(GroupCandidate, GroupCandidate.id == GroupMembership.group_id)
+                .where(
+                    GroupMembership.user_id == VKUser.vk_id,
+                    GroupMembership.is_current.is_(True),
+                    GroupCandidate.classification_status == ClassificationStatus.APPROVED,
+                )
+            ),
+        )
+        async with self._sessions() as session:
+            group_count = int(
+                await session.scalar(
+                    select(func.count(GroupCandidate.id))
+                    .outerjoin(
+                        GroupCollectionState,
+                        GroupCollectionState.group_id == GroupCandidate.id,
+                    )
+                    .where(
+                        GroupCandidate.classification_status == ClassificationStatus.APPROVED,
+                        group_due,
+                    )
+                )
+                or 0
+            )
+            user_count = int(
+                await session.scalar(select(func.count(VKUser.vk_id)).where(user_due)) or 0
+            )
+        group_requests = (group_count + 99) // 100
+        user_requests = (user_count + self._settings.collection_user_batch_size - 1) // (
+            self._settings.collection_user_batch_size
+        )
+        cohort_limit = self._settings.collection_light_repair_cohort_size
+        projected_jobs = min(cohort_limit, group_count + user_count)
+        payload = {
+            "scope": "light_repair",
+            "profile_ttl_days": self._settings.collection_user_profile_ttl_days,
+            "metadata_ttl_days": self._settings.collection_community_metadata_ttl_days,
+            "cohort_limit": cohort_limit,
+            "group_count": group_count,
+            "user_count": user_count,
+        }
+        preview_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return {
+            "approved_group_metadata_gaps": group_count,
+            "user_profile_gaps": user_count,
+            "distinct_entities": group_count + user_count,
+            "estimated_api_requests": group_requests + user_requests,
+            "estimated_database_growth_bytes": (group_count + user_count) * 512,
+            "cohort_limit": cohort_limit,
+            "projected_cohort_jobs": projected_jobs,
+            "projected_cohort_growth_bytes": projected_jobs * 512,
+            "preview_hash": preview_hash,
+            "excluded_terminal_entities": True,
+            "historical_job_rows_are_not_gaps": True,
+        }
+
+    async def plan_light_repair(self, *, capacity_evidence: dict[str, object]) -> uuid.UUID:
+        """Create or reuse an immutable explicitly-authorized light repair run."""
+        preview = await self.light_repair_preview()
+        raw_group_count = preview["approved_group_metadata_gaps"]
+        raw_user_count = preview["user_profile_gaps"]
+        if not isinstance(raw_group_count, int) or not isinstance(raw_user_count, int):
+            raise ValueError("Light-repair preview повреждён")
+        if capacity_evidence.get("decision") != "passed":
+            raise ValueError("Light-repair apply отклонён disk/capacity gate до создания jobs")
+        preview_hash = preview.get("preview_hash")
+        if capacity_evidence.get("preview_hash") != preview_hash:
+            raise ValueError("Light-repair preview изменился; повторите read-only preview")
+        payload = {
+            "scope": "light_repair",
+            "profile_ttl_days": self._settings.collection_user_profile_ttl_days,
+            "metadata_ttl_days": self._settings.collection_community_metadata_ttl_days,
+        }
+        plan_key = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        async with self._sessions() as session:
+            await session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtext("light_repair_planner")))
+            )
+            existing = await session.scalar(
+                select(CollectionRun)
+                .where(
+                    CollectionRun.scope == "light_repair",
+                    CollectionRun.status.in_(
+                        [
+                            CollectionRunStatus.PLANNED,
+                            CollectionRunStatus.RUNNING,
+                            CollectionRunStatus.WAITING_METHOD_LIMIT,
+                            CollectionRunStatus.PAUSED,
+                        ]
+                    ),
+                )
+                .order_by(CollectionRun.created_at.desc())
+                .limit(1)
+            )
+            if existing is not None:
+                if (
+                    existing.configuration.get("plan_key") != plan_key
+                    or existing.configuration.get("collection") != self.collection_configuration()
+                ):
+                    raise ValueError(
+                        "Существует активный light-repair run с несовместимой immutable "
+                        "конфигурацией; завершите или явно отмените его"
+                    )
+                return existing.id
+            run = CollectionRun(
+                scope="light_repair",
+                status=CollectionRunStatus.PLANNED,
+                configuration={
+                    "plan_key": plan_key,
+                    "capacity_gate": "passed",
+                    "capacity_evidence": capacity_evidence,
+                    "preview_hash": preview_hash,
+                    "cohort_limit": self._settings.collection_light_repair_cohort_size,
+                    "light_repair": True,
+                    "allowed_job_types": [
+                        "refresh_community_metadata",
+                        "refresh_user_profile",
+                    ],
+                    "collection": self.collection_configuration(),
+                },
+            )
+            session.add(run)
+            await session.flush()
+            now = datetime.now(UTC)
+            metadata_stale = now - timedelta(
+                days=self._settings.collection_community_metadata_ttl_days
+            )
+            profile_stale = now - timedelta(days=self._settings.collection_user_profile_ttl_days)
+            group_select = (
+                select(
+                    func.gen_random_uuid(),
+                    literal(run.id),
+                    literal("refresh_community_metadata"),
+                    literal("vk_community"),
+                    GroupCandidate.vk_id,
+                    literal(40),
+                    literal({}, type_=JSONB),
+                )
+                .outerjoin(
+                    GroupCollectionState,
+                    GroupCollectionState.group_id == GroupCandidate.id,
+                )
+                .where(
+                    GroupCandidate.classification_status == ClassificationStatus.APPROVED,
+                    func.coalesce(GroupCollectionState.unavailable, False).is_(False),
+                    or_(
+                        GroupCollectionState.group_id.is_(None),
+                        GroupCollectionState.last_group_success_at.is_(None),
+                        GroupCollectionState.last_group_success_at < metadata_stale,
+                    ),
+                )
+                .order_by(GroupCandidate.vk_id)
+                .limit(self._settings.collection_light_repair_cohort_size)
+            )
+            group_selected = int(
+                await session.scalar(select(func.count()).select_from(group_select.subquery())) or 0
+            )
+            remaining = self._settings.collection_light_repair_cohort_size - group_selected
+            user_select = (
+                select(
+                    func.gen_random_uuid(),
+                    literal(run.id),
+                    literal("refresh_user_profile"),
+                    literal("user"),
+                    VKUser.vk_id,
+                    literal(50),
+                    literal({}, type_=JSONB),
+                )
+                .where(
+                    VKUser.deactivated.is_(None),
+                    or_(VKUser.is_closed.is_(False), VKUser.can_access_closed.is_(True)),
+                    or_(
+                        VKUser.profile_updated_at.is_(None),
+                        VKUser.profile_updated_at < profile_stale,
+                    ),
+                    exists(
+                        select(GroupMembership.id)
+                        .join(GroupCandidate, GroupCandidate.id == GroupMembership.group_id)
+                        .where(
+                            GroupMembership.user_id == VKUser.vk_id,
+                            GroupMembership.is_current.is_(True),
+                            GroupCandidate.classification_status == ClassificationStatus.APPROVED,
+                        )
+                    ),
+                )
+                .order_by(VKUser.vk_id)
+                .limit(remaining)
+            )
+            columns = [
+                "id",
+                "collection_run_id",
+                "job_type",
+                "entity_type",
+                "entity_id",
+                "priority",
+                "checkpoint",
+            ]
+            group_result = await session.execute(
+                insert(CollectionJob)
+                .from_select(columns, group_select)
+                .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+            )
+            user_result = await session.execute(
+                insert(CollectionJob)
+                .from_select(columns, user_select)
+                .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+            )
+            run.total_jobs = int(group_result.rowcount or 0) + int(user_result.rowcount or 0)  # type: ignore[attr-defined]
+            bounds = (
+                await session.execute(
+                    select(
+                        func.min(CollectionJob.entity_id).filter(
+                            CollectionJob.job_type == "refresh_community_metadata"
+                        ),
+                        func.max(CollectionJob.entity_id).filter(
+                            CollectionJob.job_type == "refresh_community_metadata"
+                        ),
+                        func.min(CollectionJob.entity_id).filter(
+                            CollectionJob.job_type == "refresh_user_profile"
+                        ),
+                        func.max(CollectionJob.entity_id).filter(
+                            CollectionJob.job_type == "refresh_user_profile"
+                        ),
+                    ).where(CollectionJob.collection_run_id == run.id)
+                )
+            ).one()
+            run.configuration = {
+                **run.configuration,
+                "durable_cursor": {
+                    "group_first_vk_id": bounds[0],
+                    "group_last_vk_id": bounds[1],
+                    "user_first_vk_id": bounds[2],
+                    "user_last_vk_id": bounds[3],
+                },
+                "actual_total_jobs": run.total_jobs,
+            }
+            if not run.total_jobs:
+                run.status = CollectionRunStatus.COMPLETED
+                run.finished_at = datetime.now(UTC)
+            await session.commit()
+            return run.id
+
     async def recover_expired(self, run_id: uuid.UUID) -> int:
         cutoff = datetime.now(UTC) - timedelta(seconds=self._settings.collection_job_lease_seconds)
         async with self._sessions() as session:
@@ -353,9 +629,12 @@ class CollectionQueue:
                 )
                 .values(
                     status=JobStatus.PENDING,
+                    attempt_count=func.greatest(CollectionJob.attempt_count - 1, 0),
                     locked_at=None,
                     locked_by=None,
                     heartbeat_at=None,
+                    last_error_type="lease_expired_recovered",
+                    last_error_message="Истёк lease; job безопасно возвращён в pending",
                 )
             )
             await session.commit()
@@ -375,6 +654,7 @@ class CollectionQueue:
             "members": "collect_group_members",
             "users": "refresh_user_profile",
             "subscriptions": "collect_user_subscriptions",
+            "metadata": "refresh_community_metadata",
             "subscription_posts": "collect_subscription_group_posts",
         }.get(scope or "")
         async with self._sessions() as session:
@@ -412,6 +692,33 @@ class CollectionQueue:
             }:
                 run.status = CollectionRunStatus.RUNNING
                 run.started_at = run.started_at or now
+                run.next_wakeup_at = None
+                run.error_message = None
+                if run.campaign_id is not None:
+                    campaign = await session.get(
+                        CollectionCampaign, run.campaign_id, with_for_update=True
+                    )
+                    if campaign is not None:
+                        other_wakeup = await session.scalar(
+                            select(func.min(CollectionJob.next_attempt_at))
+                            .join(
+                                CollectionRun,
+                                CollectionRun.id == CollectionJob.collection_run_id,
+                            )
+                            .where(
+                                CollectionRun.campaign_id == campaign.id,
+                                CollectionJob.id != job.id,
+                                CollectionJob.status == JobStatus.RETRY_WAIT,
+                                CollectionJob.next_attempt_at > now,
+                            )
+                        )
+                        campaign.status = CampaignStatus.RUNNING.value
+                        campaign.next_wakeup_at = other_wakeup
+                        campaign.error_message = (
+                            "Часть jobs ожидает persisted retry"
+                            if other_wakeup is not None
+                            else None
+                        )
             await session.commit()
             return ClaimedJob(
                 job.id,
@@ -483,6 +790,35 @@ class CollectionQueue:
                 "collection": collection_configuration,
                 "capacity_gate": "pilot_required" if not pilot else "pilot",
             }
+            if pilot:
+                await session.execute(
+                    select(func.pg_advisory_xact_lock(func.hashtext("subscriptions_pilot")))
+                )
+                unfinished = await session.scalar(
+                    select(CollectionRun)
+                    .where(
+                        CollectionRun.scope == "subscriptions_pilot",
+                        CollectionRun.status.in_(
+                            [
+                                CollectionRunStatus.PLANNED,
+                                CollectionRunStatus.RUNNING,
+                                CollectionRunStatus.PAUSED,
+                                CollectionRunStatus.PAUSED_NO_TOKENS,
+                                CollectionRunStatus.WAITING_METHOD_LIMIT,
+                            ]
+                        ),
+                    )
+                    .order_by(CollectionRun.created_at)
+                    .limit(1)
+                    .with_for_update()
+                )
+                if unfinished is not None:
+                    if unfinished.configuration.get("collection") != collection_configuration:
+                        raise ValueError(
+                            "Существует незавершённый Pilot A с несовместимой конфигурацией; "
+                            "сначала выполните read-only preview и явную cancel-pilot"
+                        )
+                    return unfinished.id
             existing_query = select(CollectionRun).where(
                 CollectionRun.configuration["plan_key"].astext == configuration["plan_key"]
             )
@@ -719,6 +1055,53 @@ class CollectionQueue:
             await session.commit()
             return claimed
 
+    async def claim_metadata_batch(self, run_id: uuid.UUID, *, limit: int) -> list[ClaimedJob]:
+        """Claim extra community metadata jobs for one groups.getById request."""
+        if limit <= 0:
+            return []
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            jobs = list(
+                (
+                    await session.scalars(
+                        select(CollectionJob)
+                        .where(
+                            CollectionJob.collection_run_id == run_id,
+                            CollectionJob.job_type == "refresh_community_metadata",
+                            CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY_WAIT]),
+                            or_(
+                                CollectionJob.next_attempt_at.is_(None),
+                                CollectionJob.next_attempt_at <= now,
+                            ),
+                        )
+                        .order_by(CollectionJob.entity_id)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+            claimed: list[ClaimedJob] = []
+            for job in jobs:
+                job.status = JobStatus.RUNNING
+                job.locked_at = now
+                job.heartbeat_at = now
+                job.locked_by = self._settings.collection_worker_id
+                job.started_at = job.started_at or now
+                job.attempt_count += 1
+                claimed.append(
+                    ClaimedJob(
+                        job.id,
+                        job.collection_run_id,
+                        job.job_type,
+                        job.entity_type,
+                        job.entity_id,
+                        dict(job.checkpoint),
+                        job.attempt_count,
+                    )
+                )
+            await session.commit()
+            return claimed
+
     async def release(self, jobs: list[ClaimedJob]) -> None:
         """Вернуть дополнительные batch jobs после неуспешного общего API-запроса."""
         if not jobs:
@@ -729,6 +1112,7 @@ class CollectionQueue:
                 .where(CollectionJob.id.in_([job.id for job in jobs]))
                 .values(
                     status=JobStatus.PENDING,
+                    attempt_count=func.greatest(CollectionJob.attempt_count - 1, 0),
                     locked_at=None,
                     locked_by=None,
                     heartbeat_at=None,
@@ -744,24 +1128,74 @@ class CollectionQueue:
         error_type: str | None = None,
         error_message: str | None = None,
         retry_at: datetime | None = None,
-    ) -> None:
+        checkpoint: dict[str, object] | None = None,
+    ) -> bool:
+        """Finish/defer one job and reconcile only on the run's first terminal edge."""
         now = datetime.now(UTC)
+        run_became_terminal = False
+        campaign_id: uuid.UUID | None = None
+        terminal_statuses = {JobStatus.COMPLETED, JobStatus.SKIPPED, JobStatus.FAILED}
         async with self._sessions() as session:
             job = await session.get(CollectionJob, job_id, with_for_update=True)
             if job is None:
-                return
+                return False
+            previous_status = job.status
+            if previous_status in terminal_statuses:
+                return False
             job.status = status
             job.last_error_type = error_type
             job.last_error_message = error_message
             job.error_message = error_message
             job.next_attempt_at = retry_at
+            if checkpoint is not None:
+                job.checkpoint = checkpoint
             job.locked_at = None
             job.locked_by = None
             job.heartbeat_at = None
-            if status in {JobStatus.COMPLETED, JobStatus.SKIPPED, JobStatus.FAILED}:
+            if status in terminal_statuses:
                 job.finished_at = now
+                run = await session.get(CollectionRun, job.collection_run_id, with_for_update=True)
+                if run is not None:
+                    if status == JobStatus.COMPLETED:
+                        run.completed_jobs += 1
+                    elif status == JobStatus.SKIPPED:
+                        run.skipped_jobs += 1
+                    else:
+                        run.failed_jobs += 1
+                    await session.flush()
+                    has_active = bool(
+                        await session.scalar(
+                            select(
+                                exists().where(
+                                    CollectionJob.collection_run_id == run.id,
+                                    CollectionJob.status.in_(
+                                        [
+                                            JobStatus.PENDING,
+                                            JobStatus.RUNNING,
+                                            JobStatus.RETRY_WAIT,
+                                            JobStatus.PAUSED,
+                                        ]
+                                    ),
+                                )
+                            )
+                        )
+                    )
+                    if not has_active and run.total_jobs:
+                        run.status = (
+                            CollectionRunStatus.COMPLETED_WITH_ERRORS
+                            if run.failed_jobs
+                            else CollectionRunStatus.COMPLETED
+                        )
+                        run.finished_at = now
+                        run.next_wakeup_at = None
+                        run_became_terminal = True
+                        campaign_id = run.campaign_id
             await session.commit()
-        await self.refresh_run(job.collection_run_id)
+        if run_became_terminal and campaign_id is not None:
+            from vk_collector.collection.campaigns import CampaignManager
+
+            await CampaignManager(self._sessions, self._settings).reconcile(campaign_id)
+        return run_became_terminal
 
     async def defer_method(self, job: ClaimedJob, *, retry_at: datetime, message: str) -> None:
         """Отложить job из-за method limit, не расходуя обычную попытку."""
@@ -784,6 +1218,18 @@ class CollectionQueue:
                     retry_at if run.next_wakeup_at is None else min(run.next_wakeup_at, retry_at)
                 )
                 run.error_message = message
+                if run.campaign_id is not None:
+                    campaign = await session.get(
+                        CollectionCampaign, run.campaign_id, with_for_update=True
+                    )
+                    if campaign is not None:
+                        campaign.status = CampaignStatus.WAITING_METHOD_LIMIT.value
+                        campaign.next_wakeup_at = (
+                            retry_at
+                            if campaign.next_wakeup_at is None
+                            else min(campaign.next_wakeup_at, retry_at)
+                        )
+                        campaign.error_message = message
             await session.commit()
 
     async def pending_job_types(self, run_id: uuid.UUID) -> set[str]:
@@ -889,6 +1335,20 @@ class CollectionQueue:
                 raise ValueError("Запуск не найден")
             run.status = status
             run.error_message = reason
+            if run.campaign_id is not None:
+                campaign = await session.get(
+                    CollectionCampaign, run.campaign_id, with_for_update=True
+                )
+                if campaign is not None:
+                    if status == CollectionRunStatus.PAUSED_CAPACITY_LIMIT:
+                        campaign.status = CampaignStatus.PAUSED_CAPACITY_LIMIT.value
+                    elif status == CollectionRunStatus.PAUSED:
+                        campaign.status = CampaignStatus.PAUSED.value
+                    elif status == CollectionRunStatus.WAITING_METHOD_LIMIT:
+                        campaign.status = CampaignStatus.WAITING_METHOD_LIMIT.value
+                    elif status == CollectionRunStatus.RUNNING:
+                        campaign.status = CampaignStatus.RUNNING.value
+                    campaign.error_message = reason
             await session.execute(
                 update(CollectionJob)
                 .where(

@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy-production.sh"
 CLEANUP_SCRIPT = ROOT / "scripts" / "cleanup-production-storage.sh"
 COLLECTION_CONTROL_SCRIPT = ROOT / "scripts" / "production-collection-control.sh"
+DEPLOY_TRANSITION_SCRIPT = ROOT / "scripts" / "deploy-transition-decision.sh"
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE = f"ghcr.io/marklyvk/vk-research-collector/collector:sha-{FULL_SHA}"
 DIGEST = f"sha256:{'1' * 64}"
@@ -107,6 +108,7 @@ def test_production_compose_uses_sha_image_and_stable_volume_without_build() -> 
 
 def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action() -> None:
     text = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    transition_text = DEPLOY_TRANSITION_SCRIPT.read_text(encoding="utf-8")
     required = (
         "flock -n",
         "DISK_WARNING",
@@ -146,8 +148,13 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "DISK_AFTER_PULL",
         "install_telegram_monitor_units",
         "systemctl --user enable --now",
+        "deployment_transition_decision",
+        "legacy run quarantined as expected",
+        "transition_data_snapshot",
+        "locked_at IS NOT NULL OR locked_by IS NOT NULL",
+        "20260815_0010",
     )
-    assert all(item in text for item in required)
+    assert all(item in text + transition_text for item in required)
     assert "alembic downgrade" not in text
     assert "down -v" not in text
     assert "docker volume rm" not in text
@@ -218,7 +225,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20260810_0007",
+        "20260815_0010",
     )
     assert all(item in script for item in required)
     forbidden = (
@@ -248,32 +255,39 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
     assert job["runs-on"] == ["self-hosted", "linux", "x64", "production", "vk-collector"]
     assert job["environment"] == {"name": "production"}
     assert "START_SUBSCRIPTIONS" in workflow_text
-    assert "github.event_name == 'schedule'" in workflow_text
-    assert '"$GITHUB_EVENT_NAME" != schedule' in workflow_text
+    assert "github.event_name == 'schedule' && 'report'" in workflow_text
+    assert 'test "$GITHUB_EVENT_NAME" = workflow_dispatch' in workflow_text
+    assert "schedule' && 'start-subscriptions'" not in workflow_text
 
     required = (
         "flock -n",
-        "20260810_0007",
+        "20260815_0010",
         "collection subscriptions pilot",
         "subscription-gate-a.json",
         "production_allowed",
-        "collection subscriptions plan",
+        "collection campaign plan --apply",
         "collection capacity-apply",
+        "pilot-control-decision",
+        "campaign control-decision",
+        "pilot --run-id",
+        "cancel-pilot --run-id ID --confirm",
         "--backup",
         "setfacl -m u:10001:r",
         "setfacl -m u:10001:rx",
         'chmod 0700 "$backup_dir"',
         "Collector UID не может прочитать PGDMP header",
-        "Пробую применить уже измеренный Gate A",
+        "Пробую renewal Gate A",
         "COLLECTION_SUBSCRIPTIONS_MAX_PER_USER 50",
         "compose stop -t 360 collector-worker",
         "compose up -d --no-deps --no-build collector-worker",
         "group_keyword_matches",
         "vk_token_method_states",
-        "Следующая cohort пока не нужна",
+        "Дубли не создаются",
         "Подходящих пользователей для новой cohort сейчас нет",
-        "created_at > coalesce",
-        "status::text IN ('completed','completed_with_errors')",
+        "collection_campaigns",
+        "subscription_discovery",
+        "distinct_entities",
+        "stale_running_leases",
         "sanitized_message",
         "j.status = 'failed'",
         "for pilot_attempt in 1 2 3",
@@ -281,11 +295,21 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "terminal-состояний",
         "ensure_worker_healthy",
         "безопасный self-heal",
-        "scope IN ('full','incremental','subscriptions','subscription_posts')",
+        "'subscription_discovery','subscription_metadata'",
         "deferred_pilot",
-        "продолжение выполнит следующий hourly-control",
+        "следующий hourly-control выберет тот же run ID",
     )
     assert all(item in script for item in required)
+    active_run_query = script.split("active_runs=$(", 1)[1].split(
+        "paused_capacity_campaigns=$(", 1
+    )[0]
+    assert "'full'" not in active_run_query
+    assert "'incremental'" not in active_run_query
+    assert "subscriptions_pilot" not in active_run_query
+    assert "paused_capacity_limit" not in active_run_query
+    assert "Переиспользую paused-capacity campaign" in script
+    assert 'collection subscriptions pilot --run-id "$pilot_run_id"' in script
+    assert '--run-id "$renew_run_id"' in script
     forbidden = (
         "capacity_gate = 'passed'",
         "UPDATE collection_runs",
@@ -313,6 +337,80 @@ def test_operational_shell_scripts_are_executable_in_git() -> None:
     )
     modes = {line.split(maxsplit=1)[0] for line in output.splitlines()}
     assert modes == {"100755"}
+
+
+def transition_decision(**values: object) -> subprocess.CompletedProcess[str]:
+    exports = "\n".join(f"export {key}={str(value)!r}" for key, value in values.items())
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {str(DEPLOY_TRANSITION_SCRIPT)!r}\n{exports}\ndeployment_transition_decision",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def healthy_transition_values() -> dict[str, object]:
+    return {
+        "TRANSITION_HEALTH_OK": 1,
+        "TRANSITION_IMAGE_OK": 1,
+        "TRANSITION_ALEMBIC_OK": 1,
+        "TRANSITION_DATA_UNCHANGED": 1,
+        "BASELINE_RUN_STATUS": "running",
+        "BASELINE_COMPLETED": 10,
+        "BASELINE_FAILED": 0,
+        "RUN_STATUS": "paused_capacity_limit",
+        "RUN_ERROR_MESSAGE": "Runtime-конфигурация не совпадает с immutable run",
+        "FINAL_COMPLETED": 10,
+        "FINAL_PENDING": 2,
+        "FINAL_RUNNING": 0,
+        "FINAL_RETRY": 0,
+        "FINAL_FAILED": 0,
+        "FINAL_RUNNING_LEASES": 0,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Поведенческий shell-тест выполняется в Linux CI")
+def test_expected_legacy_configuration_quarantine_is_successful() -> None:
+    result = transition_decision(**healthy_transition_values())
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "legacy run quarantined as expected"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Поведенческий shell-тест выполняется в Linux CI")
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"RUN_ERROR_MESSAGE": "Неизвестная capacity pause"}, "configuration-mismatch"),
+        ({"RUN_ERROR_MESSAGE": "Диск заполнен на 95.0%"}, "configuration-mismatch"),
+        ({"FINAL_FAILED": 1}, "failed jobs"),
+        ({"TRANSITION_HEALTH_OK": 0}, "Healthcheck"),
+        ({"TRANSITION_IMAGE_OK": 0}, "Immutable image"),
+        ({"TRANSITION_ALEMBIC_OK": 0}, "Alembic head"),
+        ({"TRANSITION_DATA_UNCHANGED": 0}, "jobs или checkpoints"),
+        ({"FINAL_RUNNING_LEASES": 1}, "running leases"),
+    ],
+)
+def test_unsafe_deployment_transition_stays_fail_closed(
+    override: dict[str, object], expected: str
+) -> None:
+    values = healthy_transition_values()
+    values.update(override)
+    result = transition_decision(**values)
+    assert result.returncode != 0
+    assert expected in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Поведенческий shell-тест выполняется в Linux CI")
+def test_compatible_run_without_progress_stays_fail_closed() -> None:
+    values = healthy_transition_values()
+    values.update({"RUN_STATUS": "running", "RUN_ERROR_MESSAGE": ""})
+    result = transition_decision(**values)
+    assert result.returncode != 0
+    assert "не показал прогресс" in result.stderr
 
 
 def test_runner_installer_uses_production_runner_name_and_labels() -> None:

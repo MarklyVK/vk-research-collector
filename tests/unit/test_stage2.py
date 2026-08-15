@@ -1,23 +1,32 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import yaml
 from pydantic import SecretStr, ValidationError
 
-from vk_collector.cli.app import _validated_backup_metadata
+from vk_collector.cli.app import _validate_autonomous_run, _validated_backup_metadata
+from vk_collector.collection.backup import BackupVerifier
+from vk_collector.collection.campaigns import (
+    build_aggregate_capacity_projection,
+    choose_campaign_control_action,
+)
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
     write_capacity_report,
 )
 from vk_collector.collection.notifications import notify
+from vk_collector.collection.pilots import choose_pilot_control_action
 from vk_collector.collection.queue import CollectionQueue
-from vk_collector.collection.safety import inspect_disk, sanitize_message
+from vk_collector.collection.reporting import bounded_wakeup_delay
+from vk_collector.collection.safety import DiskState, inspect_disk, sanitize_message
 from vk_collector.collection.worker import normalize_attachment
 from vk_collector.config import Settings
+from vk_collector.vk import TokenPool, VKMethodUnavailable
 
 
 def test_blank_optional_limits_are_supported() -> None:
@@ -28,13 +37,147 @@ def test_blank_optional_limits_are_supported() -> None:
     assert settings.collection_subscriptions_max_per_user == 50
 
 
-def test_subscription_limit_accepts_100_but_rejects_more() -> None:
+def test_subscription_limit_accepts_50_but_rejects_more() -> None:
     assert (
-        Settings(collection_subscriptions_max_per_user=100).collection_subscriptions_max_per_user
-        == 100
+        Settings(collection_subscriptions_max_per_user=50).collection_subscriptions_max_per_user
+        == 50
     )
     with pytest.raises(ValidationError):
-        Settings(collection_subscriptions_max_per_user=101)
+        Settings(collection_subscriptions_max_per_user=51)
+
+
+def test_aggregate_capacity_scales_gate_a_to_full_discovery_snapshot() -> None:
+    preview = {
+        "snapshot_users": 20_000,
+        "already_resolved_users": 0,
+        "discovery_due_users": 20_000,
+        "snapshot_storage_estimate": {
+            "heap_bytes": 20_000 * 64,
+            "primary_key_bytes": 20_000 * 48,
+        },
+    }
+    report = {
+        "limits": {"production_users": 10_000},
+        "projected": {"database_growth_bytes": 200_000_000, "reserve_factor": 1.30},
+    }
+    rejected = build_aggregate_capacity_projection(
+        preview=preview,
+        report=report,
+        database_bytes=7 * 1024**3 - 300_000_000,
+        disk=DiskState(
+            used_percent=70.0,
+            warning=False,
+            stop=False,
+            total_bytes=10 * 1024**3,
+            free_bytes=3 * 1024**3,
+        ),
+        warning_percent=85,
+    )
+    assert rejected["gate_a_target_entities"] == 10_000
+    assert rejected["gate_a_projected_growth_bytes"] == 200_000_000
+    assert rejected["aggregate_discovery_projected_growth_bytes"] == 400_000_000
+    assert rejected["decision"] == "rejected"
+    assert rejected["rejection_reasons"]
+
+    passed = build_aggregate_capacity_projection(
+        preview=preview,
+        report=report,
+        database_bytes=1_000_000_000,
+        disk=DiskState(
+            used_percent=20.0,
+            warning=False,
+            stop=False,
+            total_bytes=10 * 1024**3,
+            free_bytes=8 * 1024**3,
+        ),
+        warning_percent=85,
+    )
+    assert passed["decision"] == "passed"
+    assert passed["snapshot_projected_growth_bytes"] == 2_912_000
+    assert passed["aggregate_projected_growth_bytes"] == 402_912_000
+
+
+def test_pilot_control_decision_is_run_id_specific_and_terminal_safe() -> None:
+    base = {
+        "run_id": str(uuid.uuid4()),
+        "classification": "compatible_recoverable",
+        "nearest_retry": None,
+        "scope": "subscriptions_pilot",
+    }
+    assert choose_pilot_control_action([base]) == {
+        "action": "resume",
+        "run_id": base["run_id"],
+        "scope": "subscriptions_pilot",
+        "reason": "compatible_recoverable",
+    }
+    waiting = {
+        **base,
+        "classification": "waiting",
+        "nearest_retry": "2026-08-15T12:00:00+00:00",
+    }
+    assert choose_pilot_control_action([waiting])["action"] == "wait"
+    stale = {**base, "classification": "stale_running_lease"}
+    assert choose_pilot_control_action([stale])["action"] == "resume"
+    incompatible = {**base, "classification": "incompatible_configuration"}
+    assert (
+        choose_pilot_control_action([incompatible, {**incompatible, "run_id": "other"}])["action"]
+        == "operator_required"
+    )
+    terminal = {**base, "classification": "terminal"}
+    assert choose_pilot_control_action([terminal])["action"] == "create"
+
+
+def test_campaign_control_renews_existing_metadata_run_not_discovery() -> None:
+    campaign_id = str(uuid.uuid4())
+    discovery_id = str(uuid.uuid4())
+    metadata_id = str(uuid.uuid4())
+    rows: list[dict[str, object]] = [
+        {
+            "campaign_id": campaign_id,
+            "campaign_status": "paused_capacity_limit",
+            "compatible": True,
+            "run_id": discovery_id,
+            "scope": "subscription_discovery",
+            "run_status": "completed",
+        },
+        {
+            "campaign_id": campaign_id,
+            "campaign_status": "paused_capacity_limit",
+            "compatible": True,
+            "run_id": metadata_id,
+            "scope": "subscription_metadata",
+            "run_status": "paused_capacity_limit",
+        },
+    ]
+    decision = choose_campaign_control_action(rows)
+    assert decision["action"] == "renew_metadata"
+    assert decision["run_id"] == metadata_id
+    assert decision["scope"] == "subscription_metadata"
+
+
+@pytest.mark.asyncio
+async def test_mixed_method_codes_choose_latest_causal_event() -> None:
+    current = [100.0]
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    pool = TokenPool(
+        ("token-a", "token-b"),
+        rps=100,
+        clock=lambda: current[0],
+        sleep=no_sleep,
+        flood_initial_cooldown=1000,
+        quota_initial_cooldown=1000,
+    )
+    first = await pool.acquire("groups.get")
+    await pool.method_cooldown(first, 9)
+    current[0] += 1
+    second = await pool.acquire("groups.get")
+    await pool.method_cooldown(second, 29)
+    with pytest.raises(VKMethodUnavailable) as captured:
+        await pool.acquire("groups.get")
+    assert captured.value.error_code == 29
 
 
 def test_secret_masking_removes_tokens_and_database_urls() -> None:
@@ -74,6 +217,12 @@ def test_disk_thresholds_are_monotonic(tmp_path: Path) -> None:
     assert state.stop
 
 
+def test_nearest_durable_wakeup_uses_bound_without_sleep() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    assert bounded_wakeup_delay(now + timedelta(seconds=17), now=now, idle_seconds=5) == 17
+    assert bounded_wakeup_delay(now + timedelta(hours=2), now=now, idle_seconds=5) == 60
+
+
 def test_collection_configuration_captures_capacity_limits() -> None:
     small = CollectionQueue(  # type: ignore[arg-type]
         None,
@@ -87,6 +236,7 @@ def test_collection_configuration_captures_capacity_limits() -> None:
     assert small.collection_configuration()["posts_max_per_group"] == 100
     assert small.collection_configuration()["members_max_per_group"] == 200
     assert small.collection_configuration()["subscription_posts_ttl_days"] == 30
+    assert small.collection_configuration()["subscription_posts_enabled"] is False
 
 
 def test_capacity_report_is_atomic_and_bound_to_configuration(tmp_path: Path) -> None:
@@ -260,6 +410,104 @@ def test_verified_backup_must_remain_the_same_pg_dump(tmp_path: Path) -> None:
     backup.write_bytes(b"PGDMP\x01changed-test")
     with pytest.raises(ValueError, match="изменился"):
         _validated_backup_metadata(backup, expected=metadata)
+
+
+def test_backup_sha_is_read_once_per_worker_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = tmp_path / "before-campaign.dump"
+    backup.write_bytes(b"PGDMP\x01safe-test-content")
+    expected = BackupVerifier().fingerprint(backup)
+    verifier = BackupVerifier()
+    original_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal reads
+        if path == backup.resolve():
+            reads += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    assert verifier.verify(backup, expected) == expected
+    assert verifier.verify(backup, expected) == expected
+    assert verifier.verify(backup, expected) == expected
+    assert reads == 1
+
+
+def test_backup_stat_change_stops_before_cached_use(tmp_path: Path) -> None:
+    backup = tmp_path / "before-campaign.dump"
+    backup.write_bytes(b"PGDMP\x01safe-test-content")
+    expected = BackupVerifier().fingerprint(backup)
+    verifier = BackupVerifier()
+    verifier.verify(backup, expected)
+    backup.write_bytes(b"PGDMP\x01changed-size-content")
+    with pytest.raises(ValueError, match="изменился"):
+        verifier.verify(backup, expected)
+
+
+def test_backup_mismatch_is_not_cached_as_verified(tmp_path: Path) -> None:
+    backup = tmp_path / "mismatch.dump"
+    backup.write_bytes(b"PGDMP\x01same-stat-content")
+    expected = BackupVerifier().fingerprint(backup)
+    mismatched = {**expected, "sha256": "0" * 64}
+    verifier = BackupVerifier()
+    with pytest.raises(ValueError, match="изменился"):
+        verifier.verify(backup, mismatched)
+    assert not verifier._verified  # mismatch не должен становиться успешным cache entry
+    assert verifier.verify(backup, expected) == expected
+
+
+@pytest.mark.asyncio
+async def test_three_scheduler_quantum_hash_backup_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = tmp_path / "scheduler.dump"
+    backup.write_bytes(b"PGDMP\x01scheduler-content")
+    expected_backup = BackupVerifier().fingerprint(backup)
+    settings = Settings()
+    configuration = CollectionQueue(None, settings).collection_configuration()  # type: ignore[arg-type]
+    run = SimpleNamespace(
+        scope="subscription_discovery",
+        configuration={
+            "capacity_gate": "passed",
+            "collection": configuration,
+            "capacity_report": str(tmp_path / "gate.json"),
+            "verified_backup": expected_backup,
+        },
+    )
+
+    class FakeSession:
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, *args: object) -> object:
+            return run
+
+    class FakeSessions:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    monkeypatch.setattr("vk_collector.cli.app.validate_capacity_report", lambda *a, **k: {})
+    original_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal reads
+        if path == backup.resolve():
+            reads += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    verifier = BackupVerifier()
+    for _ in range(3):
+        await _validate_autonomous_run(  # type: ignore[arg-type]
+            FakeSessions(), settings, uuid.uuid4(), backup_verifier=verifier
+        )
+    assert reads == 1
 
 
 def test_compose_defines_restartable_autonomous_worker() -> None:

@@ -8,16 +8,15 @@
 - Среда разработки: Codex App на Windows
 - Сервер: Cloud.ru
 - Операционная система сервера: Debian 12
-- CPU: 1
-- RAM: 1 GB
-- Диск: 10 GB
-- Swap: 1 GB
 - GPU: отсутствует
 - Все даты хранятся в UTC
+- Production является ресурсно ограниченной средой; актуальные CPU, RAM, диск и swap
+  необходимо проверять по live production report перед каждым rollout, а не брать из
+  исторического описания.
 
-## 2. Цель текущей итерации
+## 2. Завершённый первый этап
 
-Сейчас реализуется только первый этап проекта:
+Первый этап проекта завершён. В него входили:
 
 1. Поиск сообществ VK по ключевым словам.
 2. Сохранение найденных кандидатов в PostgreSQL.
@@ -44,4 +43,38 @@ incremental run после семантической классификации
 → экспорт JSON
 → ручная классификация
 → импорт одобренных VK ID
-→ будущий основной сбор
+→ одобренный набор сообществ
+```
+
+## 3. Цель второго этапа
+
+Текущий этап — безопасный фазовый subscription enrichment уже сохранённых доступных
+пользователей VK. Для каждой кампании материализуется неизменяемый snapshot; повторное
+планирование не должно расширять или незаметно менять его. Текущий конфигурационный
+лимит составляет не более 50 сохраняемых подписок на пользователя.
+
+Основная последовательность:
+
+```text
+existing accessible users
+→ immutable snapshot
+→ aggregate subscription discovery capacity gate
+→ subscription discovery
+→ устранение unresolved пользователей
+→ DISTINCT communities
+→ aggregate metadata capacity gate
+→ bounded metadata cohorts
+```
+
+Aggregate gate оценивает весь разрешённый snapshot и не может быть обойдён уменьшением
+cohort. Rejected decision не создаёт campaign, snapshot, run или jobs. Перед следующими
+cohorts выполняется live capacity recheck.
+
+Небольшой light repair по уже сохранённым пользователям и сообществам может
+чередоваться с bounded discovery cohorts. Metadata найденных сообществ, включая
+название и описание, не начинается, пока discovery всего snapshot не завершён и
+остаются unresolved пользователи. Для metadata применяется отдельный aggregate gate.
+
+Scheduled production workflow работает только в report-only режиме. Mutating запуск
+доступен лишь через ручной workflow_dispatch с точным confirmation. Subscription posts
+и массовый `wall.get` выключены и не входят во второй этап.

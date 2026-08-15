@@ -5,15 +5,16 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import signal
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import typer
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.classification.audit import evaluate_audit, prepare_audit
@@ -28,24 +29,36 @@ from vk_collector.classification.service import (
     import_classification,
 )
 from vk_collector.collection import CollectionQueue, CollectionWorker
+from vk_collector.collection.backlog import canonical_backlog
+from vk_collector.collection.backup import BackupVerifier
+from vk_collector.collection.campaigns import CampaignManager, build_aggregate_capacity_projection
 from vk_collector.collection.capacity import (
     build_capacity_report,
     validate_capacity_report,
     write_capacity_report,
 )
 from vk_collector.collection.notifications import notify
+from vk_collector.collection.pilots import (
+    cancel_pilot,
+    choose_pilot_control_action,
+    pilot_previews,
+)
 from vk_collector.collection.reporting import (
+    bounded_wakeup_delay,
     capacity_gate_passed,
     database_metrics,
     global_summary,
     latest_run_id,
-    latest_runnable_run_id,
+    next_runnable_wakeup,
     run_summary,
+    runnable_run_ids,
     verify_run,
 )
 from vk_collector.collection.safety import inspect_disk
 from vk_collector.config import Settings, get_settings, load_keyword_config
 from vk_collector.database.models import (
+    CampaignStatus,
+    CollectionCampaign,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
@@ -71,11 +84,13 @@ groups_app = typer.Typer(help="Поиск и статистика групп.")
 classification_app = typer.Typer(help="Пакеты ручной классификации.")
 collection_app = typer.Typer(help="Возобновляемый сбор публичных approved-данных.")
 subscriptions_app = typer.Typer(help="Обогащение существующих пользователей подписками.")
+campaign_app = typer.Typer(help="Многофазная кампания подписок с фиксированным snapshot.")
 privacy_app = typer.Typer(help="Проверка и минимизация персональных данных.")
 app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
 app.add_typer(collection_app, name="collection")
 collection_app.add_typer(subscriptions_app, name="subscriptions")
+collection_app.add_typer(campaign_app, name="campaign")
 app.add_typer(privacy_app, name="privacy")
 
 
@@ -545,7 +560,7 @@ async def _execute_collection(
                     raise ValueError(
                         "Pilot запускается только явной командой subscriptions pilot/posts-pilot"
                     )
-            elif run.scope == "subscriptions":
+            elif run.scope in {"subscriptions", "subscription_discovery", "subscription_metadata"}:
                 if not settings.collection_subscriptions_enabled:
                     raise ValueError("Сбор подписок выключен COLLECTION_SUBSCRIPTIONS_ENABLED")
                 report_path = run.configuration.get("capacity_report")
@@ -641,6 +656,7 @@ def run_collection(
         "members",
         "users",
         "subscriptions",
+        "metadata",
         "subscription_posts",
     }:
         typer.echo("Неизвестный scope.", err=True)
@@ -656,40 +672,162 @@ def run_collection(
 
 
 async def _collection_worker_service() -> None:
-    """Ожидать разрешённый full run и выполнять его независимо от CLI-сессии."""
+    """Fairly process all authorized runs with one shared VK client and token pool."""
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     stop_event = asyncio.Event()
+    client: VKClient | None = None
+    worker: CollectionWorker | None = None
+    run_cursor = 0
+    backup_verifier = BackupVerifier()
     loop = asyncio.get_running_loop()
     for handled_signal in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(handled_signal, stop_event.set)
     try:
+        recovery_queue = CollectionQueue(sessions, settings)
+        async with sessions() as session:
+            recovery_rows = (
+                await session.execute(
+                    select(CollectionRun.id, CollectionRun.campaign_id).where(
+                        CollectionRun.campaign_id.is_not(None),
+                        CollectionRun.status.in_(
+                            [
+                                CollectionRunStatus.PLANNED,
+                                CollectionRunStatus.RUNNING,
+                                CollectionRunStatus.WAITING_METHOD_LIMIT,
+                            ]
+                        ),
+                    )
+                )
+            ).all()
+        recovery_campaigns: set[uuid.UUID] = set()
+        for recovery_run_id, recovery_campaign_id in recovery_rows:
+            await recovery_queue.recover_expired(recovery_run_id)
+            if recovery_campaign_id is not None:
+                recovery_campaigns.add(recovery_campaign_id)
+        recovery_manager = CampaignManager(sessions, settings)
+        for recovery_campaign_id in recovery_campaigns:
+            await recovery_manager.reconcile(recovery_campaign_id)
         while not stop_event.is_set():
-            target = await latest_runnable_run_id(sessions)
-            if target is None:
+            targets = await runnable_run_ids(sessions)
+            if not targets:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
                     )
                 continue
-            try:
-                await _execute_collection(
-                    target,
-                    None,
-                    None,
-                    until_idle=False,
-                    stop_event=stop_event,
+            if client is None:
+                try:
+                    tokens = load_tokens(settings.vk_tokens_file)
+                except VKTokensUnavailable as exc:
+                    logger.warning("VK-токены пока недоступны: %s", exc)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            stop_event.wait(), timeout=settings.collection_idle_sleep_seconds
+                        )
+                    continue
+                pool = _token_pool(settings, tokens, sessions)
+                client = VKClient(
+                    pool,
+                    api_version=settings.vk_api_version,
+                    timeout=settings.vk_request_timeout_seconds,
                 )
-            except ValueError as exc:
-                queue = CollectionQueue(sessions, settings)
-                await queue.set_run_status(
-                    target, CollectionRunStatus.PAUSED_CAPACITY_LIMIT, str(exc)
+                worker = CollectionWorker(sessions, client, settings)
+            ordered = targets[run_cursor:] + targets[:run_cursor]
+            run_cursor = (run_cursor + 1) % len(targets)
+            processed = 0
+            for target in ordered:
+                if stop_event.is_set():
+                    break
+                try:
+                    await _validate_autonomous_run(
+                        sessions, settings, target, backup_verifier=backup_verifier
+                    )
+                    assert worker is not None
+                    processed += await worker.run(
+                        target,
+                        max_jobs=settings.collection_scheduler_quantum,
+                        stop_event=stop_event,
+                        until_idle=True,
+                    )
+                except ValueError as exc:
+                    queue = CollectionQueue(sessions, settings)
+                    await queue.set_run_status(
+                        target, CollectionRunStatus.PAUSED_CAPACITY_LIMIT, str(exc)
+                    )
+                    logger.error("Автономный run %s безопасно отклонён: %s", target, exc)
+            if processed == 0:
+                wakeup = await next_runnable_wakeup(sessions)
+                timeout = bounded_wakeup_delay(
+                    wakeup,
+                    now=datetime.now(UTC),
+                    idle_seconds=settings.collection_idle_sleep_seconds,
                 )
-                logger.error("Автономный run %s безопасно отклонён: %s", target, exc)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop_event.wait(), timeout=timeout)
     finally:
+        if client is not None:
+            await client.aclose()
         await engine.dispose()
+
+
+async def _validate_autonomous_run(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    run_id: uuid.UUID,
+    *,
+    backup_verifier: BackupVerifier | None = None,
+) -> None:
+    """Revalidate immutable configuration, report and backup before autonomous claim."""
+    queue = CollectionQueue(sessions, settings)
+    async with sessions() as session:
+        run = await session.get(CollectionRun, run_id)
+        if run is None or run.configuration.get("capacity_gate") != "passed":
+            raise ValueError("Run не имеет разрешающего capacity gate")
+        if run.configuration.get("collection") != queue.collection_configuration():
+            raise ValueError("Runtime-конфигурация не совпадает с immutable run")
+        if run.scope == "light_repair":
+            allowed = {"refresh_community_metadata", "refresh_user_profile"}
+            actual = set(
+                (
+                    await session.scalars(
+                        select(CollectionJob.job_type)
+                        .where(CollectionJob.collection_run_id == run_id)
+                        .distinct()
+                    )
+                ).all()
+            )
+            forbidden = sorted(actual - allowed)
+            if forbidden:
+                raise ValueError(
+                    "Light-repair содержит запрещённые job types: " + ", ".join(forbidden)
+                )
+        if run.scope in {
+            "subscriptions",
+            "subscription_discovery",
+            "subscription_metadata",
+            "subscription_posts",
+        }:
+            report_path = run.configuration.get("capacity_report")
+            backup = run.configuration.get("verified_backup")
+            expected = run.configuration.get("collection")
+            if (
+                not isinstance(report_path, str)
+                or not isinstance(backup, dict)
+                or not isinstance(backup.get("path"), str)
+                or not isinstance(expected, dict)
+            ):
+                raise ValueError("Run не содержит проверенные report/backup")
+            phase: Literal["A", "B"] = "B" if run.scope == "subscription_posts" else "A"
+            validate_capacity_report(
+                Path(report_path),
+                phase=phase,
+                configuration=expected,
+                max_age_days=settings.collection_capacity_report_max_age_days,
+            )
+            (backup_verifier or BackupVerifier()).verify(Path(str(backup["path"])), expected=backup)
 
 
 @collection_app.command("worker")
@@ -743,6 +881,248 @@ async def _plan_subscriptions(pilot: bool) -> uuid.UUID:
         await engine.dispose()
 
 
+async def _campaign_operation(
+    action: Literal["plan", "status", "pause", "resume", "metadata-preview"],
+    campaign_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        manager = CampaignManager(sessions, settings)
+        if action == "plan":
+            raise ValueError("Используйте campaign plan --apply --source ... --backup ...")
+        if action == "status":
+            return await manager.status(campaign_id)
+        if campaign_id is None:
+            raise ValueError("Укажите --campaign-id")
+        if action == "metadata-preview":
+            return await manager.metadata_preview(campaign_id)
+        await manager.change_status(campaign_id, pause=action == "pause")
+        return await manager.status(campaign_id)
+    finally:
+        await engine.dispose()
+
+
+def _show_campaign_operation(
+    action: Literal["plan", "status", "pause", "resume", "metadata-preview"],
+    campaign_id: uuid.UUID | None = None,
+) -> None:
+    try:
+        payload = asyncio.run(_campaign_operation(action, campaign_id))
+    except ValueError as exc:
+        typer.echo(f"Операция с кампанией отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _aggregate_campaign_preview(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    manager: CampaignManager,
+    source: Path | None,
+) -> dict[str, object]:
+    """Build a read-only full-snapshot projection from a validated completed Pilot A."""
+    preview = await manager.plan_preview()
+    async with sessions() as session:
+        database_bytes = int(
+            await session.scalar(select(func.pg_database_size(func.current_database()))) or 0
+        )
+    disk = inspect_disk(
+        settings.collection_export_dir,
+        settings.disk_warning_percent,
+        settings.disk_stop_percent,
+    )
+    report_path = source or settings.collection_export_dir / "subscription-gate-a.json"
+    if not report_path.is_file():
+        storage = preview.get("snapshot_storage_estimate")
+        heap = int(storage.get("heap_bytes", 0)) if isinstance(storage, dict) else 0
+        primary_key = int(storage.get("primary_key_bytes", 0)) if isinstance(storage, dict) else 0
+        return {
+            **preview,
+            "gate_a_target_entities": settings.collection_subscriptions_users_per_run,
+            "gate_a_projected_growth_bytes": None,
+            "aggregate_discovery_projected_growth_bytes": None,
+            "snapshot_heap_growth_bytes": heap,
+            "snapshot_primary_key_growth_bytes": primary_key,
+            "snapshot_projected_growth_bytes": None,
+            "aggregate_projected_growth_bytes": None,
+            "reserve_factor": 1.30,
+            "current_database_bytes": database_bytes,
+            "projected_final_database_bytes": None,
+            "current_disk_free_bytes": disk.free_bytes,
+            "projected_final_disk_used_percent": None,
+            "safe_database_limit_bytes": 7 * 1024**3,
+            "decision": "rejected",
+            "rejection_reasons": [
+                f"validated Pilot A capacity report отсутствует: {report_path.resolve()}"
+            ],
+        }
+    collection_configuration = manager.configuration()["collection"]
+    if not isinstance(collection_configuration, dict):
+        raise ValueError("Campaign collection configuration повреждена")
+    report = validate_capacity_report(
+        report_path,
+        phase="A",
+        configuration=collection_configuration,
+        max_age_days=settings.collection_capacity_report_max_age_days,
+    )
+    try:
+        pilot_id = uuid.UUID(str(report["run_id"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("Capacity report содержит некорректный pilot run ID") from exc
+    async with sessions() as session:
+        pilot = await session.get(CollectionRun, pilot_id)
+    if (
+        pilot is None
+        or pilot.scope != "subscriptions_pilot"
+        or pilot.status != CollectionRunStatus.COMPLETED
+    ):
+        raise ValueError("Capacity report не связан с завершённым Pilot A")
+    result = build_aggregate_capacity_projection(
+        preview=preview,
+        report=report,
+        database_bytes=database_bytes,
+        disk=disk,
+        warning_percent=settings.disk_warning_percent,
+    )
+    return {
+        **result,
+        "capacity_report_path": str(report_path.resolve()),
+        "capacity_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "disk": {
+            "total_bytes": disk.total_bytes,
+            "free_bytes": disk.free_bytes,
+            "used_percent": disk.used_percent,
+            "warning": disk.warning,
+            "stop": disk.stop,
+        },
+    }
+
+
+@campaign_app.command("plan")
+def campaign_plan(
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Создать или переиспользовать кампанию и первый cohort."),
+    ] = False,
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Свежий успешный capacity report Pilot A."),
+    ] = None,
+    backup: Annotated[
+        Path | None,
+        typer.Option("--backup", help="Проверенный pg_dump -Fc перед materialization."),
+    ] = None,
+) -> None:
+    """Создать campaign только явно; без --apply показать неизменяющий preview."""
+    if not apply:
+
+        async def preview() -> dict[str, object]:
+            settings = get_settings()
+            engine = create_database_engine(settings.sqlalchemy_url)
+            sessions = create_session_factory(engine)
+            try:
+                manager = CampaignManager(sessions, settings)
+                return await _aggregate_campaign_preview(sessions, settings, manager, source)
+            finally:
+                await engine.dispose()
+
+        typer.echo(json.dumps(asyncio.run(preview()), ensure_ascii=False, indent=2))
+        return
+    if source is None or backup is None:
+        typer.echo(
+            "Campaign apply отклонён: обязательны --source и --backup до materialization.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    async def apply_campaign() -> dict[str, object]:
+        settings = get_settings()
+        engine = create_database_engine(settings.sqlalchemy_url)
+        sessions = create_session_factory(engine)
+        try:
+            manager = CampaignManager(sessions, settings)
+            backup_metadata = _validated_backup_metadata(backup)
+            evidence = await _aggregate_campaign_preview(sessions, settings, manager, source)
+            if evidence.get("decision") != "passed":
+                reasons = evidence.get("rejection_reasons")
+                reason_text = (
+                    "; ".join(str(item) for item in reasons)
+                    if isinstance(reasons, list)
+                    else "неизвестная причина"
+                )
+                raise ValueError(
+                    "aggregate capacity rejected: "
+                    + reason_text
+                    + "; требуется дополнительно "
+                    + f"{evidence.get('additional_disk_required_bytes')} bytes"
+                )
+            evidence = {
+                **evidence,
+                "capacity_report": str(source.resolve()),
+                "capacity_report_path": str(source.resolve()),
+                "verified_backup": backup_metadata,
+                "projected_database_bytes": evidence["projected_final_database_bytes"],
+                "verified_at": datetime.now(UTC).isoformat(),
+            }
+            campaign_id = await manager.plan(gate_evidence=evidence)
+            return {"campaign_id": str(campaign_id), "capacity_gate": evidence}
+        finally:
+            await engine.dispose()
+
+    try:
+        payload = asyncio.run(apply_campaign())
+    except ValueError as exc:
+        typer.echo(f"Campaign apply отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@campaign_app.command("status")
+def campaign_status(
+    campaign_id: Annotated[uuid.UUID | None, typer.Option("--campaign-id")] = None,
+) -> None:
+    """Показать фазу, coverage, усечения и следующее пробуждение."""
+    _show_campaign_operation("status", campaign_id)
+
+
+@campaign_app.command("pause")
+def campaign_pause(campaign_id: Annotated[uuid.UUID, typer.Option("--campaign-id")]) -> None:
+    """Поставить кампанию на паузу без удаления jobs и checkpoint."""
+    _show_campaign_operation("pause", campaign_id)
+
+
+@campaign_app.command("resume")
+def campaign_resume(campaign_id: Annotated[uuid.UUID, typer.Option("--campaign-id")]) -> None:
+    """Возобновить кампанию с сохранённого checkpoint."""
+    _show_campaign_operation("resume", campaign_id)
+
+
+@campaign_app.command("metadata-preview")
+def campaign_metadata_preview(
+    campaign_id: Annotated[uuid.UUID, typer.Option("--campaign-id")],
+) -> None:
+    """Read-only preview DISTINCT communities будущей metadata-фазы."""
+    _show_campaign_operation("metadata-preview", campaign_id)
+
+
+@campaign_app.command("control-decision")
+def campaign_control_decision() -> None:
+    """Показать phase-aware решение hourly-control без изменения campaign."""
+
+    async def operation() -> dict[str, object]:
+        settings = get_settings()
+        engine = create_database_engine(settings.sqlalchemy_url)
+        sessions = create_session_factory(engine)
+        try:
+            return await CampaignManager(sessions, settings).control_decision()
+        finally:
+            await engine.dispose()
+
+    typer.echo(json.dumps(asyncio.run(operation())["decision"], ensure_ascii=False))
+
+
 @subscriptions_app.command("plan")
 def subscriptions_plan() -> None:
     """Создать cohort-plan существующих публичных пользователей."""
@@ -753,12 +1133,60 @@ def subscriptions_plan() -> None:
 @subscriptions_app.command("pilot")
 def subscriptions_pilot(
     max_jobs: Annotated[int | None, typer.Option("--max-jobs", min=1)] = None,
+    run_id: Annotated[uuid.UUID | None, typer.Option("--run-id")] = None,
 ) -> None:
     """Явно выполнить Pilot A максимум на 500 пользователей и записать report."""
     try:
-        payload = asyncio.run(_run_subscription_pilot("A", max_jobs=max_jobs))
+        payload = asyncio.run(_run_subscription_pilot("A", max_jobs=max_jobs, run_id=run_id))
     except ValueError as exc:
         typer.echo(f"Pilot A отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _pilot_control(
+    *, cancel_run_id: uuid.UUID | None = None, reason: str = "", confirm: bool = False
+) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        if cancel_run_id is not None:
+            if not confirm:
+                raise ValueError("Отмена pilot требует --confirm")
+            return await cancel_pilot(sessions, cancel_run_id, reason=reason)
+        rows = await pilot_previews(sessions, settings)
+        return {"pilots": rows, "decision": choose_pilot_control_action(rows)}
+    finally:
+        await engine.dispose()
+
+
+@subscriptions_app.command("pilot-preview")
+def subscriptions_pilot_preview() -> None:
+    """Показать классификацию и безопасное действие для всех historical pilot."""
+    typer.echo(json.dumps(asyncio.run(_pilot_control()), ensure_ascii=False, indent=2))
+
+
+@subscriptions_app.command("pilot-control-decision")
+def subscriptions_pilot_control_decision() -> None:
+    """Вернуть тестируемое решение hourly-control без изменения PostgreSQL."""
+    payload = asyncio.run(_pilot_control())
+    typer.echo(json.dumps(payload["decision"], ensure_ascii=False))
+
+
+@subscriptions_app.command("cancel-pilot")
+def subscriptions_cancel_pilot(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    confirm: Annotated[bool, typer.Option("--confirm")] = False,
+    reason: Annotated[
+        str, typer.Option("--reason", help="Причина сохраняется в collection run.")
+    ] = "obsolete pilot отменён оператором",
+) -> None:
+    """Явно отменить один pilot, сохранив jobs, checkpoints и collected data."""
+    try:
+        payload = asyncio.run(_pilot_control(cancel_run_id=run_id, reason=reason, confirm=confirm))
+    except ValueError as exc:
+        typer.echo(f"Отмена pilot отклонена: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -910,13 +1338,26 @@ async def _method_limits(method: str | None = None) -> list[dict[str, object]]:
             if method:
                 query = query.where(VKTokenMethodState.method == method)
             rows = list((await session.scalars(query)).all())
+            now = datetime.now(UTC)
             return [
                 {
-                    "token_fingerprint": row.token_fingerprint,
+                    "token_fingerprint": row.token_fingerprint[:12],
                     "method": row.method,
+                    "state": (
+                        "blocked"
+                        if row.blocked_until is not None and row.blocked_until > now
+                        else "enabled"
+                    ),
                     "blocked_until": row.blocked_until.isoformat() if row.blocked_until else None,
+                    "next_probe_at": row.next_probe_at.isoformat() if row.next_probe_at else None,
                     "consecutive_limit_hits": row.consecutive_limit_hits,
                     "last_error_code": row.last_error_code,
+                    "last_error_at": row.last_error_at.isoformat() if row.last_error_at else None,
+                    "last_success_at": (
+                        row.last_success_at.isoformat() if row.last_success_at else None
+                    ),
+                    "successful_requests": row.successful_requests,
+                    "cooldown_seconds": row.cooldown_seconds,
                 }
                 for row in rows
             ]
@@ -932,38 +1373,174 @@ def method_limits(
     typer.echo(json.dumps(asyncio.run(_method_limits(method)), ensure_ascii=False, indent=2))
 
 
-async def _reset_method_limits(method: str) -> int:
+async def _backlog() -> dict[str, Any]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
     try:
-        async with sessions() as session:
-            result = await session.execute(
-                update(VKTokenMethodState)
-                .where(VKTokenMethodState.method == method)
-                .values(
-                    blocked_until=None,
-                    next_probe_at=None,
-                    consecutive_limit_hits=0,
-                    last_error_code=None,
-                )
-            )
-            await session.commit()
-            return int(result.rowcount or 0)  # type: ignore[attr-defined]
+        payload = await canonical_backlog(sessions, settings)
+        disk = inspect_disk(
+            settings.collection_export_dir,
+            settings.disk_warning_percent,
+            settings.disk_stop_percent,
+        )
+        payload["disk"] = {
+            "used_percent": disk.used_percent,
+            "free_bytes": disk.free_bytes,
+            "warning": disk.warning,
+            "stop": disk.stop,
+        }
+        return payload
     finally:
         await engine.dispose()
 
 
-@collection_app.command("method-limits-reset")
-def method_limits_reset(
-    method: Annotated[str, typer.Option("--method")],
-    yes: Annotated[bool, typer.Option("--yes", help="Подтвердить точечный reset.")] = False,
+@collection_app.command("backlog")
+def collection_backlog(
+    as_json: Annotated[bool, typer.Option("--json", help="Вывести полный JSON.")] = False,
 ) -> None:
-    """Сбросить cooldown одного метода, не меняя токены и collection data."""
-    if not yes:
-        raise typer.BadParameter("Для reset укажите --yes")
-    count = asyncio.run(_reset_method_limits(method))
-    typer.echo(f"Сброшено method states: {count}")
+    """Показать read-only backlog по каноническим state-таблицам."""
+    payload = asyncio.run(_backlog())
+    if as_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    typer.echo(f"Сформировано: {payload['generated_at']}")
+    for title, key in (
+        ("Approved-группы", "approved_groups"),
+        ("Пользователи", "users"),
+        ("Подписки", "subscriptions"),
+        ("Сообщества подписок", "subscription_communities"),
+        ("Посты сообществ подписок", "subscription_posts"),
+    ):
+        typer.echo(f"{title}: {json.dumps(payload[key], ensure_ascii=False)}")
+    typer.echo(
+        "Jobs показаны отдельно как история: rows и distinct_entities не являются "
+        "каноническим backlog."
+    )
+    typer.echo(
+        f"Зависшие lease: {payload['stale_running_leases']}; "
+        f"незавершённые pilot: {payload['unfinished_pilots']}; "
+        f"активные кампании: {payload['active_campaigns']}"
+    )
+    typer.echo(f"Диск: {json.dumps(payload['disk'], ensure_ascii=False)}")
+
+
+async def _repair_stale_leases(*, confirm: bool) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    cutoff = datetime.now(UTC) - timedelta(seconds=settings.collection_job_lease_seconds)
+    try:
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(CollectionJob.collection_run_id, func.count(CollectionJob.id))
+                    .where(
+                        CollectionJob.status == JobStatus.RUNNING,
+                        CollectionJob.locked_at < cutoff,
+                    )
+                    .group_by(CollectionJob.collection_run_id)
+                    .order_by(CollectionJob.collection_run_id)
+                )
+            ).all()
+        preview = {str(run_id): int(count) for run_id, count in rows}
+        recovered = 0
+        if confirm:
+            queue = CollectionQueue(sessions, settings)
+            for run_id, _count in rows:
+                recovered += await queue.recover_expired(run_id)
+        return {
+            "mode": "confirm" if confirm else "preview",
+            "reason": "lease_expired_recovered",
+            "runs": preview,
+            "stale_jobs": sum(preview.values()),
+            "recovered_jobs": recovered,
+            "history_deleted": False,
+        }
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("repair-stale-leases")
+def repair_stale_leases(
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Вернуть только истёкшие running lease в pending."),
+    ] = False,
+) -> None:
+    """Сначала показать preview; изменять state только с явным --confirm."""
+    typer.echo(
+        json.dumps(
+            asyncio.run(_repair_stale_leases(confirm=confirm)),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@collection_app.command("light-repair")
+def light_repair(
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Явно создать безопасный light-repair run."),
+    ] = False,
+) -> None:
+    """Показать canonical gaps; с --apply создать только metadata/profile jobs."""
+
+    async def operation() -> dict[str, object]:
+        settings = get_settings()
+        engine = create_database_engine(settings.sqlalchemy_url)
+        sessions = create_session_factory(engine)
+        try:
+            queue = CollectionQueue(sessions, settings)
+            preview = await queue.light_repair_preview()
+            if not apply:
+                return {"apply": False, **preview}
+            disk = inspect_disk(
+                settings.collection_export_dir,
+                settings.disk_warning_percent,
+                settings.disk_stop_percent,
+            )
+            growth = preview.get("projected_cohort_growth_bytes")
+            if not isinstance(growth, int):
+                raise ValueError("Light-repair preview не содержит projected growth")
+            reserve_factor = 1.30
+            reserved_growth = int(growth * reserve_factor)
+            projected_used = (
+                100.0 * (disk.total_bytes - disk.free_bytes + reserved_growth) / disk.total_bytes
+            )
+            decision = (
+                "passed"
+                if not disk.warning
+                and not disk.stop
+                and reserved_growth <= disk.free_bytes
+                and projected_used < settings.disk_warning_percent
+                else "rejected"
+            )
+            evidence: dict[str, object] = {
+                "decision": decision,
+                "preview_hash": preview["preview_hash"],
+                "checked_at": datetime.now(UTC).isoformat(),
+                "disk_total_bytes": disk.total_bytes,
+                "disk_free_bytes": disk.free_bytes,
+                "disk_used_percent": disk.used_percent,
+                "projected_growth_bytes": growth,
+                "reserved_growth_bytes": reserved_growth,
+                "projected_used_percent": projected_used,
+                "reserve_factor": reserve_factor,
+            }
+            run_id = await queue.plan_light_repair(capacity_evidence=evidence)
+            return {
+                "apply": True,
+                "run_id": str(run_id),
+                "allowed_methods": ["groups.getById", "users.get"],
+                "capacity_evidence": evidence,
+                **preview,
+            }
+        finally:
+            await engine.dispose()
+
+    typer.echo(json.dumps(asyncio.run(operation()), ensure_ascii=False, indent=2))
 
 
 async def _change_run_status(run_id: uuid.UUID, status: CollectionRunStatus) -> None:
@@ -1072,27 +1649,8 @@ def _validated_backup_metadata(
     expected: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Проверить формат и fingerprint PostgreSQL custom-format backup."""
-    digest = hashlib.sha256()
-    try:
-        stat = backup.stat()
-        with backup.open("rb") as stream:
-            header = stream.read(5)
-            digest.update(header)
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as exc:
-        raise ValueError(f"Backup не читается: {exc}") from exc
-    if not backup.is_file() or stat.st_size <= 5 or header != b"PGDMP":
-        raise ValueError("Нужен непустой PostgreSQL backup формата pg_dump -Fc")
-    metadata: dict[str, object] = {
-        "path": str(backup.resolve()),
-        "size_bytes": stat.st_size,
-        "modified_ns": stat.st_mtime_ns,
-        "sha256": digest.hexdigest(),
-    }
-    if expected is not None and metadata != expected:
-        raise ValueError("Проверенный backup отсутствует или изменился после capacity-apply")
-    return metadata
+    verifier = BackupVerifier()
+    return verifier.fingerprint(backup) if expected is None else verifier.verify(backup, expected)
 
 
 async def _run_subscription_pilot(
@@ -1100,6 +1658,7 @@ async def _run_subscription_pilot(
     *,
     source_run_id: uuid.UUID | None = None,
     max_jobs: int | None = None,
+    run_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """Выполнить измеряемый Pilot A/B; незавершённый pilot оставляет gate закрытым."""
     settings = get_settings()
@@ -1107,12 +1666,53 @@ async def _run_subscription_pilot(
     sessions = create_session_factory(engine)
     try:
         queue = CollectionQueue(sessions, settings)
-        before = await database_metrics(sessions)
-        run_id = (
-            await queue.plan_subscriptions(pilot=True)
-            if phase == "A"
-            else await queue.plan_subscription_posts(pilot=True, source_run_id=source_run_id)
-        )
+        invocation_before = await database_metrics(sessions)
+        if run_id is None:
+            run_id = (
+                await queue.plan_subscriptions(pilot=True)
+                if phase == "A"
+                else await queue.plan_subscription_posts(pilot=True, source_run_id=source_run_id)
+            )
+        else:
+            rows = await pilot_previews(sessions, settings)
+            preview = next((row for row in rows if row["run_id"] == str(run_id)), None)
+            expected_scope = "subscriptions_pilot" if phase == "A" else "subscription_posts_pilot"
+            if preview is None or preview["scope"] != expected_scope:
+                raise ValueError("Указанный run ID не является pilot выбранной фазы")
+            if preview["classification"] == "waiting":
+                raise ValueError(
+                    "Pilot ожидает persisted retry до " + str(preview["nearest_retry"])
+                )
+            if preview["classification"] not in {
+                "compatible_recoverable",
+                "stale_running_lease",
+            }:
+                raise ValueError(
+                    "Pilot нельзя безопасно возобновить: " + str(preview["classification"])
+                )
+        async with sessions() as session:
+            pilot_run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if pilot_run is None:
+                raise ValueError("Pilot run исчез до выполнения")
+            stored_baseline = pilot_run.configuration.get("measurement_baseline")
+            raw_previous_duration = pilot_run.configuration.get("measurement_duration_seconds", 0)
+            previous_duration = (
+                float(raw_previous_duration)
+                if isinstance(raw_previous_duration, (int, float))
+                else 0.0
+            )
+            if isinstance(stored_baseline, dict) and all(
+                isinstance(value, int) for value in stored_baseline.values()
+            ):
+                before = {str(key): int(value) for key, value in stored_baseline.items()}
+            else:
+                before = invocation_before
+                pilot_run.configuration = {
+                    **pilot_run.configuration,
+                    "measurement_baseline": before,
+                    "measurement_started_at": datetime.now(UTC).isoformat(),
+                }
+                await session.commit()
         started_at = time.monotonic()
         _, processed = await _execute_collection(
             run_id,
@@ -1121,7 +1721,15 @@ async def _run_subscription_pilot(
             until_idle=True,
             explicit_pilot=True,
         )
-        duration_seconds = time.monotonic() - started_at
+        duration_seconds = previous_duration + time.monotonic() - started_at
+        async with sessions() as session:
+            pilot_run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if pilot_run is not None:
+                pilot_run.configuration = {
+                    **pilot_run.configuration,
+                    "measurement_duration_seconds": duration_seconds,
+                }
+                await session.commit()
         after = await database_metrics(sessions)
         summary = await run_summary(sessions, run_id)
         database_growth = max(0, after["database_bytes"] - before["database_bytes"])
@@ -1355,7 +1963,10 @@ async def _apply_capacity(
             run = await session.get(CollectionRun, run_id, with_for_update=True)
             if run is None:
                 raise ValueError("Collection run не найден")
-            if run.status != CollectionRunStatus.PAUSED_CAPACITY_LIMIT or run.total_jobs <= 0:
+            metadata_gate_pending = bool(run.configuration.get("metadata_gate_pending"))
+            if run.status != CollectionRunStatus.PAUSED_CAPACITY_LIMIT or (
+                run.total_jobs <= 0 and not metadata_gate_pending
+            ):
                 raise ValueError(
                     "Capacity gate можно применить только к непустому run на capacity-паузе"
                 )
@@ -1363,11 +1974,21 @@ async def _apply_capacity(
             if not isinstance(expected, dict):
                 raise ValueError("Collection run содержит повреждённую конфигурацию")
             backup_metadata: dict[str, object] | None = None
-            if run.scope in {"subscriptions", "subscription_posts"}:
+            if run.scope in {
+                "subscriptions",
+                "subscription_discovery",
+                "subscription_metadata",
+                "subscription_posts",
+            }:
                 if backup is None:
                     raise ValueError("Для subscription capacity gate обязателен --backup")
                 backup_metadata = _validated_backup_metadata(backup)
-                phase: Literal["A", "B"] = "A" if run.scope == "subscriptions" else "B"
+                phase: Literal["A", "B"] = (
+                    "A"
+                    if run.scope
+                    in {"subscriptions", "subscription_discovery", "subscription_metadata"}
+                    else "B"
+                )
                 payload = validate_capacity_report(
                     source,
                     phase=phase,
@@ -1404,6 +2025,69 @@ async def _apply_capacity(
                     raise ValueError("Capacity report относится к другой конфигурации сбора")
             else:
                 raise ValueError("Capacity report нельзя применить к этому scope")
+            metadata_evidence: dict[str, object] | None = None
+            if run.scope == "subscription_metadata":
+                if run.campaign_id is None:
+                    raise ValueError("Metadata run не связан с campaign")
+                manager = CampaignManager(sessions, settings)
+                metadata_counts = await manager.metadata_preview(run.campaign_id)
+                metadata_due = int(metadata_counts["metadata_due"])
+                if metadata_due <= 0:
+                    raise ValueError("Metadata backlog пуст; gate не требуется")
+                average_row_bytes = int(
+                    await session.scalar(
+                        text(
+                            "SELECT coalesce(avg(pg_column_size(v)), 0)::bigint "
+                            "FROM vk_communities AS v"
+                        )
+                    )
+                    or 0
+                )
+                reserve_factor = 1.30
+                per_job_bytes = max(1024, average_row_bytes + 512)
+                projected_metadata_growth = math.ceil(metadata_due * per_job_bytes * reserve_factor)
+                current_database = int(
+                    await session.scalar(select(func.pg_database_size(func.current_database())))
+                    or 0
+                )
+                projected_metadata_database = current_database + projected_metadata_growth
+                disk = inspect_disk(
+                    settings.collection_export_dir,
+                    settings.disk_warning_percent,
+                    settings.disk_stop_percent,
+                )
+                projected_used = (
+                    100.0
+                    * (disk.total_bytes - disk.free_bytes + projected_metadata_growth)
+                    / disk.total_bytes
+                )
+                if (
+                    disk.warning
+                    or disk.stop
+                    or projected_metadata_growth > disk.free_bytes
+                    or projected_used >= settings.disk_warning_percent
+                    or projected_metadata_database > int(safe_limit)
+                ):
+                    raise ValueError(
+                        "Metadata aggregate capacity отклонён: "
+                        f"projected_database={projected_metadata_database}, "
+                        f"safe_limit={safe_limit}, disk_free={disk.free_bytes}"
+                    )
+                metadata_evidence = {
+                    "kind": "metadata_aggregate_capacity",
+                    "checked_at": datetime.now(UTC).isoformat(),
+                    "metadata_distinct_communities": int(metadata_counts["unique_communities"]),
+                    "metadata_due": metadata_due,
+                    "measured_average_community_row_bytes": average_row_bytes,
+                    "conservative_per_job_bytes": per_job_bytes,
+                    "aggregate_projected_growth_bytes": projected_metadata_growth,
+                    "current_database_bytes": current_database,
+                    "projected_final_database_bytes": projected_metadata_database,
+                    "safe_database_limit_bytes": int(safe_limit),
+                    "reserve_factor": reserve_factor,
+                    "current_disk_free_bytes": disk.free_bytes,
+                    "projected_final_disk_used_percent": projected_used,
+                }
             run.configuration = {
                 **run.configuration,
                 "capacity_gate": "passed",
@@ -1411,11 +2095,63 @@ async def _apply_capacity(
                 "safe_limit_bytes": safe_limit,
                 "capacity_report": str(source.resolve()),
                 **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
+                **(
+                    {"metadata_capacity_evidence": metadata_evidence}
+                    if metadata_evidence is not None
+                    else {}
+                ),
             }
-            run.status = CollectionRunStatus.PLANNED
+            operator_paused = False
+            if run.campaign_id is not None:
+                current_campaign = await session.get(CollectionCampaign, run.campaign_id)
+                operator_paused = (
+                    current_campaign is not None
+                    and current_campaign.status == CampaignStatus.PAUSED.value
+                )
+            run.status = (
+                CollectionRunStatus.PAUSED if operator_paused else CollectionRunStatus.PLANNED
+            )
             run.error_message = None
+            if run.campaign_id is not None:
+                campaign = await session.get(
+                    CollectionCampaign, run.campaign_id, with_for_update=True
+                )
+                if campaign is None:
+                    raise ValueError("Campaign, связанная с run, не найдена")
+                campaign.configuration = {
+                    **campaign.configuration,
+                    "capacity_gate": "passed",
+                    "projected_database_bytes": projected,
+                    "safe_limit_bytes": safe_limit,
+                    "capacity_report": str(source.resolve()),
+                    **({"verified_backup": backup_metadata} if backup_metadata is not None else {}),
+                    **(
+                        {"metadata_capacity_evidence": metadata_evidence}
+                        if metadata_evidence is not None
+                        else {}
+                    ),
+                    **(
+                        {"metadata_capacity_gate": "passed"}
+                        if metadata_evidence is not None
+                        else {}
+                    ),
+                }
+                campaign.status = (
+                    CampaignStatus.PAUSED.value if operator_paused else CampaignStatus.RUNNING.value
+                )
+                campaign.started_at = campaign.started_at or datetime.now(UTC)
+                campaign.error_message = None
+                if metadata_evidence is not None and metadata_gate_pending:
+                    manager = CampaignManager(sessions, settings)
+                    planned = await manager.activate_metadata_cohort(session, campaign, run)
+                    if planned is None:
+                        raise ValueError("Metadata gate passed, но bounded cohort не создан")
             await session.commit()
-            return {"run_id": str(run_id), "status": "planned", "capacity_gate": "passed"}
+            return {
+                "run_id": str(run_id),
+                "status": run.status.value,
+                "capacity_gate": "passed",
+            }
     finally:
         await engine.dispose()
 

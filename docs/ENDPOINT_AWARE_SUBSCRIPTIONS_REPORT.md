@@ -89,3 +89,10 @@ docker compose run --rm collector collection subscriptions run --run-id POSTS_RU
 Сгенерированных измеренных разрешающих reports нет, поэтому оба production gate закрыты.
 Теоретический Gate B превышает лимит диска и ничего не разрешает. Reset
 method limits точечный и требует `--yes`; массового reset токенов/data нет.
+# Дополнение 2026-08-15
+
+Коды VK 9 и 29 теперь сохраняются без потери исходного кода, а method state содержит
+successful requests, суммарный cooldown, последний success/error и next probe.
+Автономный scheduler больше не выбирает только последний run: он round-robin
+обслуживает все разрешённые non-pilot run, пропуская заблокированный метод.
+Ручная CLI-команда сброса cooldown удалена.
