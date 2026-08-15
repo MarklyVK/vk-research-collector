@@ -176,6 +176,18 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
     assert "set -x" not in text
 
 
+def test_transition_snapshot_sends_psql_variables_through_stdin() -> None:
+    text = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    start = text.index("transition_data_snapshot()")
+    end = text.index("\n}\n", start)
+    function = text[start:end]
+
+    assert "<<'SQL'" in function
+    assert "-c" not in function
+    assert '-v target_run_id="$run_id"' in function
+    assert function.count(":'target_run_id'::uuid") == 3
+
+
 def test_runtime_secrets_archives_and_runner_are_not_tracked() -> None:
     tracked = subprocess.check_output(
         ["git", "ls-files"], cwd=ROOT, text=True, encoding="utf-8"

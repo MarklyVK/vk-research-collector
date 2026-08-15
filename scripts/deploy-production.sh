@@ -126,8 +126,8 @@ psql_query() {
 
 transition_data_snapshot() {
   local run_id=$1
-  psql_query -AtF '|' -v target_run_id="$run_id" -c \
-    "SELECT
+  psql_query -AtF '|' -v target_run_id="$run_id" <<'SQL'
+    SELECT
        (SELECT count(*) FROM collection_campaigns),
        (SELECT count(*) FROM collection_jobs),
        (SELECT count(*) FROM collection_jobs
@@ -141,7 +141,8 @@ transition_data_snapshot() {
        (SELECT count(*) FROM collection_jobs
          WHERE collection_run_id = :'target_run_id'::uuid
            AND status::text = 'running'
-           AND (locked_at IS NOT NULL OR locked_by IS NOT NULL))"
+           AND (locked_at IS NOT NULL OR locked_by IS NOT NULL));
+SQL
 }
 
 load_protected_backups() {
