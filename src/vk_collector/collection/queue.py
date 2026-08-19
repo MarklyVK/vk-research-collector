@@ -30,6 +30,7 @@ from vk_collector.database.models import (
     UserGroupSubscription,
     UserSubscriptionState,
     VKCommunity,
+    VKTokenState,
     VKUser,
 )
 from vk_collector.subjects import SUBJECT_NAMES
@@ -131,6 +132,7 @@ class CollectionQueue:
             "user_posts_window_days": self._settings.collection_user_posts_window_days,
             "user_posts_ttl_days": self._settings.collection_user_posts_ttl_days,
             "user_posts_stop_at_date": self._settings.collection_user_posts_stop_at_date,
+            "user_posts_pilot_users": self._settings.collection_user_posts_pilot_users,
             "subscriptions_max_per_user": (self._settings.collection_subscriptions_max_per_user),
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
             "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,
@@ -664,6 +666,7 @@ class CollectionQueue:
             "subscriptions": "collect_user_subscriptions",
             "metadata": "refresh_community_metadata",
             "subscription_posts": "collect_subscription_group_posts",
+            "user_posts": "collect_user_posts",
         }.get(scope or "")
         async with self._sessions() as session:
             query = (
@@ -1200,10 +1203,69 @@ class CollectionQueue:
                         campaign_id = run.campaign_id
             await session.commit()
         if run_became_terminal and campaign_id is not None:
+            await self._reconcile_campaign(campaign_id)
+        return run_became_terminal
+
+    async def _reconcile_campaign(self, campaign_id: uuid.UUID) -> None:
+        async with self._sessions() as session:
+            campaign_type = await session.scalar(
+                select(CollectionCampaign.campaign_type).where(CollectionCampaign.id == campaign_id)
+            )
+        if campaign_type == "user_posts_enrichment":
+            from vk_collector.collection.user_posts_campaigns import UserPostCampaignManager
+
+            await UserPostCampaignManager(self._sessions, self._settings).reconcile(campaign_id)
+        else:
             from vk_collector.collection.campaigns import CampaignManager
 
             await CampaignManager(self._sessions, self._settings).reconcile(campaign_id)
-        return run_became_terminal
+
+    async def resume_paused_no_tokens(self, fingerprints: set[str]) -> int:
+        """Resume auth-paused work only when a configured fingerprint is usable."""
+        if not fingerprints:
+            return 0
+        async with self._sessions() as session:
+            usable = bool(
+                await session.scalar(
+                    select(VKTokenState.token_fingerprint)
+                    .where(
+                        VKTokenState.token_fingerprint.in_(fingerprints),
+                        VKTokenState.disabled.is_(False),
+                    )
+                    .limit(1)
+                )
+            )
+            if not usable:
+                return 0
+            run_ids = select(CollectionRun.id).where(
+                CollectionRun.status == CollectionRunStatus.PAUSED_NO_TOKENS
+            )
+            changed = await session.execute(
+                update(CollectionJob)
+                .where(
+                    CollectionJob.collection_run_id.in_(run_ids),
+                    CollectionJob.status == JobStatus.PAUSED,
+                    CollectionJob.last_error_type == "tokens_unavailable",
+                )
+                .values(
+                    status=JobStatus.PENDING,
+                    next_attempt_at=None,
+                    locked_at=None,
+                    locked_by=None,
+                    heartbeat_at=None,
+                )
+            )
+            await session.execute(
+                update(CollectionRun)
+                .where(CollectionRun.status == CollectionRunStatus.PAUSED_NO_TOKENS)
+                .values(
+                    status=CollectionRunStatus.RUNNING,
+                    next_wakeup_at=None,
+                    error_message=None,
+                )
+            )
+            await session.commit()
+            return int(changed.rowcount or 0)  # type: ignore[attr-defined]
 
     async def defer_method(self, job: ClaimedJob, *, retry_at: datetime, message: str) -> None:
         """Отложить job из-за method limit, не расходуя обычную попытку."""

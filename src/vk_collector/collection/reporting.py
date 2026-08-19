@@ -23,6 +23,7 @@ from vk_collector.database.models import (
     UserGroupSubscription,
     UserPost,
     UserPostAttachment,
+    UserPostCollectionState,
     UserSubscriptionState,
     VKCommunity,
     VKTokenMethodState,
@@ -58,6 +59,7 @@ async def latest_runnable_run_id(
                         "subscription_discovery",
                         "subscription_metadata",
                         "light_repair",
+                        "user_posts",
                     ]
                 ),
                 CollectionRun.status.in_(
@@ -94,6 +96,7 @@ async def runnable_run_ids(
                                 "subscription_discovery",
                                 "subscription_metadata",
                                 "light_repair",
+                                "user_posts",
                             ]
                         ),
                         CollectionRun.status.in_(
@@ -126,6 +129,7 @@ async def next_runnable_wakeup(
                     "subscription_discovery",
                     "subscription_metadata",
                     "light_repair",
+                    "user_posts",
                 ]
             ),
             CollectionRun.status.in_(
@@ -253,6 +257,33 @@ async def run_summary(
                     select(func.count(UserSubscriptionState.user_id)).where(
                         UserSubscriptionState.last_run_id == target,
                         UserSubscriptionState.privacy_denied.is_(True),
+                    )
+                )
+                or 0
+            ),
+            "processed_user_walls": int(
+                await session.scalar(
+                    select(func.count(UserPostCollectionState.user_id)).where(
+                        UserPostCollectionState.last_run_id == target,
+                        UserPostCollectionState.last_success_at.is_not(None),
+                    )
+                )
+                or 0
+            ),
+            "private_user_walls": int(
+                await session.scalar(
+                    select(func.count(UserPostCollectionState.user_id)).where(
+                        UserPostCollectionState.last_run_id == target,
+                        UserPostCollectionState.wall_private.is_(True),
+                    )
+                )
+                or 0
+            ),
+            "unavailable_user_walls": int(
+                await session.scalar(
+                    select(func.count(UserPostCollectionState.user_id)).where(
+                        UserPostCollectionState.last_run_id == target,
+                        UserPostCollectionState.unavailable.is_(True),
                     )
                 )
                 or 0

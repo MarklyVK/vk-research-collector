@@ -152,7 +152,7 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "legacy run quarantined as expected",
         "transition_data_snapshot",
         "locked_at IS NOT NULL OR locked_by IS NOT NULL",
-        "20260819_0012",
+        "20260820_0013",
     )
     assert all(item in text + transition_text for item in required)
     assert "alembic downgrade" not in text
@@ -237,7 +237,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20260819_0012",
+        "20260820_0013",
     )
     assert all(item in script for item in required)
     forbidden = (
@@ -270,10 +270,15 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
     assert "github.event_name == 'schedule' && 'report'" in workflow_text
     assert 'test "$GITHUB_EVENT_NAME" = workflow_dispatch' in workflow_text
     assert "schedule' && 'start-subscriptions'" not in workflow_text
+    assert "START_USER_POSTS" in workflow_text
+    assert "QUARANTINE_INCOMPATIBLE_PILOTS" in workflow_text
+    assert "collection user-posts pilot" in script
+    assert "collection user-posts capacity-apply" in script
+    assert "COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED true" not in script
 
     required = (
         "flock -n",
-        "20260819_0012",
+        "20260820_0013",
         "collection subscriptions pilot",
         "subscription-gate-a.json",
         "production_allowed",

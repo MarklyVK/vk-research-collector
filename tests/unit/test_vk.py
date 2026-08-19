@@ -127,6 +127,34 @@ async def test_all_tokens_limited_for_exact_method_raise_unavailable(error_code:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocked_method", "available_methods"),
+    [
+        ("groups.get", ("wall.get",)),
+        ("wall.get", ("groups.get",)),
+        ("users.get", ("groups.get", "wall.get")),
+    ],
+)
+async def test_method_cooldown_does_not_block_other_endpoints(
+    blocked_method: str, available_methods: tuple[str, ...]
+) -> None:
+    time = FakeTime()
+    pool = TokenPool(
+        ["only-token"],
+        rps=1000,
+        clock=time.clock,
+        sleep=time.sleep,
+        flood_initial_cooldown=10,
+    )
+    lease = await pool.acquire(blocked_method)
+    await pool.method_cooldown(lease, 9)
+    with pytest.raises(VKMethodUnavailable):
+        await pool.acquire(blocked_method)
+    for method in available_methods:
+        assert (await pool.acquire(method)).fingerprint == lease.fingerprint
+
+
+@pytest.mark.asyncio
 async def test_method_cooldown_grows_and_is_capped() -> None:
     time = FakeTime()
     pool = TokenPool(

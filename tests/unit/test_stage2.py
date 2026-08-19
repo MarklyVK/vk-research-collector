@@ -20,7 +20,10 @@ from vk_collector.collection.capacity import (
     write_capacity_report,
 )
 from vk_collector.collection.notifications import notify
-from vk_collector.collection.pilots import choose_pilot_control_action
+from vk_collector.collection.pilots import (
+    choose_pilot_control_action,
+    quarantine_incompatible_pilots,
+)
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import bounded_wakeup_delay
 from vk_collector.collection.safety import DiskState, inspect_disk, sanitize_message
@@ -35,6 +38,14 @@ def test_blank_optional_limits_are_supported() -> None:
     )
     assert settings.collection_members_max_per_group is None
     assert settings.collection_subscriptions_max_per_user == 50
+
+
+@pytest.mark.asyncio
+async def test_legacy_quarantine_requires_exact_confirmation() -> None:
+    with pytest.raises(ValueError, match="QUARANTINE_INCOMPATIBLE_PILOTS"):
+        await quarantine_incompatible_pilots(  # type: ignore[arg-type]
+            None, Settings(), confirmation="yes"
+        )
 
 
 def test_subscription_limit_accepts_50_but_rejects_more() -> None:

@@ -6,15 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: report только читает; start-subscriptions запускает Pilot A и production run
+        description: report читает; mutations доступны только отдельными manual actions
         required: true
         type: choice
         default: report
         options:
           - report
           - start-subscriptions
+          - start-user-posts
+          - quarantine-incompatible-pilots
       confirmation:
-        description: Для запуска введите START_SUBSCRIPTIONS
+        description: START_SUBSCRIPTIONS, START_USER_POSTS или QUARANTINE_INCOMPATIBLE_PILOTS
         required: false
         type: string
 
@@ -51,6 +53,14 @@ jobs:
             start-subscriptions)
               test "$GITHUB_EVENT_NAME" = workflow_dispatch
               test "$CONTROL_CONFIRMATION" = START_SUBSCRIPTIONS
+              ;;
+            start-user-posts)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              test "$CONTROL_CONFIRMATION" = START_USER_POSTS
+              ;;
+            quarantine-incompatible-pilots)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              test "$CONTROL_CONFIRMATION" = QUARANTINE_INCOMPATIBLE_PILOTS
               ;;
             report) ;;
             *) exit 2 ;;

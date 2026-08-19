@@ -7,9 +7,9 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import Table, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -45,7 +45,7 @@ from vk_collector.vk import (
     VKTokensUnavailable,
 )
 
-TERMINAL_VK_CODES = frozenset({7, 15, 18, 30})
+TERMINAL_VK_CODES = frozenset({7, 15, 18, 30, 260})
 JOB_METHODS = {
     "refresh_group": "groups.getById",
     "collect_group_posts": "wall.get",
@@ -229,6 +229,7 @@ class CollectionWorker:
                     "subscriptions": "collect_user_subscriptions",
                     "metadata": "refresh_community_metadata",
                     "subscription_posts": "collect_subscription_group_posts",
+                    "user_posts": "collect_user_posts",
                 }.get(scope, "")
             )
             if method is not None and not await self._method_available(method):
@@ -905,24 +906,8 @@ class CollectionWorker:
                     )
                 )
                 if (
-                    self._settings.collection_user_posts_enabled
-                    and not value.get("is_closed")
-                    and not value.get("deactivated")
-                ):
-                    await session.execute(
-                        insert(CollectionJob)
-                        .values(
-                            collection_run_id=job.run_id,
-                            job_type="collect_user_posts",
-                            entity_type="user",
-                            entity_id=user_id,
-                            priority=45,
-                        )
-                        .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
-                    )
-                if (
                     self._settings.collection_subscriptions_enabled
-                    and not value.get("is_closed")
+                    and (not value.get("is_closed") or value.get("can_access_closed"))
                     and not value.get("deactivated")
                 ):
                     await session.execute(
@@ -1493,7 +1478,12 @@ class CollectionWorker:
             try:
                 custom_cutoff = datetime.fromisoformat(
                     self._settings.collection_user_posts_stop_at_date
-                ).replace(tzinfo=UTC)
+                )
+                custom_cutoff = (
+                    custom_cutoff.replace(tzinfo=UTC)
+                    if custom_cutoff.tzinfo is None
+                    else custom_cutoff.astimezone(UTC)
+                )
                 cutoff = max(cutoff, custom_cutoff)
             except ValueError:
                 pass
@@ -1553,12 +1543,21 @@ class CollectionWorker:
                         .on_conflict_do_update(
                             constraint="uq_user_posts_owner_post",
                             set_={
+                                "user_id": user.vk_id,
+                                "published_at": published,
                                 "text": text,
                                 "edited_at": _utc_from_timestamp(raw.get("edited")),
+                                "post_type": str(raw.get("post_type", "post")),
+                                "is_pinned": bool(raw.get("is_pinned", False)),
                                 "comments_count": _counter(raw.get("comments")),
                                 "likes_count": _counter(raw.get("likes")),
                                 "reposts_count": _counter(raw.get("reposts")),
                                 "views_count": _counter(raw.get("views")),
+                                "signer_vk_user_id": raw.get("signer_id")
+                                if isinstance(raw.get("signer_id"), int)
+                                else None,
+                                "source_updated_at": _utc_from_timestamp(raw.get("edited"))
+                                or published,
                                 "last_seen_at": now,
                                 "content_hash": content_hash,
                             },
@@ -1568,9 +1567,6 @@ class CollectionWorker:
                     if post_id is None:
                         continue
 
-                    await session.execute(
-                        delete(UserPostAttachment).where(UserPostAttachment.post_id == post_id)
-                    )
                     raw_attachments = raw.get("attachments", [])
                     attachments = (
                         [item for item in raw_attachments if isinstance(item, dict)]
@@ -1580,7 +1576,31 @@ class CollectionWorker:
                     for position, attachment in enumerate(attachments):
                         normalized = normalize_attachment(attachment, position)
                         normalized["post_id"] = post_id
-                        session.add(UserPostAttachment(**normalized))
+                        attachment_values = {
+                            ("metadata" if key == "attachment_metadata" else key): value
+                            for key, value in normalized.items()
+                        }
+                        attachment_table = cast(Table, UserPostAttachment.__table__)
+                        await session.execute(
+                            insert(attachment_table)
+                            .values(**attachment_values)
+                            .on_conflict_do_update(
+                                constraint="uq_user_post_attachments_post_position",
+                                set_={
+                                    attachment_table.c[key]: value
+                                    for key, value in attachment_values.items()
+                                    if key not in {"post_id", "position"}
+                                },
+                            )
+                        )
+                    stale_attachments = delete(UserPostAttachment).where(
+                        UserPostAttachment.post_id == post_id
+                    )
+                    if attachments:
+                        stale_attachments = stale_attachments.where(
+                            UserPostAttachment.position.not_in(range(len(attachments)))
+                        )
+                    await session.execute(stale_attachments)
                     changed += 1
                     total_collected += 1
                     if total_collected >= maximum:
@@ -1661,7 +1681,7 @@ class CollectionWorker:
                     last_run_id=job.run_id,
                     last_error_code=error_code,
                     last_error_reason=reason[:255],
-                    wall_private=terminal and error_code in {7, 15, 30},
+                    wall_private=terminal and error_code in {7, 15, 30, 260},
                     unavailable=terminal and error_code in {18},
                 )
                 .on_conflict_do_update(
@@ -1675,7 +1695,7 @@ class CollectionWorker:
                         "last_run_id": job.run_id,
                         "last_error_code": error_code,
                         "last_error_reason": reason[:255],
-                        "wall_private": terminal and error_code in {7, 15, 30},
+                        "wall_private": terminal and error_code in {7, 15, 30, 260},
                         "unavailable": terminal and error_code in {18},
                     },
                 )

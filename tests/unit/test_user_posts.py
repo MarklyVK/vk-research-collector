@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from vk_collector.collection.queue import CollectionQueue
+from vk_collector.collection.safety import DiskState
+from vk_collector.collection.user_posts_campaigns import build_user_posts_capacity_projection
 from vk_collector.collection.worker import JOB_METHODS
 from vk_collector.config import Settings
 from vk_collector.ml.contracts import (
@@ -29,6 +31,69 @@ def test_user_posts_settings_defaults() -> None:
     assert settings.collection_user_posts_page_size == 20
     assert settings.collection_user_posts_window_days == 180
     assert settings.collection_user_posts_ttl_days == 30
+    assert settings.collection_user_posts_pilot_users == 500
+
+
+def test_user_posts_hard_limits_cannot_be_expanded() -> None:
+    with pytest.raises(ValueError):
+        Settings(collection_user_posts_max_per_user=21)
+    with pytest.raises(ValueError):
+        Settings(collection_user_posts_window_days=181)
+    with pytest.raises(ValueError):
+        Settings(collection_user_posts_pilot_users=501)
+
+
+def test_user_posts_capacity_projection_is_aggregate_and_reserved() -> None:
+    result = build_user_posts_capacity_projection(
+        preview={
+            "snapshot_users": 1_000,
+            "fresh_users": 100,
+            "terminal_users": 10,
+            "due_users": 900,
+            "planning_configuration_hash": "a" * 64,
+        },
+        pilot={
+            "measured_users": 100,
+            "database_growth_bytes": 2_000_000,
+            "user_posts": 1_000,
+            "attachments": 200,
+        },
+        database_bytes=1024**3,
+        disk=DiskState(
+            used_percent=10.0,
+            warning=False,
+            stop=False,
+            total_bytes=20 * 1024**3,
+            free_bytes=18 * 1024**3,
+        ),
+        warning_percent=85,
+    )
+    assert result["decision"] == "passed"
+    assert result["reserve_factor"] == 1.30
+    assert result["aggregate_projected_growth_bytes"] > 900 * 20_000
+
+
+def test_user_posts_capacity_projection_rejects_full_snapshot() -> None:
+    result = build_user_posts_capacity_projection(
+        preview={"snapshot_users": 100_000, "due_users": 100_000},
+        pilot={
+            "measured_users": 100,
+            "database_growth_bytes": 50_000_000,
+            "user_posts": 2_000,
+            "attachments": 1_000,
+        },
+        database_bytes=7 * 1024**3 - 1,
+        disk=DiskState(
+            used_percent=70.0,
+            warning=False,
+            stop=False,
+            total_bytes=20 * 1024**3,
+            free_bytes=4 * 1024**3,
+        ),
+        warning_percent=85,
+    )
+    assert result["decision"] == "rejected"
+    assert result["additional_disk_required_bytes"] > 0
 
 
 @pytest.mark.asyncio

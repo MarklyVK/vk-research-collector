@@ -42,6 +42,7 @@ from vk_collector.collection.pilots import (
     cancel_pilot,
     choose_pilot_control_action,
     pilot_previews,
+    quarantine_incompatible_pilots,
 )
 from vk_collector.collection.reporting import (
     bounded_wakeup_delay,
@@ -55,6 +56,16 @@ from vk_collector.collection.reporting import (
     verify_run,
 )
 from vk_collector.collection.safety import inspect_disk
+from vk_collector.collection.user_posts_campaigns import (
+    PILOT_SCOPE as USER_POSTS_PILOT_SCOPE,
+)
+from vk_collector.collection.user_posts_campaigns import (
+    RUN_SCOPE as USER_POSTS_RUN_SCOPE,
+)
+from vk_collector.collection.user_posts_campaigns import (
+    UserPostCampaignManager,
+    build_user_posts_capacity_projection,
+)
 from vk_collector.config import Settings, get_settings, load_keyword_config
 from vk_collector.database.models import (
     CampaignStatus,
@@ -76,7 +87,13 @@ from vk_collector.privacy import delete_user, inspect_group, inspect_user
 from vk_collector.search.postgres import PostgresSearchPersistence, search_run_summary
 from vk_collector.search.service import Keyword, SearchService
 from vk_collector.subjects import SubjectName, ensure_subject
-from vk_collector.vk import TokenPool, VKClient, VKTokensUnavailable, load_tokens
+from vk_collector.vk import (
+    TokenPool,
+    VKClient,
+    VKTokensUnavailable,
+    load_tokens,
+    token_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 app = typer.Typer(help="Поиск и ручная классификация сообществ VK.")
@@ -85,12 +102,14 @@ classification_app = typer.Typer(help="Пакеты ручной классиф�
 collection_app = typer.Typer(help="Возобновляемый сбор публичных approved-данных.")
 subscriptions_app = typer.Typer(help="Обогащение существующих пользователей подписками.")
 campaign_app = typer.Typer(help="Многофазная кампания подписок с фиксированным snapshot.")
+user_posts_app = typer.Typer(help="Безопасная кампания личных стен существующих пользователей.")
 privacy_app = typer.Typer(help="Проверка и минимизация персональных данных.")
 app.add_typer(groups_app, name="groups")
 app.add_typer(classification_app, name="classification")
 app.add_typer(collection_app, name="collection")
 collection_app.add_typer(subscriptions_app, name="subscriptions")
 collection_app.add_typer(campaign_app, name="campaign")
+collection_app.add_typer(user_posts_app, name="user-posts")
 app.add_typer(privacy_app, name="privacy")
 
 
@@ -555,7 +574,11 @@ async def _execute_collection(
                 sessions, target
             ):
                 raise ValueError("Full/incremental run запрещён до успешного capacity gate")
-            if run.scope in {"subscriptions_pilot", "subscription_posts_pilot"}:
+            if run.scope in {
+                "subscriptions_pilot",
+                "subscription_posts_pilot",
+                USER_POSTS_PILOT_SCOPE,
+            }:
                 if not explicit_pilot:
                     raise ValueError(
                         "Pilot запускается только явной командой subscriptions pilot/posts-pilot"
@@ -603,6 +626,23 @@ async def _execute_collection(
                 backup = run.configuration.get("verified_backup")
                 if not isinstance(backup, dict) or not isinstance(backup.get("path"), str):
                     raise ValueError("Subscription posts run запрещён без проверенного backup")
+                _validated_backup_metadata(Path(backup["path"]), expected=backup)
+            elif run.scope == USER_POSTS_RUN_SCOPE:
+                if not settings.collection_user_posts_enabled:
+                    raise ValueError("Сбор личных стен выключен COLLECTION_USER_POSTS_ENABLED")
+                evidence = run.configuration.get("capacity_evidence")
+                backup = run.configuration.get("verified_backup")
+                if (
+                    run.configuration.get("capacity_gate") != "passed"
+                    or not isinstance(evidence, dict)
+                    or not isinstance(backup, dict)
+                    or not isinstance(backup.get("path"), str)
+                ):
+                    raise ValueError("User-post run запрещён без aggregate gate и backup")
+                if int(evidence.get("projected_final_database_bytes", 0)) > int(
+                    evidence.get("safe_database_limit_bytes", 0)
+                ):
+                    raise ValueError("User-post aggregate gate rejected")
                 _validated_backup_metadata(Path(backup["path"]), expected=backup)
             expected_configuration = run.configuration.get("collection")
             if expected_configuration != queue.collection_configuration():
@@ -658,6 +698,7 @@ def run_collection(
         "subscriptions",
         "metadata",
         "subscription_posts",
+        "user_posts",
     }:
         typer.echo("Неизвестный scope.", err=True)
         raise typer.Exit(code=2)
@@ -679,6 +720,7 @@ async def _collection_worker_service() -> None:
     stop_event = asyncio.Event()
     client: VKClient | None = None
     worker: CollectionWorker | None = None
+    active_token_fingerprints: set[str] = set()
     run_cursor = 0
     backup_verifier = BackupVerifier()
     loop = asyncio.get_running_loop()
@@ -707,10 +749,47 @@ async def _collection_worker_service() -> None:
             await recovery_queue.recover_expired(recovery_run_id)
             if recovery_campaign_id is not None:
                 recovery_campaigns.add(recovery_campaign_id)
-        recovery_manager = CampaignManager(sessions, settings)
         for recovery_campaign_id in recovery_campaigns:
-            await recovery_manager.reconcile(recovery_campaign_id)
+            async with sessions() as session:
+                recovery_type = await session.scalar(
+                    select(CollectionCampaign.campaign_type).where(
+                        CollectionCampaign.id == recovery_campaign_id
+                    )
+                )
+            if recovery_type == "user_posts_enrichment":
+                await UserPostCampaignManager(sessions, settings).reconcile(recovery_campaign_id)
+            else:
+                await CampaignManager(sessions, settings).reconcile(recovery_campaign_id)
         while not stop_event.is_set():
+            try:
+                current_tokens = load_tokens(settings.vk_tokens_file)
+            except VKTokensUnavailable:
+                current_tokens = ()
+            if not current_tokens and client is not None:
+                await client.aclose()
+                client = None
+                worker = None
+                active_token_fingerprints = set()
+            if current_tokens:
+                current_fingerprints = {token_fingerprint(token) for token in current_tokens}
+                if client is None or current_fingerprints != active_token_fingerprints:
+                    if client is not None:
+                        await client.aclose()
+                    pool = _token_pool(settings, current_tokens, sessions)
+                    await pool.is_method_available("users.get")
+                    client = VKClient(
+                        pool,
+                        api_version=settings.vk_api_version,
+                        timeout=settings.vk_request_timeout_seconds,
+                    )
+                    worker = CollectionWorker(sessions, client, settings)
+                    active_token_fingerprints = current_fingerprints
+                resumed = await recovery_queue.resume_paused_no_tokens(current_fingerprints)
+                if resumed:
+                    logger.warning(
+                        "Возобновлены paused_no_tokens jobs после появления рабочего токена: %s",
+                        resumed,
+                    )
             targets = await runnable_run_ids(sessions)
             if not targets:
                 with contextlib.suppress(TimeoutError):
@@ -804,6 +883,23 @@ async def _validate_autonomous_run(
                 raise ValueError(
                     "Light-repair содержит запрещённые job types: " + ", ".join(forbidden)
                 )
+        if run.scope == USER_POSTS_RUN_SCOPE:
+            expected = run.configuration.get("collection")
+            evidence = run.configuration.get("capacity_evidence")
+            backup = run.configuration.get("verified_backup")
+            if (
+                not isinstance(expected, dict)
+                or not isinstance(evidence, dict)
+                or not isinstance(backup, dict)
+                or not isinstance(backup.get("path"), str)
+            ):
+                raise ValueError("User-post run не содержит aggregate evidence/backup")
+            if int(evidence.get("projected_final_database_bytes", 0)) > int(
+                evidence.get("safe_database_limit_bytes", 0)
+            ):
+                raise ValueError("User-post aggregate capacity evidence отклонён")
+            (backup_verifier or BackupVerifier()).verify(Path(str(backup["path"])), expected=backup)
+            return
         if run.scope in {
             "subscriptions",
             "subscription_discovery",
@@ -838,6 +934,284 @@ def collection_worker() -> None:
     except ValueError as exc:
         typer.echo(f"Worker остановлен: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+
+async def _user_posts_pilot_preview() -> dict[str, object]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await UserPostCampaignManager(sessions, settings).pilot_preview()
+    finally:
+        await engine.dispose()
+
+
+@user_posts_app.command("pilot-preview")
+def user_posts_pilot_preview() -> None:
+    """Показать user-post pilot максимум на 500 пользователей без записи в БД."""
+    typer.echo(json.dumps(asyncio.run(_user_posts_pilot_preview()), ensure_ascii=False, indent=2))
+
+
+async def _run_user_posts_pilot(max_jobs: int | None = None) -> dict[str, object]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        manager = UserPostCampaignManager(sessions, settings)
+        run_id = await manager.plan_pilot()
+        current_before = await database_metrics(sessions)
+        async with sessions() as session:
+            run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if run is None:
+                raise ValueError("User-post pilot исчез до выполнения")
+            stored = run.configuration.get("measurement_baseline")
+            if isinstance(stored, dict) and all(
+                isinstance(value, int) for value in stored.values()
+            ):
+                before = {str(key): int(value) for key, value in stored.items()}
+            else:
+                before = current_before
+                run.configuration = {
+                    **run.configuration,
+                    "measurement_baseline": before,
+                    "measurement_started_at": datetime.now(UTC).isoformat(),
+                }
+                await session.commit()
+        _, processed = await _execute_collection(
+            run_id,
+            None,
+            max_jobs,
+            until_idle=True,
+            explicit_pilot=True,
+        )
+        metrics = await manager.pilot_metrics(run_id, database_before=before["database_bytes"])
+        after = await database_metrics(sessions)
+        metrics["user_posts"] = max(0, after["user_posts"] - before["user_posts"])
+        metrics["attachments"] = max(0, after["user_attachments"] - before["user_attachments"])
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "user_posts_pilot",
+            "created_at": datetime.now(UTC).isoformat(),
+            "complete": max_jobs is None and metrics.get("run_status") == "completed",
+            "processed_jobs": processed,
+            "configuration": manager.configuration(),
+            "metrics": metrics,
+        }
+        target = settings.collection_export_dir / "user-posts-pilot.json"
+        _write_json(target, payload)
+        return {"path": str(target), **payload}
+    finally:
+        await engine.dispose()
+
+
+@user_posts_app.command("pilot")
+def user_posts_pilot(
+    max_jobs: Annotated[int | None, typer.Option("--max-jobs", min=1)] = None,
+) -> None:
+    """Выполнить явный измеряемый pilot личных стен; production campaign не создаётся."""
+    try:
+        payload = asyncio.run(_run_user_posts_pilot(max_jobs))
+    except ValueError as exc:
+        typer.echo(f"User-post pilot отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+async def _user_posts_plan(
+    *, apply: bool, source: Path | None, backup: Path | None
+) -> dict[str, object]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        manager = UserPostCampaignManager(sessions, settings)
+        preview = await manager.plan_preview()
+        if source is None:
+            if apply:
+                raise ValueError("Для apply укажите измеренный --source и --backup")
+            return preview
+        try:
+            pilot_payload = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Pilot report не читается: {exc}") from exc
+        if (
+            pilot_payload.get("schema_version") != 1
+            or pilot_payload.get("kind") != "user_posts_pilot"
+            or pilot_payload.get("complete") is not True
+            or pilot_payload.get("configuration") != manager.configuration()
+            or not isinstance(pilot_payload.get("metrics"), dict)
+        ):
+            raise ValueError("Pilot report неполон или относится к другой configuration")
+        try:
+            created_at = datetime.fromisoformat(str(pilot_payload["created_at"]))
+            created_at = (
+                created_at.replace(tzinfo=UTC)
+                if created_at.tzinfo is None
+                else created_at.astimezone(UTC)
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError("Pilot report не содержит корректный UTC timestamp") from exc
+        age = datetime.now(UTC) - created_at
+        if age.total_seconds() < 0 or age > timedelta(
+            days=settings.collection_capacity_report_max_age_days
+        ):
+            raise ValueError("Pilot report устарел или датирован будущим")
+        current = await database_metrics(sessions)
+        disk = inspect_disk(
+            settings.collection_export_dir,
+            settings.disk_warning_percent,
+            settings.disk_stop_percent,
+        )
+        gate = build_user_posts_capacity_projection(
+            preview=preview,
+            pilot=pilot_payload["metrics"],
+            database_bytes=current["database_bytes"],
+            disk=disk,
+            warning_percent=settings.disk_warning_percent,
+        )
+        gate["capacity_report"] = str(source.resolve())
+        gate["verified_at"] = datetime.now(UTC).isoformat()
+        if apply:
+            if backup is None:
+                raise ValueError("User-post apply требует проверенный --backup pg_dump -Fc")
+            gate["verified_backup"] = _validated_backup_metadata(backup)
+            if gate["decision"] != "passed":
+                required = gate.get("additional_disk_required_bytes", 0)
+                raise ValueError(
+                    "Aggregate user-post gate rejected; требуется дополнительно "
+                    f"{required} bytes. Уменьшение cohort запрещено"
+                )
+            campaign_id = await manager.plan(gate_evidence=gate)
+            gate["campaign_id"] = str(campaign_id)
+            gate["apply"] = True
+        target = settings.collection_export_dir / "user-posts-aggregate-gate.json"
+        _write_json(target, gate)
+        return {"path": str(target), **gate}
+    finally:
+        await engine.dispose()
+
+
+@user_posts_app.command("plan")
+def user_posts_plan(
+    apply: Annotated[bool, typer.Option("--apply", help="Создать campaign/snapshot/jobs.")] = False,
+    source: Annotated[
+        Path | None, typer.Option("--source", help="Завершённый pilot report.")
+    ] = None,
+    backup: Annotated[
+        Path | None, typer.Option("--backup", help="Проверенный pg_dump -Fc.")
+    ] = None,
+) -> None:
+    """Показать aggregate gate; запись разрешена только явным --apply."""
+    try:
+        payload = asyncio.run(_user_posts_plan(apply=apply, source=source, backup=backup))
+    except ValueError as exc:
+        typer.echo(f"User-post plan отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@user_posts_app.command("capacity-apply")
+def user_posts_capacity_apply(
+    source: Annotated[Path, typer.Option("--source")],
+    backup: Annotated[Path, typer.Option("--backup")],
+) -> None:
+    """Явно применить измеренный aggregate gate и создать/переиспользовать campaign."""
+    user_posts_plan(apply=True, source=source, backup=backup)
+
+
+async def _user_posts_status(campaign_id: uuid.UUID | None = None) -> dict[str, object]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await UserPostCampaignManager(sessions, settings).status(campaign_id)
+    finally:
+        await engine.dispose()
+
+
+@user_posts_app.command("status")
+def user_posts_status(
+    campaign_id: Annotated[uuid.UUID | None, typer.Option("--campaign-id")] = None,
+) -> None:
+    """Показать snapshot, coverage, jobs и оставшийся capacity budget."""
+    typer.echo(
+        json.dumps(asyncio.run(_user_posts_status(campaign_id)), ensure_ascii=False, indent=2)
+    )
+
+
+async def _change_user_posts_campaign(campaign_id: uuid.UUID | None, *, pause: bool) -> uuid.UUID:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        manager = UserPostCampaignManager(sessions, settings)
+        if campaign_id is None:
+            status = await manager.status()
+            raw_id = status.get("campaign_id")
+            if not isinstance(raw_id, str):
+                raise ValueError("User-post campaign отсутствует")
+            campaign_id = uuid.UUID(raw_id)
+        await manager.change_status(campaign_id, pause=pause)
+        return campaign_id
+    finally:
+        await engine.dispose()
+
+
+@user_posts_app.command("pause")
+def user_posts_pause(
+    campaign_id: Annotated[uuid.UUID | None, typer.Option("--campaign-id")] = None,
+) -> None:
+    """Поставить user-post campaign на операторскую паузу."""
+    target = asyncio.run(_change_user_posts_campaign(campaign_id, pause=True))
+    typer.echo(f"User-post campaign {target} поставлена на паузу.")
+
+
+@user_posts_app.command("resume")
+def user_posts_resume(
+    campaign_id: Annotated[uuid.UUID | None, typer.Option("--campaign-id")] = None,
+) -> None:
+    """Возобновить campaign без сброса checkpoints."""
+    target = asyncio.run(_change_user_posts_campaign(campaign_id, pause=False))
+    typer.echo(f"User-post campaign {target} возобновлена.")
+
+
+async def _legacy_pilots_preview() -> list[dict[str, Any]]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await pilot_previews(sessions, settings)
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("legacy-pilots-preview")
+def legacy_pilots_preview() -> None:
+    """Read-only классификация всех historical pilot runs."""
+    typer.echo(json.dumps(asyncio.run(_legacy_pilots_preview()), ensure_ascii=False, indent=2))
+
+
+async def _quarantine_legacy_pilots(confirmation: str) -> dict[str, Any]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await quarantine_incompatible_pilots(sessions, settings, confirmation=confirmation)
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("quarantine-incompatible-pilots")
+def quarantine_legacy_pilots(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+) -> None:
+    """Карантинизировать только incompatible/obsolete pilots без удаления истории."""
+    try:
+        payload = asyncio.run(_quarantine_legacy_pilots(confirmation))
+    except ValueError as exc:
+        typer.echo(f"Карантин отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 async def _show_status(run_id: uuid.UUID | None) -> dict[str, Any]:

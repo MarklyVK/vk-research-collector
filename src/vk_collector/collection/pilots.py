@@ -18,7 +18,7 @@ from vk_collector.database.models import (
     JobStatus,
 )
 
-PILOT_SCOPES = ("subscriptions_pilot", "subscription_posts_pilot")
+PILOT_SCOPES = ("subscriptions_pilot", "subscription_posts_pilot", "user_posts_pilot")
 TERMINAL_RUN_STATUSES = (
     CollectionRunStatus.COMPLETED,
     CollectionRunStatus.COMPLETED_WITH_ERRORS,
@@ -218,3 +218,43 @@ async def cancel_pilot(
             "cancelled_jobs": int(changed.rowcount or 0),  # type: ignore[attr-defined]
             "history_deleted": False,
         }
+
+
+async def quarantine_incompatible_pilots(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    *,
+    confirmation: str,
+) -> dict[str, Any]:
+    """Quarantine only incompatible/obsolete pilots while preserving durable history."""
+    if confirmation != "QUARANTINE_INCOMPATIBLE_PILOTS":
+        raise ValueError("Требуется точное confirmation QUARANTINE_INCOMPATIBLE_PILOTS")
+    previews = await pilot_previews(sessions, settings)
+    targets = [
+        row
+        for row in previews
+        if row["classification"] in {"incompatible_configuration", "obsolete"}
+    ]
+    results = []
+    for row in targets:
+        results.append(
+            await cancel_pilot(
+                sessions,
+                uuid.UUID(str(row["run_id"])),
+                reason="Карантин несовместимого/устаревшего legacy pilot",
+            )
+        )
+    return {
+        "confirmation": confirmation,
+        "quarantined": results,
+        "quarantined_count": len(results),
+        "jobs_checkpoints_data_deleted": False,
+        "untouched_classifications": [
+            "compatible_recoverable",
+            "stale_running_lease",
+            "waiting",
+            "paused_no_tokens",
+            "operator_paused",
+            "terminal",
+        ],
+    }

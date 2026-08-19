@@ -78,6 +78,7 @@ class CampaignStatus(StrEnum):
 class CampaignPhase(StrEnum):
     SUBSCRIPTION_DISCOVERY = "subscription_discovery"
     SUBSCRIPTION_METADATA = "subscription_metadata"
+    USER_POSTS_COLLECTION = "user_posts_collection"
     WAITING_METHOD_LIMIT = "waiting_method_limit"
     PAUSED_CAPACITY_LIMIT = "paused_capacity_limit"
     COMPLETED = "completed"
@@ -366,6 +367,7 @@ class CollectionCampaign(TimestampMixin, Base):
         ),
         CheckConstraint(
             "phase IN ('subscription_discovery','subscription_metadata',"
+            "'user_posts_collection',"
             "'waiting_method_limit','paused_capacity_limit','completed','failed','cancelled')",
             name="collection_campaign_phase_allowed",
         ),

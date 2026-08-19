@@ -78,3 +78,16 @@ cohorts выполняется live capacity recheck.
 Scheduled production workflow работает только в report-only режиме. Mutating запуск
 доступен лишь через ручной workflow_dispatch с точным confirmation. Subscription posts
 и массовый `wall.get` выключены и не входят во второй этап.
+
+## Решение владельца от 20.08.2026: личные стены пользователей
+
+Владелец отдельно разрешил массовый `wall.get` только для личных стен уже сохранённых
+доступных пользователей из approved-групп: не более 20 последних постов на пользователя
+и не старше 180 дней. Это реализуется независимой durable campaign
+`user_posts_enrichment` с фазой `user_posts_collection`, собственным immutable snapshot,
+измеряемым pilot максимум на 500 пользователей, aggregate capacity gate всего snapshot
+и live recheck перед следующими cohorts.
+
+Разрешение не распространяется на стены сообществ из подписок, новых участников,
+расширение snapshot, LLM API, векторизацию или кластеризацию. Jobs личных стен создаются
+непосредственно из snapshot; `refresh_user_profile` их больше не создаёт.

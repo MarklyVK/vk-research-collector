@@ -70,11 +70,12 @@ class Settings(BaseSettings):
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
     collection_user_posts_enabled: bool = True
-    collection_user_posts_max_per_user: int = Field(default=20, ge=1, le=100)
-    collection_user_posts_page_size: int = Field(default=20, ge=1, le=100)
-    collection_user_posts_window_days: int = Field(default=180, ge=1)
+    collection_user_posts_max_per_user: int = Field(default=20, ge=1, le=20)
+    collection_user_posts_page_size: int = Field(default=20, ge=1, le=20)
+    collection_user_posts_window_days: int = Field(default=180, ge=1, le=180)
     collection_user_posts_ttl_days: int = Field(default=30, ge=1)
     collection_user_posts_stop_at_date: str = ""
+    collection_user_posts_pilot_users: int = Field(default=500, ge=1, le=500)
     collection_subscriptions_enabled: bool = False
     collection_subscriptions_max_per_user: int = Field(default=50, ge=1, le=50)
     collection_subscriptions_page_size: int = Field(default=50, ge=1, le=1000)

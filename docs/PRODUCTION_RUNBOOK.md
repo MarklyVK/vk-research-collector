@@ -128,3 +128,17 @@ Gate A inheritance и запрет subscription posts приведены в
 `docs/PHASED_SUBSCRIPTION_IMPLEMENTATION.md`. Перед любым apply обязательны
 read-only backlog, проверка active pilot/campaign/run, method states, диск,
 `pg_dump -Fc`, `pg_restore --list` и SHA-256.
+# Ручной rollout личных стен
+
+Последовательность: deploy exact tested SHA; валидный `pg_dump -Fc` с проверкой
+`pg_restore --list` и SHA-256; Alembic до `20260820_0013`; read-only report; preview и
+точечный quarantine несовместимых pilots; subscription Pilot A/Gate A; user-post
+`pilot-preview` и измеряемый `pilot`; read-only aggregate `plan`; затем только manual
+action `start-user-posts` с confirmation `START_USER_POSTS`.
+
+Если любой aggregate gate rejected, cohort не уменьшается и production не запускается:
+оператору выводится требуемое дополнительное место, а storage расширяется только после
+отдельного решения владельца. Rollback: `collection user-posts pause`, остановка worker
+и анализ. Alembic downgrade и удаление campaign/runs/jobs/checkpoints/data запрещены;
+при повреждении схемы восстанавливается проверенный backup. Subscription community posts
+остаются выключенными.

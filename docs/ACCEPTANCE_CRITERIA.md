@@ -35,3 +35,18 @@
 13. Тесты не используют реальные VK-токены и не ждут реальные минуты.
 14. Deployment требует валидный backup, Alembic upgrade, exact image SHA и успешные
     health checks PostgreSQL и worker.
+15. `user_posts_enrichment` использует отдельный immutable snapshot с тем же eligible
+    predicate и напрямую создаёт `collect_user_posts`, не используя profile-refresh.
+16. User-post pilot ограничен 500 пользователями; production gate учитывает posts,
+    attachments, state, snapshot, jobs и indexes с reserve factor не менее 1.30.
+17. Rejected user-post gate не создаёт campaign/snapshot/run/jobs; уменьшение cohort не
+    обходит решение, а перед следующей cohort выполняется live capacity recheck.
+18. Личная стена сохраняет максимум 20 постов не старше 180 дней, включая корректный
+    zero-post success, durable checkpoint/retry и terminal privacy/unavailable state.
+19. `groups.get`, `users.get` и `wall.get` имеют независимые method cooldown; новый
+    token fingerprint может восстановить `paused_no_tokens`, auth-disabled fingerprint
+    автоматически не включается повторно.
+20. Legacy quarantine применим только к incompatible/obsolete pilots с точным
+    confirmation и не удаляет jobs, checkpoints или собранные данные.
+21. `start-user-posts` требует ручного workflow_dispatch и точного `START_USER_POSTS`;
+    scheduled workflow остаётся report-only.

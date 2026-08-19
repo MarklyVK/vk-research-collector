@@ -210,3 +210,21 @@ PostgreSQL benchmark использовал 500 fake users × 50 подписо�
 создав 25 000 связей. Регрессия проверяет не более 10 storage statements на страницу;
 теоретический старый row-by-row baseline — 100 group/link UPSERT на пользователя,
 то есть не менее чем десятикратное сокращение числа storage statements.
+## Независимая campaign личных стен (решение владельца 20.08.2026)
+
+Owner authorization разрешает `wall.get` только для личных стен уже сохранённых eligible
+users. Pipeline не зависит от subscription metadata:
+
+```text
+eligible existing users -> user-post pilot (<=500) -> aggregate gate
+-> immutable user-post snapshot -> bounded cohorts -> live capacity recheck
+```
+
+Лимиты жёсткие: максимум 20 постов и окно максимум 180 дней. Aggregate projection
+включает `user_posts`, `user_post_attachments`, state rows, campaign snapshot, jobs и
+indexes, reserve factor >=1.30, текущий размер БД, свободный диск и hard limit 7 GiB.
+Rejected gate требует расширения storage либо остановки rollout; cohort уменьшать нельзя.
+
+Rollback выполняется операторской паузой campaign и остановкой worker. Alembic downgrade,
+удаление jobs/checkpoints/data и ручные SQL UPDATE/DELETE запрещены; при необходимости
+восстанавливается валидный predeploy `pg_dump -Fc` согласно production runbook.

@@ -137,6 +137,33 @@ UNION ALL SELECT 'classification_reviews', count(*) FROM classification_reviews
 UNION ALL SELECT 'group_labels', count(*) FROM group_labels
 ORDER BY element;
 
+\echo '=== COVERAGE ПОДПИСОК И ЛИЧНЫХ СТЕН ==='
+WITH eligible AS (
+  SELECT DISTINCT u.vk_id
+  FROM vk_users u
+  JOIN group_memberships m ON m.user_id=u.vk_id AND m.is_current
+  JOIN group_candidates g ON g.id=m.group_id AND g.classification_status='approved'
+  WHERE u.deactivated IS NULL AND (NOT u.is_closed OR u.can_access_closed)
+), subscription_coverage AS (
+  SELECT count(*) AS eligible,
+         count(*) FILTER (WHERE s.next_scheduled_at > now()
+           AND (s.last_success_at IS NOT NULL OR s.terminal_reason IS NOT NULL)) AS fresh,
+         count(*) FILTER (WHERE s.next_scheduled_at > now()
+           AND s.terminal_reason IS NOT NULL) AS terminal
+  FROM eligible e LEFT JOIN user_subscription_states s ON s.user_id=e.vk_id
+), wall_coverage AS (
+  SELECT count(*) AS eligible,
+         count(*) FILTER (WHERE s.next_scheduled_at > now()
+           AND (s.last_success_at IS NOT NULL OR s.wall_private OR s.unavailable)) AS fresh,
+         count(*) FILTER (WHERE s.next_scheduled_at > now()
+           AND (s.wall_private OR s.unavailable)) AS terminal
+  FROM eligible e LEFT JOIN user_post_collection_states s ON s.user_id=e.vk_id
+)
+SELECT 'subscriptions' AS scope, eligible, eligible-fresh AS due, fresh, terminal
+FROM subscription_coverage
+UNION ALL
+SELECT 'user_posts', eligible, eligible-fresh, fresh, terminal FROM wall_coverage;
+
 SELECT classification_status::text AS classification_status, count(*) AS groups
 FROM group_candidates GROUP BY 1 ORDER BY 1;
 
@@ -427,16 +454,50 @@ start_subscriptions() {
   printf 'VERIFIED_BACKUP=%s\n' "$latest_backup"
 }
 
+quarantine_incompatible_pilots() {
+  collector collection legacy-pilots-preview
+  collector collection quarantine-incompatible-pilots \
+    --confirmation QUARANTINE_INCOMPATIBLE_PILOTS
+}
+
+start_user_posts() {
+  local latest_backup report_path
+  log 'Фиксирую owner-authorized лимиты личных стен: 20 постов, окно 180 дней.'
+  set_env_value COLLECTION_USER_POSTS_ENABLED true
+  set_env_value COLLECTION_USER_POSTS_MAX_PER_USER 20
+  set_env_value COLLECTION_USER_POSTS_PAGE_SIZE 20
+  set_env_value COLLECTION_USER_POSTS_WINDOW_DAYS 180
+  latest_backup=$(find "$DEPLOY_DIR/backups" -type f -name '*.dump' -printf '%T@ %p\n' \
+    | sort -nr | head -n 1 | cut -d' ' -f2-)
+  [[ -n "$latest_backup" && -s "$latest_backup" ]] || die 'Нет непустого backup для user-post gate.'
+  compose exec -T postgres pg_restore --list < "$latest_backup" >/dev/null \
+    || die 'Последний backup не прошёл pg_restore --list.'
+  grant_collector_backup_read "$latest_backup"
+  log 'Останавливаю worker на время измеряемого user-post pilot.'
+  compose stop -t 360 collector-worker
+  WORKER_STOPPED=1
+  trap restart_worker EXIT
+  collector collection user-posts pilot
+  report_path="$DEPLOY_DIR/exports/stage2-pilot/user-posts-pilot.json"
+  [[ -s "$report_path" ]] || die "User-post pilot не создал отчёт: $report_path"
+  collector collection user-posts capacity-apply \
+    --source /app/exports/stage2-pilot/user-posts-pilot.json \
+    --backup "/app/backups/$(basename "$latest_backup")"
+  restart_worker
+  trap - EXIT
+  collector collection user-posts status
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --action) ACTION=${2:?}; shift 2 ;;
     --deploy-dir) DEPLOY_DIR=${2:?}; shift 2 ;;
-    -h|--help) printf 'usage: %s --action report|start-subscriptions [--deploy-dir PATH]\n' "$0"; exit 0 ;;
+    -h|--help) printf 'usage: %s --action report|start-subscriptions|start-user-posts|quarantine-incompatible-pilots [--deploy-dir PATH]\n' "$0"; exit 0 ;;
     *) die "Неизвестный аргумент: $1" ;;
   esac
 done
 
-[[ "$ACTION" == report || "$ACTION" == start-subscriptions ]] \
+[[ "$ACTION" == report || "$ACTION" == start-subscriptions || "$ACTION" == start-user-posts || "$ACTION" == quarantine-incompatible-pilots ]] \
   || die "Неизвестное действие: $ACTION"
 for command in docker flock realpath sed awk find sort df grep mktemp python3 chmod chown; do
   command -v "$command" >/dev/null 2>&1 || die "Не найдена команда: $command"
@@ -460,11 +521,21 @@ POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
 ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20260819_0012 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20260820_0013 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 report
 if [[ "$ACTION" == start-subscriptions ]]; then
   start_subscriptions
   log 'Срез после запуска:'
+  report
+fi
+if [[ "$ACTION" == start-user-posts ]]; then
+  start_user_posts
+  log 'Срез после запуска личных стен:'
+  report
+fi
+if [[ "$ACTION" == quarantine-incompatible-pilots ]]; then
+  quarantine_incompatible_pilots
+  log 'Срез после карантина legacy pilots:'
   report
 fi
