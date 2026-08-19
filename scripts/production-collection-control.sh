@@ -158,6 +158,11 @@ SELECT 'vk_communities' AS element, count(*) AS total FROM vk_communities
 UNION ALL SELECT 'communities_with_metadata', count(*) FROM vk_communities WHERE metadata_updated_at IS NOT NULL
 UNION ALL SELECT 'group_posts', count(*) FROM group_posts
 UNION ALL SELECT 'post_attachments', count(*) FROM post_attachments
+UNION ALL SELECT 'user_posts', count(*) FROM user_posts
+UNION ALL SELECT 'user_post_attachments', count(*) FROM user_post_attachments
+UNION ALL SELECT 'user_post_states', count(*) FROM user_post_collection_states
+UNION ALL SELECT 'processed_user_posts', count(*) FROM user_post_collection_states WHERE last_success_at IS NOT NULL
+UNION ALL SELECT 'private_user_walls', count(*) FROM user_post_collection_states WHERE wall_private
 UNION ALL SELECT 'vk_users', count(*) FROM vk_users
 UNION ALL SELECT 'accessible_vk_users', count(*) FROM vk_users WHERE deactivated IS NULL AND (NOT is_closed OR can_access_closed)
 UNION ALL SELECT 'group_memberships', count(*) FROM group_memberships

@@ -30,6 +30,9 @@ from vk_collector.database.models import (
     JobStatus,
     PostAttachment,
     UserGroupSubscription,
+    UserPost,
+    UserPostAttachment,
+    UserPostCollectionState,
     UserSubscriptionState,
     VKCommunity,
     VKUser,
@@ -48,6 +51,7 @@ JOB_METHODS = {
     "collect_group_posts": "wall.get",
     "collect_group_members": "groups.getMembers",
     "refresh_user_profile": "users.get",
+    "collect_user_posts": "wall.get",
     "collect_user_subscriptions": "groups.get",
     "refresh_community_metadata": "groups.getById",
     "collect_subscription_group_posts": "wall.get",
@@ -274,6 +278,8 @@ class CollectionWorker:
                 await self._collect_members(job)
             elif job.job_type == "refresh_user_profile":
                 await self._refresh_user(job)
+            elif job.job_type == "collect_user_posts":
+                await self._collect_user_posts(job)
             elif job.job_type == "collect_user_subscriptions":
                 await self._collect_subscriptions(job)
             elif job.job_type == "refresh_community_metadata":
@@ -324,6 +330,8 @@ class CollectionWorker:
             elif exc.code in TERMINAL_VK_CODES:
                 if job.job_type == "collect_user_subscriptions":
                     await self._mark_subscriptions_terminal(job, exc.code)
+                if job.job_type == "collect_user_posts":
+                    await self._mark_user_post_failure(job, exc.code, message, terminal=True)
                 if job.job_type in {
                     "collect_group_posts",
                     "collect_subscription_group_posts",
@@ -795,6 +803,57 @@ class CollectionWorker:
         now = datetime.now(UTC)
         async with self._sessions() as session:
             for user_id, value in by_id.items():
+                sex_val = int(value["sex"]) if isinstance(value.get("sex"), int) else None
+                bdate_val = str(value["bdate"]) if value.get("bdate") else None
+                city_raw = value.get("city")
+                city_val = (
+                    str(city_raw.get("title"))
+                    if isinstance(city_raw, dict) and "title" in city_raw
+                    else (str(city_raw) if isinstance(city_raw, str) else None)
+                )
+                edu_val = (
+                    str(
+                        value.get("university_name")
+                        or value.get("faculty_name")
+                        or value.get("education_form")
+                        or ""
+                    )
+                    or None
+                )
+                rel_val = int(value["relation"]) if isinstance(value.get("relation"), int) else None
+                followers_val = (
+                    int(value["followers_count"])
+                    if isinstance(value.get("followers_count"), int)
+                    else None
+                )
+                counters_raw = value.get("counters")
+                friends_val = (
+                    int(counters_raw["friends"])
+                    if isinstance(counters_raw, dict)
+                    and isinstance(counters_raw.get("friends"), int)
+                    else None
+                )
+                gifts_val = (
+                    int(counters_raw["gifts"])
+                    if isinstance(counters_raw, dict) and isinstance(counters_raw.get("gifts"), int)
+                    else None
+                )
+
+                demographics_dict: dict[str, object] = {
+                    k: v
+                    for k, v in {
+                        "sex": sex_val,
+                        "bdate": bdate_val,
+                        "city": city_val,
+                        "education": edu_val,
+                        "relation": rel_val,
+                        "followers_count": followers_val,
+                        "friends_count": friends_val,
+                        "gifts_count": gifts_val,
+                    }.items()
+                    if v is not None
+                }
+
                 await session.execute(
                     insert(VKUser)
                     .values(
@@ -805,6 +864,15 @@ class CollectionWorker:
                         is_closed=bool(value.get("is_closed", False)),
                         can_access_closed=bool(value.get("can_access_closed", False)),
                         deactivated=str(value["deactivated"]) if value.get("deactivated") else None,
+                        sex=sex_val,
+                        bdate=bdate_val,
+                        city=city_val,
+                        education=edu_val,
+                        relation=rel_val,
+                        followers_count=followers_val,
+                        friends_count=friends_val,
+                        gifts_count=gifts_val,
+                        demographics=demographics_dict,
                         first_seen_at=now,
                         last_seen_at=now,
                         profile_updated_at=now,
@@ -822,12 +890,41 @@ class CollectionWorker:
                             "deactivated": str(value["deactivated"])
                             if value.get("deactivated")
                             else None,
+                            "sex": sex_val,
+                            "bdate": bdate_val,
+                            "city": city_val,
+                            "education": edu_val,
+                            "relation": rel_val,
+                            "followers_count": followers_val,
+                            "friends_count": friends_val,
+                            "gifts_count": gifts_val,
+                            "demographics": demographics_dict,
                             "last_seen_at": now,
                             "profile_updated_at": now,
                         },
                     )
                 )
-                if self._settings.collection_subscriptions_enabled and not value.get("is_closed"):
+                if (
+                    self._settings.collection_user_posts_enabled
+                    and not value.get("is_closed")
+                    and not value.get("deactivated")
+                ):
+                    await session.execute(
+                        insert(CollectionJob)
+                        .values(
+                            collection_run_id=job.run_id,
+                            job_type="collect_user_posts",
+                            entity_type="user",
+                            entity_id=user_id,
+                            priority=45,
+                        )
+                        .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                    )
+                if (
+                    self._settings.collection_subscriptions_enabled
+                    and not value.get("is_closed")
+                    and not value.get("deactivated")
+                ):
                     await session.execute(
                         insert(CollectionJob)
                         .values(
@@ -1371,6 +1468,215 @@ class CollectionWorker:
                         "collected_count": len(items),
                         "wall_private": False,
                         "unavailable": False,
+                    },
+                )
+            )
+            await session.commit()
+
+    async def _collect_user_posts(self, job: ClaimedJob) -> None:
+        """Сохранить не более 20 последних постов пользователя не старше полугода (180 дней)."""
+        async with self._sessions() as session:
+            user = await session.get(VKUser, job.entity_id)
+        if user is None:
+            raise VKAPIError(18, "Пользователь не найден")
+        if user.deactivated:
+            raise VKAPIError(18, f"Пользователь деактивирован: {user.deactivated}")
+        if user.is_closed and not user.can_access_closed:
+            raise VKAPIError(30, "Профиль пользователя закрыт")
+
+        offset = int(job.checkpoint.get("offset", 0))
+        maximum = self._settings.collection_user_posts_max_per_user
+        page_size = min(self._settings.collection_user_posts_page_size, maximum)
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=self._settings.collection_user_posts_window_days)
+        if self._settings.collection_user_posts_stop_at_date:
+            try:
+                custom_cutoff = datetime.fromisoformat(
+                    self._settings.collection_user_posts_stop_at_date
+                ).replace(tzinfo=UTC)
+                cutoff = max(cutoff, custom_cutoff)
+            except ValueError:
+                pass
+
+        total_collected = int(job.checkpoint.get("collected", 0))
+        while total_collected < maximum:
+            count = min(page_size, maximum - total_collected)
+            response = await self._client.get_user_wall_page(user.vk_id, offset, count)
+            raw_items = response.get("items", [])
+            items = (
+                [item for item in raw_items if isinstance(item, dict)]
+                if isinstance(raw_items, list)
+                else []
+            )
+            if not items:
+                break
+
+            reached_cutoff = False
+            async with self._sessions() as session:
+                changed = 0
+                for raw in items:
+                    published = _utc_from_timestamp(raw.get("date"))
+                    if published is None or not isinstance(raw.get("id"), int):
+                        continue
+                    if published < cutoff:
+                        reached_cutoff = True
+                        break
+
+                    text = str(raw.get("text", ""))
+                    content_hash = hashlib.sha256(
+                        f"{text}\0{raw.get('date')}\0{raw.get('edited')}".encode()
+                    ).hexdigest()
+
+                    post_id = await session.scalar(
+                        insert(UserPost)
+                        .values(
+                            vk_owner_id=int(raw.get("owner_id", user.vk_id)),
+                            vk_post_id=int(raw["id"]),
+                            user_id=user.vk_id,
+                            published_at=published,
+                            edited_at=_utc_from_timestamp(raw.get("edited")),
+                            text=text,
+                            post_type=str(raw.get("post_type", "post")),
+                            is_pinned=bool(raw.get("is_pinned", False)),
+                            comments_count=_counter(raw.get("comments")),
+                            likes_count=_counter(raw.get("likes")),
+                            reposts_count=_counter(raw.get("reposts")),
+                            views_count=_counter(raw.get("views")),
+                            signer_vk_user_id=raw.get("signer_id")
+                            if isinstance(raw.get("signer_id"), int)
+                            else None,
+                            source_updated_at=_utc_from_timestamp(raw.get("edited")) or published,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                            content_hash=content_hash,
+                        )
+                        .on_conflict_do_update(
+                            constraint="uq_user_posts_owner_post",
+                            set_={
+                                "text": text,
+                                "edited_at": _utc_from_timestamp(raw.get("edited")),
+                                "comments_count": _counter(raw.get("comments")),
+                                "likes_count": _counter(raw.get("likes")),
+                                "reposts_count": _counter(raw.get("reposts")),
+                                "views_count": _counter(raw.get("views")),
+                                "last_seen_at": now,
+                                "content_hash": content_hash,
+                            },
+                        )
+                        .returning(UserPost.id)
+                    )
+                    if post_id is None:
+                        continue
+
+                    await session.execute(
+                        delete(UserPostAttachment).where(UserPostAttachment.post_id == post_id)
+                    )
+                    raw_attachments = raw.get("attachments", [])
+                    attachments = (
+                        [item for item in raw_attachments if isinstance(item, dict)]
+                        if isinstance(raw_attachments, list)
+                        else []
+                    )
+                    for position, attachment in enumerate(attachments):
+                        normalized = normalize_attachment(attachment, position)
+                        normalized["post_id"] = post_id
+                        session.add(UserPostAttachment(**normalized))
+                    changed += 1
+                    total_collected += 1
+                    if total_collected >= maximum:
+                        break
+
+                offset += len(items)
+                checkpoint: dict[str, object] = {
+                    "offset": offset,
+                    "total": int(response.get("count", 0)),
+                    "collected": total_collected,
+                }
+                await self._checkpoint(session, job.id, checkpoint, 1, changed)
+                await session.commit()
+
+            total_vk = int(response.get("count", 0))
+            if (
+                reached_cutoff
+                or total_collected >= maximum
+                or offset >= total_vk
+                or len(items) < count
+            ):
+                break
+
+        async with self._sessions() as session:
+            await session.execute(
+                insert(UserPostCollectionState)
+                .values(
+                    user_id=user.vk_id,
+                    last_attempt_at=now,
+                    last_success_at=now,
+                    next_scheduled_at=now
+                    + timedelta(days=self._settings.collection_user_posts_ttl_days),
+                    last_run_id=job.run_id,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    collected_count=total_collected,
+                    wall_private=False,
+                    unavailable=False,
+                )
+                .on_conflict_do_update(
+                    index_elements=[UserPostCollectionState.user_id],
+                    set_={
+                        "last_attempt_at": now,
+                        "last_success_at": now,
+                        "next_scheduled_at": now
+                        + timedelta(days=self._settings.collection_user_posts_ttl_days),
+                        "last_run_id": job.run_id,
+                        "last_error_code": None,
+                        "last_error_reason": None,
+                        "collected_count": total_collected,
+                        "wall_private": False,
+                        "unavailable": False,
+                    },
+                )
+            )
+            await session.commit()
+
+    async def _mark_user_post_failure(
+        self,
+        job: ClaimedJob,
+        error_code: int | None,
+        reason: str,
+        *,
+        terminal: bool,
+    ) -> None:
+        user_id = job.entity_id
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            await session.execute(
+                insert(UserPostCollectionState)
+                .values(
+                    user_id=user_id,
+                    last_attempt_at=now,
+                    next_scheduled_at=now
+                    + timedelta(days=self._settings.collection_user_posts_ttl_days)
+                    if terminal
+                    else None,
+                    last_run_id=job.run_id,
+                    last_error_code=error_code,
+                    last_error_reason=reason[:255],
+                    wall_private=terminal and error_code in {7, 15, 30},
+                    unavailable=terminal and error_code in {18},
+                )
+                .on_conflict_do_update(
+                    index_elements=[UserPostCollectionState.user_id],
+                    set_={
+                        "last_attempt_at": now,
+                        "next_scheduled_at": now
+                        + timedelta(days=self._settings.collection_user_posts_ttl_days)
+                        if terminal
+                        else None,
+                        "last_run_id": job.run_id,
+                        "last_error_code": error_code,
+                        "last_error_reason": reason[:255],
+                        "wall_private": terminal and error_code in {7, 15, 30},
+                        "unavailable": terminal and error_code in {18},
                     },
                 )
             )

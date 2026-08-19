@@ -21,6 +21,8 @@ from vk_collector.database.models import (
     JobStatus,
     PostAttachment,
     UserGroupSubscription,
+    UserPost,
+    UserPostAttachment,
     UserSubscriptionState,
     VKCommunity,
     VKTokenMethodState,
@@ -436,6 +438,9 @@ async def database_metrics(
             "community_post_collection_states",
             "group_posts",
             "post_attachments",
+            "user_posts",
+            "user_post_attachments",
+            "user_post_collection_states",
         ):
             relations[f"relation_{table}_bytes"] = int(
                 await session.scalar(select(func.pg_total_relation_size(table))) or 0
@@ -460,6 +465,8 @@ async def global_summary_from_session(session: AsyncSession) -> dict[str, int]:
     rows = {
         "posts": GroupPost,
         "attachments": PostAttachment,
+        "user_posts": UserPost,
+        "user_attachments": UserPostAttachment,
         "memberships": GroupMembership,
         "users": VKUser,
         "subscriptions": UserGroupSubscription,

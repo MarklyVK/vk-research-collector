@@ -195,6 +195,15 @@ class VKClient:
             raise VKAPIError(-1, "Некорректный ответ wall.get")
         return response
 
+    async def get_user_wall_page(self, user_vk_id: int, offset: int, count: int) -> dict[str, Any]:
+        """Получить страницу постов со стены пользователя (owner_id положительный)."""
+        response = await self.call(
+            "wall.get", {"owner_id": user_vk_id, "offset": offset, "count": count}
+        )
+        if not isinstance(response, dict):
+            raise VKAPIError(-1, "Некорректный ответ wall.get")
+        return response
+
     async def get_members_page(self, group_vk_id: int, offset: int, count: int) -> dict[str, Any]:
         response = await self.call(
             "groups.getMembers", {"group_id": group_vk_id, "offset": offset, "count": count}
@@ -208,7 +217,10 @@ class VKClient:
             "users.get",
             {
                 "user_ids": ",".join(str(value) for value in user_ids),
-                "fields": "screen_name,is_closed,can_access_closed,deactivated",
+                "fields": (
+                    "screen_name,is_closed,can_access_closed,deactivated,"
+                    "sex,bdate,city,education,universities,relation,followers_count,counters"
+                ),
             },
         )
         if not isinstance(response, list):
