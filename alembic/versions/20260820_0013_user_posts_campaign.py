@@ -24,7 +24,7 @@ def upgrade() -> None:
     )
     op.execute(
         "ALTER TABLE collection_campaigns ADD CONSTRAINT "
-        "collection_campaign_phase_allowed CHECK (phase IN ("
+        "ck_collection_campaigns_collection_campaign_phase_allowed CHECK (phase IN ("
         "'subscription_discovery','subscription_metadata','user_posts_collection',"
         "'waiting_method_limit','paused_capacity_limit','completed','failed','cancelled'))"
     )
