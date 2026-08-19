@@ -27,6 +27,7 @@ venv/
 # Результаты работы
 exports/
 logs/
+*.log
 tmp/
 
 # PostgreSQL

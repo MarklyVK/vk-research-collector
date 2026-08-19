@@ -110,6 +110,8 @@ class CollectionQueue:
             scopes.append("members")
         if self._settings.collection_users_enabled:
             scopes.append("users")
+        if self._settings.collection_user_posts_enabled:
+            scopes.append("user_posts")
         return tuple(scopes)
 
     def collection_configuration(self) -> dict[str, object]:
@@ -123,6 +125,12 @@ class CollectionQueue:
             "members_page_size": self._settings.collection_members_page_size,
             "user_profile_ttl_days": self._settings.collection_user_profile_ttl_days,
             "user_batch_size": self._settings.collection_user_batch_size,
+            "user_posts_enabled": self._settings.collection_user_posts_enabled,
+            "user_posts_max_per_user": self._settings.collection_user_posts_max_per_user,
+            "user_posts_page_size": self._settings.collection_user_posts_page_size,
+            "user_posts_window_days": self._settings.collection_user_posts_window_days,
+            "user_posts_ttl_days": self._settings.collection_user_posts_ttl_days,
+            "user_posts_stop_at_date": self._settings.collection_user_posts_stop_at_date,
             "subscriptions_max_per_user": (self._settings.collection_subscriptions_max_per_user),
             "subscriptions_page_size": self._settings.collection_subscriptions_page_size,
             "subscriptions_users_per_run": self._settings.collection_subscriptions_users_per_run,

@@ -634,6 +634,17 @@ class VKUser(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     profile_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sex: Mapped[int | None] = mapped_column(Integer)
+    bdate: Mapped[str | None] = mapped_column(String(50))
+    city: Mapped[str | None] = mapped_column(String(255))
+    education: Mapped[str | None] = mapped_column(String(512))
+    relation: Mapped[int | None] = mapped_column(Integer)
+    followers_count: Mapped[int | None] = mapped_column(Integer)
+    friends_count: Mapped[int | None] = mapped_column(Integer)
+    gifts_count: Mapped[int | None] = mapped_column(Integer)
+    demographics: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
 
 
 class GroupMembership(Base):
@@ -820,3 +831,113 @@ class VKTokenMethodState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class PostEmbedding(Base):
+    """Мультимодальные L2-нормализованные эмбеддинги постов компаний."""
+
+    __tablename__ = "post_embeddings"
+    __table_args__ = (
+        Index("ix_post_embeddings_run_id", "run_id"),
+        Index("ix_post_embeddings_model_name", "model_name"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    post_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("group_posts.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False, server_default="2048")
+    embedding_vector: Mapped[list[float]] = mapped_column(JSONB, nullable=False)
+    modality_profile: Mapped[str] = mapped_column(String(50), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UserPost(TimestampMixin, Base):
+    """Посты со стен пользователей VK."""
+
+    __tablename__ = "user_posts"
+    __table_args__ = (
+        UniqueConstraint("vk_owner_id", "vk_post_id", name="uq_user_posts_owner_post"),
+        Index("ix_user_posts_user_published", "user_id", "published_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    vk_owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    vk_post_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), nullable=False
+    )
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    text: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    post_type: Mapped[str] = mapped_column(String(50), nullable=False, server_default="post")
+    is_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    comments_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    likes_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    reposts_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    views_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    signer_vk_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class UserPostAttachment(Base):
+    """Медиавложения к постам со стены пользователя."""
+
+    __tablename__ = "user_post_attachments"
+    __table_args__ = (
+        UniqueConstraint("post_id", "position", name="uq_user_post_attachments_post_position"),
+        Index("ix_user_post_attachments_type", "attachment_type"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    post_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_posts.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    attachment_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    vk_owner_id: Mapped[int | None] = mapped_column(BigInteger)
+    vk_attachment_id: Mapped[int | None] = mapped_column(BigInteger)
+    access_key: Mapped[str | None] = mapped_column(String(255))
+    duration: Mapped[int | None] = mapped_column(Integer)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str | None] = mapped_column(String(1000))
+    external_url: Mapped[str | None] = mapped_column(Text)
+    attachment_metadata: Mapped[dict[str, object]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+
+class UserPostCollectionState(Base):
+    """Состояние сбора постов со стены пользователя."""
+
+    __tablename__ = "user_post_collection_states"
+    __table_args__ = (Index("ix_user_post_collection_states_next", "next_scheduled_at"),)
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_users.vk_id", ondelete="CASCADE"), primary_key=True
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("collection_runs.id", ondelete="SET NULL")
+    )
+    last_error_code: Mapped[int | None] = mapped_column(Integer)
+    last_error_reason: Mapped[str | None] = mapped_column(String(255))
+    collected_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    wall_private: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    unavailable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")

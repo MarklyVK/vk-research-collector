@@ -39,6 +39,10 @@ def upgrade() -> None:
             "vk_token_method_states",
             "community_post_collection_states",
             "collection_campaign_users",
+            "post_embeddings",
+            "user_posts",
+            "user_post_attachments",
+            "user_post_collection_states",
         }
     ]
     Base.metadata.create_all(op.get_bind(), tables=stage_one_tables)
