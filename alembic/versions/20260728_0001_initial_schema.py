@@ -39,7 +39,6 @@ def upgrade() -> None:
             "vk_token_method_states",
             "community_post_collection_states",
             "collection_campaign_users",
-            "collection_campaigns",
             "post_embeddings",
             "user_posts",
             "user_post_attachments",
