@@ -517,7 +517,16 @@ stop_worker_on_critical_disk "$DISK_AFTER_BACKUP" post-backup
 
 atomic_text "$DEPLOY_DIR/.deploy/previous-image" "$PREVIOUS_IMAGE"
 log 'Скачивается неизменяемый SHA image.'
-docker pull "$IMAGE"
+PULL_SUCCESS=0
+for attempt in 1 2 3; do
+  if docker pull "$IMAGE"; then
+    PULL_SUCCESS=1
+    break
+  fi
+  log "docker pull завершился с ошибкой (попытка $attempt/3). Ожидание 10с перед повтором..."
+  sleep 10
+done
+(( PULL_SUCCESS == 1 )) || die "Не удалось скачать image: $IMAGE"
 verify_local_image
 DISK_AFTER_PULL=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
 stop_worker_on_critical_disk "$DISK_AFTER_PULL" post-pull
@@ -537,8 +546,8 @@ ROLLBACK_ALLOWED=0
 compose_cli alembic upgrade head
 compose_cli alembic check
 ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
-[[ "$ALEMBIC_REVISION" == *20260815_0010* ]] \
-  || die "Alembic находится не на ожидаемом head 20260815_0010: $ALEMBIC_REVISION"
+[[ "$ALEMBIC_REVISION" == *20260819_0012* ]] \
+  || die "Alembic находится не на ожидаемом head 20260819_0012: $ALEMBIC_REVISION"
 
 ROLLBACK_ALLOWED=1
 if [[ -n "$RUN_ID" ]]; then

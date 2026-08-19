@@ -460,7 +460,7 @@ POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
 ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20260815_0010 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20260819_0012 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 report
 if [[ "$ACTION" == start-subscriptions ]]; then
