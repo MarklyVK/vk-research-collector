@@ -26,7 +26,7 @@ deployment_transition_decision() {
 
   if [[ "${RUN_STATUS:-}" == paused_capacity_limit ]]; then
     case "${BASELINE_RUN_STATUS:-}" in
-      planned|running|waiting_method_limit) ;;
+      planned|running|waiting_method_limit|paused_capacity_limit) ;;
       *)
         printf 'До deployment legacy run не был active.\n' >&2
         return 1
