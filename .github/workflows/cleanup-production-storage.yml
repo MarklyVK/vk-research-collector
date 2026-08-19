@@ -11,8 +11,9 @@ on:
         options:
           - preview
           - apply
+          - apply-maximal
       confirmation:
-        description: Для apply введите DELETE_OLD_BACKUPS
+        description: Для apply введите DELETE_OLD_BACKUPS; для apply-maximal — DELETE_ALL_UNUSED
         required: false
         type: string
 
@@ -47,6 +48,8 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           if [[ "$CLEANUP_MODE" == apply ]]; then
             test "$CLEANUP_CONFIRMATION" = DELETE_OLD_BACKUPS
+          elif [[ "$CLEANUP_MODE" == apply-maximal ]]; then
+            test "$CLEANUP_CONFIRMATION" = DELETE_ALL_UNUSED
           else
             test "$CLEANUP_MODE" = preview
           fi
@@ -59,7 +62,11 @@ jobs:
         run: |
           set -Eeuo pipefail
           args=(--deploy-dir "$DEPLOY_ROOT")
-          [[ "$CLEANUP_MODE" == apply ]] && args+=(--apply)
+          if [[ "$CLEANUP_MODE" == apply ]]; then
+            args+=(--apply)
+          elif [[ "$CLEANUP_MODE" == apply-maximal ]]; then
+            args+=(--apply --drop-rollback-image)
+          fi
           report="$RUNNER_TEMP/production-storage-${GITHUB_RUN_ID}.log"
           bash scripts/cleanup-production-storage.sh "${args[@]}" | tee "$report"
           {
@@ -69,4 +76,3 @@ jobs:
             tail -n 80 "$report"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-

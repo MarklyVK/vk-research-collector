@@ -4,6 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 APPLY=0
+DROP_ROLLBACK_IMAGE=0
 DEPLOY_DIR="${DEPLOY_ROOT:-/opt/vk-research-collector}"
 EXPECTED_USER="${DEPLOY_USER:-deploy}"
 EXPECTED_DEPLOY_DIR="${CLEANUP_EXPECTED_DEPLOY_DIR:-/opt/vk-research-collector}"
@@ -12,10 +13,11 @@ COLLECTOR_REPOSITORY="ghcr.io/marklyvk/vk-research-collector/collector"
 
 usage() {
   cat <<'EOF'
-Использование: cleanup-production-storage.sh [--apply] [--deploy-dir PATH]
+Использование: cleanup-production-storage.sh [--apply] [--drop-rollback-image] [--deploy-dir PATH]
 
 Без --apply выполняется только preview. Скрипт всегда сохраняет последний проверенный
-PostgreSQL dump, текущий image, rollback image, volume, exports и secrets.
+PostgreSQL dump, текущий image, volume, exports и secrets. Rollback image сохраняется,
+если явно не передан --drop-rollback-image.
 EOF
 }
 
@@ -64,6 +66,7 @@ file_size() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply) APPLY=1; shift ;;
+    --drop-rollback-image) DROP_ROLLBACK_IMAGE=1; shift ;;
     --deploy-dir) DEPLOY_DIR=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Неизвестный аргумент: $1" ;;
@@ -98,7 +101,8 @@ docker image inspect "$CURRENT_IMAGE" >/dev/null 2>&1 \
   || die "Текущий image отсутствует локально: $CURRENT_IMAGE"
 CURRENT_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CURRENT_IMAGE")
 PREVIOUS_IMAGE_ID=""
-if [[ -n "$PREVIOUS_IMAGE" ]] && docker image inspect "$PREVIOUS_IMAGE" >/dev/null 2>&1; then
+if [[ "$DROP_ROLLBACK_IMAGE" -eq 0 && -n "$PREVIOUS_IMAGE" ]] \
+  && docker image inspect "$PREVIOUS_IMAGE" >/dev/null 2>&1; then
   PREVIOUS_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$PREVIOUS_IMAGE")
 fi
 
@@ -209,6 +213,7 @@ DISK_AVAILABLE_BEFORE=$(df -B1 --output=avail "$DEPLOY_DIR" | awk 'NR==2 {print 
 DISK_PERCENT_BEFORE=$(df -P "$DEPLOY_DIR" | awk 'NR==2 {print $5}')
 
 log "Режим: $([[ "$APPLY" -eq 1 ]] && printf apply || printf preview)"
+log "Rollback image: $([[ "$DROP_ROLLBACK_IMAGE" -eq 1 ]] && printf 'удаляется' || printf 'сохраняется')"
 log "Alembic: $REVISION; PostgreSQL: $POSTGRES_STATE_BEFORE; worker: $WORKER_STATE_BEFORE"
 log "Сохраняется последний backup: $LATEST_BACKUP ($LATEST_BACKUP_BYTES bytes)"
 log "Verified backup незавершённых запусков под защитой: ${#PROTECTED_BACKUPS[@]}"
@@ -241,6 +246,9 @@ if [[ "$APPLY" -eq 1 ]]; then
   for reference in "${IMAGE_DELETE[@]}"; do
     docker image rm "$reference"
   done
+  if [[ "$DROP_ROLLBACK_IMAGE" -eq 1 ]]; then
+    rm -f -- "$DEPLOY_DIR/.deploy/previous-image"
+  fi
   docker image prune -f
   docker builder prune -af
   sync
@@ -255,7 +263,7 @@ WORKER_STATE_AFTER=$(service_state collector-worker)
 test -s "$LATEST_BACKUP" || die 'Сохранённый последний backup исчез после cleanup'
 docker image inspect "$CURRENT_IMAGE" >/dev/null 2>&1 \
   || die 'Текущий image исчез после cleanup'
-if [[ -n "$PREVIOUS_IMAGE_ID" ]]; then
+if [[ "$DROP_ROLLBACK_IMAGE" -eq 0 && -n "$PREVIOUS_IMAGE_ID" ]]; then
   docker image inspect "$PREVIOUS_IMAGE" >/dev/null 2>&1 \
     || die 'Rollback image исчез после cleanup'
 fi
@@ -268,6 +276,7 @@ FREED_BYTES=$((DISK_USED_BEFORE - DISK_USED_AFTER))
 log 'Docker disk usage после cleanup/preview:'
 docker system df
 printf 'MODE=%s\n' "$([[ "$APPLY" -eq 1 ]] && printf apply || printf preview)"
+printf 'DROP_ROLLBACK_IMAGE=%s\n' "$DROP_ROLLBACK_IMAGE"
 printf 'LATEST_BACKUP=%s\n' "$LATEST_BACKUP"
 printf 'LATEST_BACKUP_BYTES=%s\n' "$LATEST_BACKUP_BYTES"
 printf 'BACKUP_DELETE_COUNT=%s\n' "${#BACKUP_DELETE[@]}"

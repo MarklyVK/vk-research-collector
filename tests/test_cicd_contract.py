@@ -223,6 +223,8 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
     assert job["runs-on"] == ["self-hosted", "linux", "x64", "production", "vk-collector"]
     assert job["environment"] == {"name": "production"}
     assert "DELETE_OLD_BACKUPS" in workflow_text
+    assert "DELETE_ALL_UNUSED" in workflow_text
+    assert "--drop-rollback-image" in workflow_text
     assert "cleanup-production-storage.sh" in workflow_text
 
     required = (
@@ -233,6 +235,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "configuration #>> '{verified_backup,path}'",
         "CURRENT_IMAGE_ID",
         "PREVIOUS_IMAGE_ID",
+        "DROP_ROLLBACK_IMAGE",
         "docker builder prune -af",
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
