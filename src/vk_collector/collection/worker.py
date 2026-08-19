@@ -58,7 +58,7 @@ JOB_METHODS = {
 }
 FAIR_JOB_TYPES = tuple(JOB_METHODS)
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
-SUBSCRIPTION_LONG_RETRY_MAX_SECONDS = 86400
+USER_ENRICHMENT_LONG_RETRY_MAX_SECONDS = 86400
 METADATA_BATCH_MISS_LIMIT = 3
 METADATA_SINGLE_MISS_LIMIT = 2
 logger = logging.getLogger(__name__)
@@ -388,13 +388,15 @@ class CollectionWorker:
     async def _retry_or_fail(self, job: ClaimedJob, category: str, message: str) -> None:
         if job.job_type in {"collect_group_posts", "collect_subscription_group_posts"}:
             await self._mark_post_failure(job, None, message, terminal=False)
+        if job.job_type == "collect_user_posts":
+            await self._mark_user_post_failure(job, None, message, terminal=False)
         if job.job_type == "collect_user_subscriptions":
             await self._mark_subscriptions_transient(job)
-        durable_subscription = job.job_type == "collect_user_subscriptions" and category in {
-            "transient",
-            "vk_api",
-        }
-        if job.attempt_count >= len(RETRY_DELAYS) and not durable_subscription:
+        durable_user_enrichment = job.job_type in {
+            "collect_user_posts",
+            "collect_user_subscriptions",
+        } and category in {"transient", "vk_api"}
+        if job.attempt_count >= len(RETRY_DELAYS) and not durable_user_enrichment:
             await self._queue.finish(
                 job.id, JobStatus.FAILED, error_type=category, error_message=message
             )
@@ -404,7 +406,7 @@ class CollectionWorker:
         else:
             long_retry_step = min(2, job.attempt_count - len(RETRY_DELAYS))
             delay = min(
-                SUBSCRIPTION_LONG_RETRY_MAX_SECONDS,
+                USER_ENRICHMENT_LONG_RETRY_MAX_SECONDS,
                 RETRY_DELAYS[-1] * (2**long_retry_step),
             )
         retry_at = datetime.now(UTC) + timedelta(seconds=delay)
@@ -1507,6 +1509,10 @@ class CollectionWorker:
                 for raw in items:
                     published = _utc_from_timestamp(raw.get("date"))
                     if published is None or not isinstance(raw.get("id"), int):
+                        continue
+                    if published < cutoff and bool(raw.get("is_pinned", False)):
+                        # VK can put an old pinned post before newer wall entries. It is not
+                        # evidence that the rest of the page is outside the 180-day window.
                         continue
                     if published < cutoff:
                         reached_cutoff = True

@@ -120,6 +120,8 @@ async def test_user_posts_campaign_is_direct_idempotent_and_immutable() -> None:
                     "decision": "passed",
                     "current_database_bytes": 1,
                     "aggregate_projected_growth_bytes": 1024,
+                    "payload_projected_growth_bytes": 512,
+                    "snapshot_projected_growth_bytes": 512,
                     "projected_final_database_bytes": 2048,
                     "current_disk_free_bytes": 10 * 1024**3,
                     "safe_database_limit_bytes": 7 * 1024**3,
@@ -285,6 +287,7 @@ async def test_live_capacity_recheck_stops_next_user_post_cohort() -> None:
                             "projected_final_database_bytes": 0,
                             "due_users": 2,
                             "aggregate_projected_growth_bytes": 0,
+                            "payload_projected_growth_bytes": 0,
                             "safe_database_limit_bytes": 7 * 1024**3,
                             "collection": CollectionQueue(
                                 sessions, settings
@@ -319,6 +322,83 @@ async def test_live_capacity_recheck_stops_next_user_post_cohort() -> None:
                             or 0
                         )
                         == 0
+                    )
+                    campaign.status = "failed"
+                    campaign.phase = CampaignPhase.FAILED.value
+                    campaign.finished_at = datetime.now(UTC)
+                    await session.commit()
+
+                # A smaller live database is extra headroom, not a capacity violation. The
+                # next cohort must still be materialized when the remaining payload fits.
+                async with sessions() as session:
+                    now = datetime.now(UTC)
+                    session.add_all(
+                        [
+                            VKUser(
+                                vk_id=marker + 10,
+                                is_closed=False,
+                                can_access_closed=False,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                            ),
+                            VKUser(
+                                vk_id=marker + 11,
+                                is_closed=False,
+                                can_access_closed=False,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                            ),
+                        ]
+                    )
+                    pass_campaign = CollectionCampaign(
+                        campaign_type="user_posts_enrichment",
+                        status="running",
+                        phase=CampaignPhase.USER_POSTS_COLLECTION.value,
+                        snapshot_at=now,
+                        snapshot_max_user_id=marker + 11,
+                        snapshot_user_count=2,
+                        last_planned_user_id=marker + 10,
+                        configuration={
+                            "current_database_bytes": 7 * 1024**3,
+                            "projected_final_database_bytes": 7 * 1024**3,
+                            "due_users": 2,
+                            "aggregate_projected_growth_bytes": 0,
+                            "payload_projected_growth_bytes": 0,
+                            "safe_database_limit_bytes": 7 * 1024**3,
+                            "collection": CollectionQueue(
+                                sessions, settings
+                            ).collection_configuration(),
+                        },
+                        configuration_hash=uuid.uuid4().hex,
+                    )
+                    session.add(pass_campaign)
+                    await session.flush()
+                    session.add_all(
+                        [
+                            CollectionCampaignUser(
+                                campaign_id=pass_campaign.id, user_id=marker + 10
+                            ),
+                            CollectionCampaignUser(
+                                campaign_id=pass_campaign.id, user_id=marker + 11
+                            ),
+                        ]
+                    )
+                    await session.commit()
+                    pass_campaign_id = pass_campaign.id
+                await UserPostCampaignManager(sessions, settings).reconcile(pass_campaign_id)
+                async with sessions() as session:
+                    pass_campaign = await session.get(CollectionCampaign, pass_campaign_id)
+                    assert pass_campaign is not None and pass_campaign.status == "running"
+                    assert (
+                        int(
+                            await session.scalar(
+                                select(func.count(CollectionRun.id)).where(
+                                    CollectionRun.campaign_id == pass_campaign_id
+                                )
+                            )
+                            or 0
+                        )
+                        == 1
                     )
             finally:
                 await outer.rollback()
@@ -519,6 +599,13 @@ async def test_user_wall_checkpoint_cutoff_zero_and_idempotency() -> None:
                                 first_seen_at=now,
                                 last_seen_at=now,
                             ),
+                            VKUser(
+                                vk_id=marker + 5,
+                                is_closed=False,
+                                can_access_closed=False,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                            ),
                         ]
                     )
                     run = CollectionRun(scope="user_posts_pilot", total_jobs=1)
@@ -529,6 +616,7 @@ async def test_user_wall_checkpoint_cutoff_zero_and_idempotency() -> None:
                         job_type="collect_user_posts",
                         entity_type="user",
                         entity_id=marker,
+                        attempt_count=5,
                     )
                     session.add(job)
                     await session.commit()
@@ -638,6 +726,44 @@ async def test_user_wall_checkpoint_cutoff_zero_and_idempotency() -> None:
                     cutoff_state = await session.get(UserPostCollectionState, marker + 2)
                     assert cutoff_state is not None and cutoff_state.collected_count == 5
                     assert int(await session.scalar(select(func.count(UserPost.id))) or 0) == 25
+                    pinned_run = CollectionRun(scope="user_posts_pilot", total_jobs=1)
+                    session.add(pinned_run)
+                    await session.flush()
+                    session.add(
+                        CollectionJob(
+                            collection_run_id=pinned_run.id,
+                            job_type="collect_user_posts",
+                            entity_type="user",
+                            entity_id=marker + 5,
+                        )
+                    )
+                    await session.commit()
+                    pinned_run_id = pinned_run.id
+                pinned_items: list[dict[str, object]] = [
+                    {
+                        "id": 299,
+                        "owner_id": marker + 5,
+                        "date": int((now - timedelta(days=181)).timestamp()),
+                        "text": "old-pinned",
+                        "is_pinned": 1,
+                    },
+                    *[
+                        {
+                            "id": 300 + index,
+                            "owner_id": marker + 5,
+                            "date": int((now - timedelta(days=index)).timestamp()),
+                            "text": f"after-pinned-{index}",
+                        }
+                        for index in range(3)
+                    ],
+                ]
+                await CollectionWorker(  # type: ignore[arg-type]
+                    sessions, WallVK(pinned_items), settings
+                ).run(pinned_run_id)
+                async with sessions() as session:
+                    pinned_state = await session.get(UserPostCollectionState, marker + 5)
+                    assert pinned_state is not None and pinned_state.collected_count == 3
+                    assert int(await session.scalar(select(func.count(UserPost.id))) or 0) == 28
                     terminal_run = CollectionRun(scope="user_posts_pilot", total_jobs=2)
                     session.add(terminal_run)
                     await session.flush()

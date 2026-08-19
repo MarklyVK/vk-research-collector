@@ -71,6 +71,9 @@ def test_user_posts_capacity_projection_is_aggregate_and_reserved() -> None:
     assert result["decision"] == "passed"
     assert result["reserve_factor"] == 1.30
     assert result["aggregate_projected_growth_bytes"] > 900 * 20_000
+    assert result["aggregate_projected_growth_bytes"] == (
+        result["payload_projected_growth_bytes"] + result["snapshot_projected_growth_bytes"]
+    )
 
 
 def test_user_posts_capacity_projection_rejects_full_snapshot() -> None:

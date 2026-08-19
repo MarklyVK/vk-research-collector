@@ -99,9 +99,9 @@ def build_user_posts_capacity_projection(
     snapshot_bytes = snapshot_users * (
         SNAPSHOT_HEAP_BYTES_PER_USER + SNAPSHOT_PRIMARY_KEY_BYTES_PER_USER
     )
-    aggregate_growth = math.ceil(
-        (due_users * per_due_user + snapshot_bytes) * MINIMUM_RESERVE_FACTOR
-    )
+    payload_growth = math.ceil(due_users * per_due_user * MINIMUM_RESERVE_FACTOR)
+    snapshot_growth = math.ceil(snapshot_bytes * MINIMUM_RESERVE_FACTOR)
+    aggregate_growth = payload_growth + snapshot_growth
     projected_database = database_bytes + aggregate_growth
     projected_used = (
         100.0 * (disk.total_bytes - disk.free_bytes + aggregate_growth) / disk.total_bytes
@@ -123,7 +123,8 @@ def build_user_posts_capacity_projection(
         "modeled_payload_bytes_per_user": modeled_payload,
         "state_bytes_per_user": STATE_BYTES_PER_USER,
         "job_bytes_per_user": JOB_BYTES_PER_USER,
-        "snapshot_projected_growth_bytes": snapshot_bytes,
+        "payload_projected_growth_bytes": payload_growth,
+        "snapshot_projected_growth_bytes": snapshot_growth,
         "aggregate_projected_growth_bytes": aggregate_growth,
         "current_database_bytes": database_bytes,
         "projected_final_database_bytes": projected_database,
@@ -429,6 +430,8 @@ class UserPostCampaignManager:
         for key in (
             "current_database_bytes",
             "aggregate_projected_growth_bytes",
+            "payload_projected_growth_bytes",
+            "snapshot_projected_growth_bytes",
             "projected_final_database_bytes",
             "current_disk_free_bytes",
             "safe_database_limit_bytes",
@@ -440,16 +443,22 @@ class UserPostCampaignManager:
         safe_limit = gate_evidence.get("safe_database_limit_bytes")
         current_database = gate_evidence.get("current_database_bytes")
         aggregate_growth = gate_evidence.get("aggregate_projected_growth_bytes")
+        payload_growth = gate_evidence.get("payload_projected_growth_bytes")
+        snapshot_growth = gate_evidence.get("snapshot_projected_growth_bytes")
         disk_free = gate_evidence.get("current_disk_free_bytes")
         assert isinstance(projected_final, int)
         assert isinstance(safe_limit, int)
         assert isinstance(current_database, int)
         assert isinstance(aggregate_growth, int)
+        assert isinstance(payload_growth, int)
+        assert isinstance(snapshot_growth, int)
         assert isinstance(disk_free, int)
         if safe_limit != SAFE_DISK_LIMIT_BYTES:
             raise ValueError("Capacity evidence содержит неожиданный safe database limit")
         if projected_final < current_database + aggregate_growth:
             raise ValueError("Capacity evidence занижает projected final database")
+        if aggregate_growth < payload_growth + snapshot_growth:
+            raise ValueError("Capacity evidence занижает payload/snapshot projection")
         if projected_final > safe_limit:
             raise ValueError("Capacity evidence превышает safe database limit")
         if aggregate_growth > disk_free:
@@ -552,19 +561,24 @@ class UserPostCampaignManager:
         initial = campaign.configuration.get("current_database_bytes")
         projected = campaign.configuration.get("projected_final_database_bytes")
         due = campaign.configuration.get("due_users")
-        growth = campaign.configuration.get("aggregate_projected_growth_bytes")
-        if not all(isinstance(v, int) and v >= 0 for v in (initial, projected, due, growth)):
+        payload_growth = campaign.configuration.get("payload_projected_growth_bytes")
+        if not all(
+            isinstance(v, int) and v >= 0 for v in (initial, projected, due, payload_growth)
+        ):
             self._pause_capacity(campaign, "Aggregate user-post evidence повреждён")
             return False
         assert isinstance(initial, int)
         assert isinstance(projected, int)
         assert isinstance(due, int)
-        assert isinstance(growth, int)
+        assert isinstance(payload_growth, int)
         current = int(
             await session.scalar(select(func.pg_database_size(func.current_database()))) or 0
         )
         unresolved = await self._unresolved_count(session, campaign)
-        remaining = math.ceil(growth * unresolved / due) if due else 0
+        # Snapshot rows have already been materialized before this recheck. Scale only the
+        # reserved post/state/job payload, otherwise every next cohort counts the snapshot
+        # twice and can pause a campaign whose aggregate gate still has enough headroom.
+        remaining = math.ceil(payload_growth * unresolved / due) if due else 0
         disk = inspect_disk(
             self._settings.collection_export_dir,
             self._settings.disk_warning_percent,
@@ -577,8 +591,7 @@ class UserPostCampaignManager:
             else 100.0
         )
         if (
-            current < initial
-            or required_final > projected
+            required_final > projected
             or required_final > SAFE_DISK_LIMIT_BYTES
             or remaining > disk.free_bytes
             or disk.warning

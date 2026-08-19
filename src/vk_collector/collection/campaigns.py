@@ -577,8 +577,7 @@ class CampaignManager:
             else 100.0
         )
         if (
-            current_database < initial_database
-            or required_final > projected_final
+            required_final > projected_final
             or required_final > SAFE_DISK_LIMIT_BYTES
             or remaining_growth > disk.free_bytes
             or disk.warning
