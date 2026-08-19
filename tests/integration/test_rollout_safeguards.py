@@ -9,7 +9,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from vk_collector.cli.app import _validate_autonomous_run
 from vk_collector.collection.campaigns import CampaignManager
-from vk_collector.collection.pilots import cancel_pilot, pilot_previews
+from vk_collector.collection.pilots import (
+    cancel_pilot,
+    finalize_deferred_subscription_pilot,
+    pilot_previews,
+)
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.worker import CollectionWorker
 from vk_collector.config import Settings
@@ -75,6 +79,73 @@ class MetadataVK:
             }
             for value in ids
         ]
+
+
+@pytest.mark.asyncio
+async def test_finalize_deferred_subscription_pilot_preserves_checkpoint() -> None:
+    engine = create_database_engine(database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(
+        database_url=database_url(),
+        collection_export_dir=".",
+        collection_subscription_pilot_min_users=1,
+    )
+    try:
+        async with sessions() as session:
+            run = CollectionRun(
+                scope="subscriptions_pilot",
+                status=CollectionRunStatus.RUNNING,
+                total_jobs=2,
+                completed_jobs=1,
+                configuration={
+                    "collection": CollectionQueue(sessions, settings).collection_configuration()
+                },
+            )
+            session.add(run)
+            await session.flush()
+            completed = CollectionJob(
+                collection_run_id=run.id,
+                job_type="collect_user_subscriptions",
+                entity_type="user",
+                entity_id=int(uuid.uuid4().hex[:10], 16),
+                status=JobStatus.COMPLETED,
+                finished_at=datetime.now(UTC),
+            )
+            deferred = CollectionJob(
+                collection_run_id=run.id,
+                job_type="collect_user_subscriptions",
+                entity_type="user",
+                entity_id=int(uuid.uuid4().hex[:10], 16),
+                status=JobStatus.RETRY_WAIT,
+                next_attempt_at=datetime.now(UTC) + timedelta(hours=6),
+                checkpoint={"offset": 50, "collected": 50},
+            )
+            session.add_all([completed, deferred])
+            await session.commit()
+            run_id, deferred_id = run.id, deferred.id
+
+        result = await finalize_deferred_subscription_pilot(
+            sessions,
+            settings,
+            run_id,
+            confirmation="FINALIZE_DEFERRED_SUBSCRIPTION_PILOT",
+        )
+        assert result["status"] == "completed"
+        assert result["deferred_jobs_finalized"] == 1
+        assert result["jobs_checkpoints_data_deleted"] is False
+        async with sessions() as session:
+            stored_run = await session.get(CollectionRun, run_id)
+            stored_job = await session.get(CollectionJob, deferred_id)
+            assert stored_run is not None
+            assert stored_run.status == CollectionRunStatus.COMPLETED
+            assert stored_run.completed_jobs == 1
+            assert stored_run.skipped_jobs == 1
+            assert stored_job is not None
+            assert stored_job.status == JobStatus.SKIPPED
+            assert stored_job.checkpoint == {"offset": 50, "collected": 50}
+            assert stored_job.next_attempt_at is None
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

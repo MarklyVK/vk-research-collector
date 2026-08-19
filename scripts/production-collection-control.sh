@@ -386,10 +386,22 @@ start_subscriptions() {
       IFS='|' read -r production_allowed retryable_pilot deferred_pilot <<< "$pilot_state"
       [[ "$production_allowed" == true ]] && break
       if [[ "$deferred_pilot" == true ]]; then
-        log 'Pilot сохранил transient retry; следующий hourly-control выберет тот же run ID.'
-        restart_worker
-        trap - EXIT
-        return
+        pilot_run_id=$(python3 -c \
+          'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["run_id"])' \
+          "$report_path")
+        log "Pilot набрал репрезентативный минимум; завершаю deferred jobs без удаления данных, run ID $pilot_run_id."
+        collector collection subscriptions finalize-deferred-pilot \
+          --run-id "$pilot_run_id" \
+          --confirmation FINALIZE_DEFERRED_SUBSCRIPTION_PILOT
+        collector collection subscriptions finalized-pilot-report \
+          --run-id "$pilot_run_id" \
+          --confirmation REPORT_FINALIZED_SUBSCRIPTION_PILOT
+        pilot_state=$(python3 -c \
+          'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(str(p["production_allowed"] is True).lower())' \
+          "$report_path")
+        [[ "$pilot_state" == true ]] \
+          || die 'Завершённый Pilot A не прошёл собственный capacity gate.'
+        break
       fi
       if [[ "$retryable_pilot" == true && "$pilot_attempt" -lt 3 ]]; then
         log 'Pilot целиком пропущен из-за terminal-состояний; выбираю следующую cohort.'

@@ -220,6 +220,105 @@ async def cancel_pilot(
         }
 
 
+async def finalize_deferred_subscription_pilot(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    run_id: uuid.UUID,
+    *,
+    confirmation: str,
+) -> dict[str, Any]:
+    """Finish a representative Pilot A without waiting hours for isolated transient users.
+
+    Deferred users are not treated as resolved: only their pilot jobs become skipped. A
+    later production campaign snapshots the same due users and creates fresh durable jobs
+    for them. No checkpoints, errors, states, subscriptions or other collected data are
+    deleted.
+    """
+    expected_confirmation = "FINALIZE_DEFERRED_SUBSCRIPTION_PILOT"
+    if confirmation != expected_confirmation:
+        raise ValueError(f"Требуется точное confirmation {expected_confirmation}")
+    now = datetime.now(UTC)
+    expected = CollectionQueue(sessions, settings).collection_configuration()
+    async with sessions() as session:
+        run = await session.get(CollectionRun, run_id, with_for_update=True)
+        if run is None or run.scope != "subscriptions_pilot":
+            raise ValueError("Pilot A не найден")
+        if run.status in TERMINAL_RUN_STATUSES:
+            raise ValueError("Pilot A уже terminal")
+        if run.configuration.get("collection") != expected:
+            raise ValueError("Pilot A несовместим с текущей runtime-конфигурацией")
+        counts = (
+            await session.execute(
+                select(CollectionJob.status, func.count(CollectionJob.id))
+                .where(CollectionJob.collection_run_id == run_id)
+                .group_by(CollectionJob.status)
+            )
+        ).all()
+        by_status = {status: int(count) for status, count in counts}
+        if by_status.get(JobStatus.FAILED, 0):
+            raise ValueError("Pilot A содержит failed jobs и не может быть завершён как измеряемый")
+        if any(
+            by_status.get(status, 0)
+            for status in (JobStatus.PENDING, JobStatus.RUNNING, JobStatus.PAUSED)
+        ):
+            raise ValueError("Pilot A ещё содержит готовые или выполняющиеся jobs")
+        completed = by_status.get(JobStatus.COMPLETED, 0)
+        if completed < settings.collection_subscription_pilot_min_users:
+            raise ValueError("Pilot A не набрал минимальное число успешных измерений")
+        deferred = by_status.get(JobStatus.RETRY_WAIT, 0)
+        if deferred <= 0:
+            raise ValueError("Pilot A не содержит deferred jobs")
+        changed = await session.execute(
+            update(CollectionJob)
+            .where(
+                CollectionJob.collection_run_id == run_id,
+                CollectionJob.status == JobStatus.RETRY_WAIT,
+            )
+            .values(
+                status=JobStatus.SKIPPED,
+                next_attempt_at=None,
+                locked_at=None,
+                locked_by=None,
+                heartbeat_at=None,
+                finished_at=now,
+                last_error_type="pilot_measurement_deferred",
+                last_error_message=(
+                    "Transient pilot job отложен до production campaign; "
+                    "собранные данные и checkpoint сохранены"
+                ),
+                error_message=(
+                    "Transient pilot job отложен до production campaign; "
+                    "собранные данные и checkpoint сохранены"
+                ),
+            )
+        )
+        finalized = int(changed.rowcount or 0)  # type: ignore[attr-defined]
+        if finalized != deferred:
+            raise ValueError("Состав deferred jobs изменился; повторите preview")
+        run.status = CollectionRunStatus.COMPLETED
+        run.finished_at = now
+        run.next_wakeup_at = None
+        run.completed_jobs = completed
+        run.failed_jobs = 0
+        run.skipped_jobs = by_status.get(JobStatus.SKIPPED, 0) + finalized
+        run.configuration = {
+            **run.configuration,
+            "deferred_pilot_jobs_finalized": finalized,
+            "deferred_pilot_finalized_at": now.isoformat(),
+        }
+        run.error_message = None
+        await session.commit()
+        return {
+            "run_id": str(run_id),
+            "status": "completed",
+            "completed_jobs": completed,
+            "deferred_jobs_finalized": finalized,
+            "minimum_successful_measurements": settings.collection_subscription_pilot_min_users,
+            "jobs_checkpoints_data_deleted": False,
+            "deferred_users_remain_due_for_production": True,
+        }
+
+
 async def quarantine_incompatible_pilots(
     sessions: async_sessionmaker[AsyncSession],
     settings: Settings,

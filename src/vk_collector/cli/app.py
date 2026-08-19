@@ -41,6 +41,7 @@ from vk_collector.collection.notifications import notify
 from vk_collector.collection.pilots import (
     cancel_pilot,
     choose_pilot_control_action,
+    finalize_deferred_subscription_pilot,
     pilot_previews,
     quarantine_incompatible_pilots,
 )
@@ -1518,8 +1519,34 @@ def subscriptions_pilot(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+@subscriptions_app.command("finalized-pilot-report")
+def subscriptions_finalized_pilot_report(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+) -> None:
+    """Пересобрать capacity report для явно завершённого deferred Pilot A."""
+    if confirmation != "REPORT_FINALIZED_SUBSCRIPTION_PILOT":
+        typer.echo(
+            "Capacity report отклонён: требуется точное confirmation "
+            "REPORT_FINALIZED_SUBSCRIPTION_PILOT",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        payload = asyncio.run(_run_subscription_pilot("A", run_id=run_id, finalized_report=True))
+    except ValueError as exc:
+        typer.echo(f"Capacity report завершённого Pilot A отклонён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 async def _pilot_control(
-    *, cancel_run_id: uuid.UUID | None = None, reason: str = "", confirm: bool = False
+    *,
+    cancel_run_id: uuid.UUID | None = None,
+    finalize_run_id: uuid.UUID | None = None,
+    reason: str = "",
+    confirm: bool = False,
+    confirmation: str = "",
 ) -> dict[str, Any]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -1529,6 +1556,13 @@ async def _pilot_control(
             if not confirm:
                 raise ValueError("Отмена pilot требует --confirm")
             return await cancel_pilot(sessions, cancel_run_id, reason=reason)
+        if finalize_run_id is not None:
+            return await finalize_deferred_subscription_pilot(
+                sessions,
+                settings,
+                finalize_run_id,
+                confirmation=confirmation,
+            )
         rows = await pilot_previews(sessions, settings)
         return {"pilots": rows, "decision": choose_pilot_control_action(rows)}
     finally:
@@ -1561,6 +1595,20 @@ def subscriptions_cancel_pilot(
         payload = asyncio.run(_pilot_control(cancel_run_id=run_id, reason=reason, confirm=confirm))
     except ValueError as exc:
         typer.echo(f"Отмена pilot отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@subscriptions_app.command("finalize-deferred-pilot")
+def subscriptions_finalize_deferred_pilot(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+) -> None:
+    """Завершить измеряемый Pilot A с изолированными transient jobs без удаления данных."""
+    try:
+        payload = asyncio.run(_pilot_control(finalize_run_id=run_id, confirmation=confirmation))
+    except ValueError as exc:
+        typer.echo(f"Завершение deferred Pilot A отклонено: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -2033,6 +2081,7 @@ async def _run_subscription_pilot(
     source_run_id: uuid.UUID | None = None,
     max_jobs: int | None = None,
     run_id: uuid.UUID | None = None,
+    finalized_report: bool = False,
 ) -> dict[str, Any]:
     """Выполнить измеряемый Pilot A/B; незавершённый pilot оставляет gate закрытым."""
     settings = get_settings()
@@ -2057,7 +2106,10 @@ async def _run_subscription_pilot(
                 raise ValueError(
                     "Pilot ожидает persisted retry до " + str(preview["nearest_retry"])
                 )
-            if preview["classification"] not in {
+            if preview["classification"] == "terminal":
+                if not finalized_report or preview["status"] != "completed":
+                    raise ValueError("Pilot уже terminal")
+            elif preview["classification"] not in {
                 "compatible_recoverable",
                 "stale_running_lease",
             }:
@@ -2068,6 +2120,10 @@ async def _run_subscription_pilot(
             pilot_run = await session.get(CollectionRun, run_id, with_for_update=True)
             if pilot_run is None:
                 raise ValueError("Pilot run исчез до выполнения")
+            if finalized_report and not isinstance(
+                pilot_run.configuration.get("deferred_pilot_jobs_finalized"), int
+            ):
+                raise ValueError("Pilot не был явно завершён из deferred-состояния")
             stored_baseline = pilot_run.configuration.get("measurement_baseline")
             raw_previous_duration = pilot_run.configuration.get("measurement_duration_seconds", 0)
             previous_duration = (
@@ -2088,14 +2144,18 @@ async def _run_subscription_pilot(
                 }
                 await session.commit()
         started_at = time.monotonic()
-        _, processed = await _execute_collection(
-            run_id,
-            None,
-            max_jobs,
-            until_idle=True,
-            explicit_pilot=True,
-        )
-        duration_seconds = previous_duration + time.monotonic() - started_at
+        if finalized_report:
+            processed = 0
+            duration_seconds = previous_duration
+        else:
+            _, processed = await _execute_collection(
+                run_id,
+                None,
+                max_jobs,
+                until_idle=True,
+                explicit_pilot=True,
+            )
+            duration_seconds = previous_duration + time.monotonic() - started_at
         async with sessions() as session:
             pilot_run = await session.get(CollectionRun, run_id, with_for_update=True)
             if pilot_run is not None:

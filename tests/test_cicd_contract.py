@@ -314,7 +314,10 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "безопасный self-heal",
         "'subscription_discovery','subscription_metadata'",
         "deferred_pilot",
-        "следующий hourly-control выберет тот же run ID",
+        "finalize-deferred-pilot",
+        "FINALIZE_DEFERRED_SUBSCRIPTION_PILOT",
+        "finalized-pilot-report",
+        "REPORT_FINALIZED_SUBSCRIPTION_PILOT",
     )
     assert all(item in script for item in required)
     active_run_query = script.split("active_runs=$(", 1)[1].split(
