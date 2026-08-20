@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     vk_api_version: str = "5.199"
     vk_tokens_file: Path = Path("/run/secrets/vk_tokens.txt")
     vk_request_timeout_seconds: float = 30
-    vk_max_concurrency: int = Field(default=3, ge=1)
+    vk_max_concurrency: int = Field(default=6, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
     vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     collection_disk_min_free_bytes: int = Field(default=0, ge=0)
     collection_safe_database_limit_bytes: int = Field(default=7 * 1024**3, ge=1024**3)
     collection_worker_id: str = "collector-1"
-    collection_max_concurrency: int = Field(default=3, ge=1, le=10)
+    collection_max_concurrency: int = Field(default=6, ge=1, le=10)
     collection_job_lease_seconds: int = Field(default=300, ge=30)
     collection_job_heartbeat_seconds: int = Field(default=60, ge=10)
     collection_idle_sleep_seconds: float = Field(default=5, ge=0.1)
@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     collection_light_repair_cohort_size: int = Field(default=10_000, ge=1, le=10_000)
     collection_community_metadata_batch_size: int = Field(default=100, ge=1, le=100)
     collection_community_metadata_ttl_days: int = Field(default=30, ge=1)
-    collection_scheduler_quantum: int = Field(default=10, ge=1, le=100)
+    collection_scheduler_quantum: int = Field(default=30, ge=1, le=100)
     collection_subscription_pilot_users: int = Field(default=500, ge=1, le=500)
     collection_subscription_pilot_min_users: int = Field(default=100, ge=1, le=500)
     collection_subscription_snapshot_user_limit: int | None = Field(default=None, ge=1)
@@ -143,6 +143,11 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.postgres_user}:{password}@"
             f"{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def effective_collection_concurrency(self) -> int:
+        """Ограничить worker одновременно его лимитом и общим VK concurrency cap."""
+        return min(self.collection_max_concurrency, self.vk_max_concurrency)
 
     @property
     def telegram_token(self) -> str:

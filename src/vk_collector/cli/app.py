@@ -725,6 +725,14 @@ async def _collection_worker_service() -> None:
     active_token_fingerprints: set[str] = set()
     run_cursor = 0
     backup_verifier = BackupVerifier()
+    logger.info(
+        "worker_scheduler_started configured_concurrency=%s vk_concurrency_cap=%s "
+        "effective_concurrency=%s scheduler_quantum=%s",
+        settings.collection_max_concurrency,
+        settings.vk_max_concurrency,
+        settings.effective_collection_concurrency,
+        settings.collection_scheduler_quantum,
+    )
     loop = asyncio.get_running_loop()
     for handled_signal in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, RuntimeError):
@@ -823,12 +831,13 @@ async def _collection_worker_service() -> None:
                 if stop_event.is_set():
                     break
                 try:
-                    await _validate_autonomous_run(
+                    claim_scope = await _validate_autonomous_run(
                         sessions, settings, target, backup_verifier=backup_verifier
                     )
                     assert worker is not None
                     processed += await worker.run(
                         target,
+                        scope=claim_scope,
                         max_jobs=settings.collection_scheduler_quantum,
                         stop_event=stop_event,
                         until_idle=True,
@@ -860,7 +869,7 @@ async def _validate_autonomous_run(
     run_id: uuid.UUID,
     *,
     backup_verifier: BackupVerifier | None = None,
-) -> None:
+) -> str | None:
     """Revalidate immutable configuration, report and backup before autonomous claim."""
     queue = CollectionQueue(sessions, settings)
     async with sessions() as session:
@@ -901,7 +910,7 @@ async def _validate_autonomous_run(
             ):
                 raise ValueError("User-post aggregate capacity evidence отклонён")
             (backup_verifier or BackupVerifier()).verify(Path(str(backup["path"])), expected=backup)
-            return
+            return "user_posts"
         if run.scope in {
             "subscriptions",
             "subscription_discovery",
@@ -926,6 +935,13 @@ async def _validate_autonomous_run(
                 max_age_days=settings.collection_capacity_report_max_age_days,
             )
             (backup_verifier or BackupVerifier()).verify(Path(str(backup["path"])), expected=backup)
+            return {
+                "subscriptions": "subscriptions",
+                "subscription_discovery": "subscriptions",
+                "subscription_metadata": "metadata",
+                "subscription_posts": "subscription_posts",
+            }[run.scope]
+        return None
 
 
 @collection_app.command("worker")

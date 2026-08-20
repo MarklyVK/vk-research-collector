@@ -544,11 +544,30 @@ async def test_three_scheduler_quantum_hash_backup_once(
 
     monkeypatch.setattr(Path, "open", counted_open)
     verifier = BackupVerifier()
+    claim_scopes = []
     for _ in range(3):
-        await _validate_autonomous_run(  # type: ignore[arg-type]
-            FakeSessions(), settings, uuid.uuid4(), backup_verifier=verifier
+        claim_scopes.append(
+            await _validate_autonomous_run(  # type: ignore[arg-type]
+                FakeSessions(), settings, uuid.uuid4(), backup_verifier=verifier
+            )
         )
     assert reads == 1
+    assert claim_scopes == ["subscriptions"] * 3
+
+
+def test_collection_concurrency_respects_both_worker_and_vk_caps() -> None:
+    assert (
+        Settings(
+            collection_max_concurrency=6, vk_max_concurrency=6
+        ).effective_collection_concurrency
+        == 6
+    )
+    assert (
+        Settings(
+            collection_max_concurrency=8, vk_max_concurrency=4
+        ).effective_collection_concurrency
+        == 4
+    )
 
 
 def test_compose_defines_restartable_autonomous_worker() -> None:

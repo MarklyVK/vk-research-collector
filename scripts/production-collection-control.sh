@@ -123,7 +123,9 @@ report() {
     COLLECTION_USERS_ENABLED COLLECTION_SUBSCRIPTIONS_ENABLED \
     COLLECTION_SUBSCRIPTIONS_MAX_PER_USER COLLECTION_SUBSCRIPTIONS_PAGE_SIZE \
     COLLECTION_SUBSCRIPTIONS_USERS_PER_RUN COLLECTION_SUBSCRIPTION_PILOT_USERS \
-    COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED COLLECTION_SUBSCRIPTION_GROUP_POSTS_MAX; do
+    COLLECTION_SUBSCRIPTION_GROUP_POSTS_ENABLED COLLECTION_SUBSCRIPTION_GROUP_POSTS_MAX \
+    VK_MAX_CONCURRENCY VK_PER_TOKEN_RPS COLLECTION_MAX_CONCURRENCY \
+    COLLECTION_SCHEDULER_QUANTUM; do
     printf '%s=%s\n' "$key" "$(env_value "$key")"
   done
 
@@ -472,6 +474,25 @@ quarantine_incompatible_pilots() {
     --confirmation QUARANTINE_INCOMPATIBLE_PILOTS
 }
 
+accelerate_active_collection() {
+  local attempt worker_logs
+  log 'Включаю безопасное ускорение: concurrency 6, quantum 30, VK RPS остаётся 2.5 на токен.'
+  set_env_value VK_MAX_CONCURRENCY 6
+  set_env_value COLLECTION_MAX_CONCURRENCY 6
+  set_env_value COLLECTION_SCHEDULER_QUANTUM 30
+  compose up -d --no-deps --no-build --force-recreate collector-worker
+  ensure_worker_healthy
+  for attempt in {1..30}; do
+    worker_logs=$(compose logs --since 5m --no-color collector-worker 2>&1 || true)
+    if grep -F 'effective_concurrency=6 scheduler_quantum=30' <<< "$worker_logs" >/dev/null; then
+      log 'Новый worker подтвердил effective_concurrency=6 и scheduler_quantum=30.'
+      return 0
+    fi
+    sleep 2
+  done
+  die 'Новый worker healthy, но не подтвердил ускоренную scheduler-конфигурацию в логах.'
+}
+
 start_budgeted_collection() {
   log 'Включаю owner-authorized bounded collection с абсолютным резервом 2 GiB.'
   set_env_value DISK_WARNING_PERCENT 90
@@ -518,12 +539,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --action) ACTION=${2:?}; shift 2 ;;
     --deploy-dir) DEPLOY_DIR=${2:?}; shift 2 ;;
-    -h|--help) printf 'usage: %s --action report|start-subscriptions|start-user-posts|start-budgeted-collection|quarantine-incompatible-pilots [--deploy-dir PATH]\n' "$0"; exit 0 ;;
+    -h|--help) printf 'usage: %s --action report|start-subscriptions|start-user-posts|start-budgeted-collection|accelerate-active-collection|quarantine-incompatible-pilots [--deploy-dir PATH]\n' "$0"; exit 0 ;;
     *) die "Неизвестный аргумент: $1" ;;
   esac
 done
 
-[[ "$ACTION" == report || "$ACTION" == start-subscriptions || "$ACTION" == start-user-posts || "$ACTION" == start-budgeted-collection || "$ACTION" == quarantine-incompatible-pilots ]] \
+[[ "$ACTION" == report || "$ACTION" == start-subscriptions || "$ACTION" == start-user-posts || "$ACTION" == start-budgeted-collection || "$ACTION" == accelerate-active-collection || "$ACTION" == quarantine-incompatible-pilots ]] \
   || die "Неизвестное действие: $ACTION"
 for command in docker flock realpath sed awk find sort df grep mktemp python3 chmod chown; do
   command -v "$command" >/dev/null 2>&1 || die "Не найдена команда: $command"
@@ -563,6 +584,11 @@ fi
 if [[ "$ACTION" == start-budgeted-collection ]]; then
   start_budgeted_collection
   log 'Срез после запуска bounded subscriptions и user posts:'
+  report
+fi
+if [[ "$ACTION" == accelerate-active-collection ]]; then
+  accelerate_active_collection
+  log 'Срез после безопасного ускорения активного сбора:'
   report
 fi
 if [[ "$ACTION" == quarantine-incompatible-pilots ]]; then

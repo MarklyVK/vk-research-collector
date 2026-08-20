@@ -141,6 +141,7 @@ class CollectionWorker:
             1.0,
             min(60.0, self._settings.collection_job_lease_seconds / 2),
         )
+        effective_concurrency = self._settings.effective_collection_concurrency
         next_recovery_at = time.monotonic() + recovery_interval
         while stop_event is None or not stop_event.is_set():
             if time.monotonic() >= next_recovery_at:
@@ -173,9 +174,7 @@ class CollectionWorker:
                 disk_warning_sent = True
             elif not disk.warning:
                 disk_warning_sent = False
-            while len(tasks) < self._settings.collection_max_concurrency and (
-                max_jobs is None or claimed < max_jobs
-            ):
+            while len(tasks) < effective_concurrency and (max_jobs is None or claimed < max_jobs):
                 job = await self._claim_next(run_id, scope)
                 if job is None:
                     break

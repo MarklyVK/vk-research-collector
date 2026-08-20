@@ -33,6 +33,12 @@
 11. Mutating start требует ручного workflow_dispatch и точного confirmation.
 12. Subscription posts и массовый `wall.get` остаются выключенными.
 13. Тесты не используют реальные VK-токены и не ждут реальные минуты.
+14. Однотипные campaign runs используют прямой claim своего job type без перебора
+    неактивных очередей; worker ограничивает effective concurrency минимумом из
+    `COLLECTION_MAX_CONCURRENCY` и `VK_MAX_CONCURRENCY`.
+15. Production-ускорение требует отдельного ручного action и точного confirmation,
+    не увеличивает `VK_PER_TOKEN_RPS`, не меняет immutable collection configuration
+    и после рестарта проверяет фактические параметры нового worker по его логам.
 14. Deployment требует валидный backup, Alembic upgrade, exact image SHA и успешные
     health checks PostgreSQL и worker.
 15. `user_posts_enrichment` использует отдельный immutable snapshot с тем же eligible

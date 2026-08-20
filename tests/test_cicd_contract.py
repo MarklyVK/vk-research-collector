@@ -275,6 +275,7 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
     assert "schedule' && 'start-subscriptions'" not in workflow_text
     assert "START_USER_POSTS" in workflow_text
     assert "START_BUDGETED_COLLECTION" in workflow_text
+    assert "ACCELERATE_ACTIVE_COLLECTION" in workflow_text
     assert "QUARANTINE_INCOMPATIBLE_PILOTS" in workflow_text
     assert "collection user-posts pilot" in script
     assert "collection user-posts capacity-apply" in script
@@ -327,6 +328,9 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "COLLECTION_SUBSCRIPTION_SNAPSHOT_USER_LIMIT 150000",
         "COLLECTION_USER_POSTS_SNAPSHOT_USER_LIMIT 250000",
         "SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS",
+        "COLLECTION_MAX_CONCURRENCY 6",
+        "COLLECTION_SCHEDULER_QUANTUM 30",
+        "effective_concurrency=6 scheduler_quantum=30",
     )
     assert all(item in script for item in required)
     active_run_query = script.split("active_runs=$(", 1)[1].split(

@@ -87,6 +87,12 @@ Scheduled production workflow работает только в report-only ре�
 доступен лишь через ручной workflow_dispatch с точным confirmation. Subscription posts
 и массовый `wall.get` выключены и не входят во второй этап.
 
+Решением владельца от 2026-08-20 для уже разрешённых bounded-кампаний включён ускоренный
+worker: не более 6 одновременных jobs, общий scheduler quantum 30 и прежний лимит 2.5 RPS
+на каждый VK-токен. TokenPool по-прежнему сериализует per-token slots в PostgreSQL,
+а code 6/9/29 сохраняют global/method cooldown. Ускорение не меняет snapshots, лимиты
+собираемых сущностей, retries, capacity gates или требования к резерву диска.
+
 ## Решение владельца от 20.08.2026: личные стены пользователей
 
 Владелец отдельно разрешил массовый `wall.get` только для личных стен уже сохранённых
