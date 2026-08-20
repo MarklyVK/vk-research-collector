@@ -46,6 +46,7 @@ from vk_collector.collection.pilots import (
     quarantine_incompatible_pilots,
     supersede_paused_capacity_campaigns,
 )
+from vk_collector.collection.recovery import reconcile_capacity_paused_campaigns
 from vk_collector.collection.reporting import (
     bounded_wakeup_delay,
     capacity_gate_passed,
@@ -724,6 +725,7 @@ async def _collection_worker_service() -> None:
     worker: CollectionWorker | None = None
     active_token_fingerprints: set[str] = set()
     run_cursor = 0
+    next_capacity_recheck_at = 0.0
     backup_verifier = BackupVerifier()
     logger.info(
         "worker_scheduler_started configured_concurrency=%s vk_concurrency_cap=%s "
@@ -771,6 +773,26 @@ async def _collection_worker_service() -> None:
             else:
                 await CampaignManager(sessions, settings).reconcile(recovery_campaign_id)
         while not stop_event.is_set():
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_capacity_recheck_at:
+                try:
+                    recovered_campaigns = await reconcile_capacity_paused_campaigns(
+                        sessions, settings
+                    )
+                    if recovered_campaigns:
+                        logger.warning(
+                            "Capacity-paused campaigns автоматически продолжены после "
+                            "успешного live recheck: %s",
+                            ",".join(str(value) for value in recovered_campaigns),
+                        )
+                except Exception:
+                    logger.exception(
+                        "Не удалось выполнить периодический capacity recheck; "
+                        "worker продолжает обработку доступных runs"
+                    )
+                next_capacity_recheck_at = (
+                    now_monotonic + settings.collection_capacity_recheck_seconds
+                )
             try:
                 current_tokens = load_tokens(settings.vk_tokens_file)
             except VKTokensUnavailable:

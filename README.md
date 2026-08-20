@@ -877,6 +877,7 @@ Production monitor выполняет read-only проверки каждые п
 | `COLLECTION_JOB_LEASE_SECONDS` | `300` | Срок lease задания, минимум 30 секунд |
 | `COLLECTION_JOB_HEARTBEAT_SECONDS` | `60` | Зарезервированный интервал heartbeat; lease recovery сейчас опирается на timestamps задания |
 | `COLLECTION_IDLE_SLEEP_SECONDS` | `5` | Пауза автономного worker без доступных задач |
+| `COLLECTION_CAPACITY_RECHECK_SECONDS` | `60` | Интервал повторной проверки места для уже разрешённых bounded-кампаний на capacity-паузе |
 | `COLLECTION_RUN_ID` | пусто | Основной run для production-скриптов и handoff |
 
 ### Посты

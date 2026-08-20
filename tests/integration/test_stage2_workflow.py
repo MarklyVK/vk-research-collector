@@ -1190,6 +1190,34 @@ async def test_next_discovery_cohort_pauses_when_durable_budget_is_exceeded(
                         )
                         == 1
                     )
+                monkeypatch.setattr(
+                    "vk_collector.collection.campaigns.inspect_disk",
+                    lambda *_args, **_kwargs: DiskState(
+                        used_percent=50.0,
+                        warning=False,
+                        stop=False,
+                        total_bytes=20 * 1024**3,
+                        free_bytes=10 * 1024**3,
+                    ),
+                )
+                await manager.reconcile(campaign_id)
+                async with sessions() as session:
+                    campaign = await session.get(CollectionCampaign, campaign_id)
+                    assert campaign is not None
+                    assert campaign.status == "running"
+                    assert campaign.error_message is None
+                    assert campaign.last_planned_user_id == users[-1].vk_id
+                    assert (
+                        int(
+                            await session.scalar(
+                                select(func.count(CollectionRun.id)).where(
+                                    CollectionRun.campaign_id == campaign_id
+                                )
+                            )
+                            or 0
+                        )
+                        == 2
+                    )
             finally:
                 await outer.rollback()
     finally:

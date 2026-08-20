@@ -496,7 +496,7 @@ async def test_live_capacity_recheck_stops_next_user_post_cohort() -> None:
                     )
                     pass_campaign = CollectionCampaign(
                         campaign_type="user_posts_enrichment",
-                        status="running",
+                        status="paused_capacity_limit",
                         phase=CampaignPhase.USER_POSTS_COLLECTION.value,
                         snapshot_at=now,
                         snapshot_max_user_id=marker + 11,
@@ -533,6 +533,7 @@ async def test_live_capacity_recheck_stops_next_user_post_cohort() -> None:
                 async with sessions() as session:
                     pass_campaign = await session.get(CollectionCampaign, pass_campaign_id)
                     assert pass_campaign is not None and pass_campaign.status == "running"
+                    assert pass_campaign.error_message is None
                     assert (
                         int(
                             await session.scalar(

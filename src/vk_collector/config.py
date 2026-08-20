@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     collection_community_metadata_batch_size: int = Field(default=100, ge=1, le=100)
     collection_community_metadata_ttl_days: int = Field(default=30, ge=1)
     collection_scheduler_quantum: int = Field(default=30, ge=1, le=100)
+    collection_capacity_recheck_seconds: int = Field(default=60, ge=5)
     collection_subscription_pilot_users: int = Field(default=500, ge=1, le=500)
     collection_subscription_pilot_min_users: int = Field(default=100, ge=1, le=500)
     collection_subscription_snapshot_user_limit: int | None = Field(default=None, ge=1)

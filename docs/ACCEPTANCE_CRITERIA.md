@@ -57,6 +57,9 @@
 21. Ручное продолжение подписок после capacity-паузы создаёт новый immutable snapshot
     не более 40 000 due users, повторяет Pilot A и aggregate gate, сохраняет резерв 2 GiB
     и не изменяет активную user-post campaign.
+22. Уже разрешённая bounded-кампания автоматически выходит из `paused_capacity_limit`
+    после увеличения доступного места только при повторном успешном live capacity recheck;
+    исходный aggregate evidence, snapshot и резерв диска не изменяются.
 18. Личная стена сохраняет максимум 20 постов не старше 180 дней, включая корректный
     zero-post success, durable checkpoint/retry и terminal privacy/unavailable state.
 19. `groups.get`, `users.get` и `wall.get` имеют независимые method cooldown; новый

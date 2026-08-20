@@ -778,6 +778,13 @@ class UserPostCampaignManager:
                 campaign.error_message = f"Кампания содержит failed jobs: {failed}"
                 campaign.finished_at = datetime.now(UTC)
             else:
+                if campaign.status == CampaignStatus.PAUSED_CAPACITY_LIMIT.value:
+                    if not await self._budget_available(session, campaign):
+                        await session.commit()
+                        return
+                    campaign.status = CampaignStatus.RUNNING.value
+                    campaign.next_wakeup_at = None
+                    campaign.error_message = None
                 if campaign.status not in (
                     CampaignStatus.PLANNED.value,
                     CampaignStatus.RUNNING.value,

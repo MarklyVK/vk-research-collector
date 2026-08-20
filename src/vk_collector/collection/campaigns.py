@@ -984,6 +984,21 @@ class CampaignManager:
                 campaign.finished_at = datetime.now(UTC)
                 await session.commit()
                 return
+            if campaign.status == CampaignStatus.PAUSED_CAPACITY_LIMIT.value:
+                capacity_available = False
+                if campaign.phase == CampaignPhase.SUBSCRIPTION_DISCOVERY.value:
+                    capacity_available = await self._discovery_budget_available(session, campaign)
+                elif (
+                    campaign.phase == CampaignPhase.SUBSCRIPTION_METADATA.value
+                    and campaign.configuration.get("metadata_capacity_gate") == "passed"
+                ):
+                    capacity_available = await self._metadata_budget_available(session, campaign)
+                if not capacity_available:
+                    await session.commit()
+                    return
+                campaign.status = CampaignStatus.RUNNING.value
+                campaign.next_wakeup_at = None
+                campaign.error_message = None
             if campaign.status not in (
                 CampaignStatus.PLANNED.value,
                 CampaignStatus.RUNNING.value,

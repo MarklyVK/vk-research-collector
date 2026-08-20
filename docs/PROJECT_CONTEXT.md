@@ -83,6 +83,12 @@ snapshot до 40 000 due-пользователей. Старый rejected snaps
 terminal управляющий статус без удаления jobs, checkpoints или данных; новый snapshot
 снова целиком проходит Pilot A и aggregate capacity gate с тем же резервом 2 GiB.
 
+После расширения production-диска 20.08.2026 владелец отдельно разрешил автоматически
+возобновлять уже materialized bounded-кампании из `paused_capacity_limit`. Worker раз в
+минуту повторяет исходный live capacity recheck и продолжает тот же immutable snapshot
+только если его aggregate evidence, абсолютный резерв и процентные disk limits снова
+проходят. Это не создаёт новый snapshot и не обходит rejected aggregate gate.
+
 Небольшой light repair по уже сохранённым пользователям и сообществам может
 чередоваться с bounded discovery cohorts. Metadata найденных сообществ, включая
 название и описание, не начинается, пока discovery всего snapshot не завершён и
