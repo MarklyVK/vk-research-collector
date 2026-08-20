@@ -1141,9 +1141,10 @@ class CollectionQueue:
         retry_at: datetime | None = None,
         checkpoint: dict[str, object] | None = None,
     ) -> bool:
-        """Finish/defer one job and reconcile only on the run's first terminal edge."""
+        """Finish/defer one job and reconcile on terminal or deferred-only edges."""
         now = datetime.now(UTC)
         run_became_terminal = False
+        campaign_reconcile_needed = False
         campaign_id: uuid.UUID | None = None
         terminal_statuses = {JobStatus.COMPLETED, JobStatus.SKIPPED, JobStatus.FAILED}
         async with self._sessions() as session:
@@ -1163,16 +1164,18 @@ class CollectionQueue:
             job.locked_at = None
             job.locked_by = None
             job.heartbeat_at = None
-            if status in terminal_statuses:
-                job.finished_at = now
+            if status in terminal_statuses or status == JobStatus.RETRY_WAIT:
                 run = await session.get(CollectionRun, job.collection_run_id, with_for_update=True)
                 if run is not None:
-                    if status == JobStatus.COMPLETED:
-                        run.completed_jobs += 1
-                    elif status == JobStatus.SKIPPED:
-                        run.skipped_jobs += 1
-                    else:
-                        run.failed_jobs += 1
+                    campaign_id = run.campaign_id
+                    if status in terminal_statuses:
+                        job.finished_at = now
+                        if status == JobStatus.COMPLETED:
+                            run.completed_jobs += 1
+                        elif status == JobStatus.SKIPPED:
+                            run.skipped_jobs += 1
+                        else:
+                            run.failed_jobs += 1
                     await session.flush()
                     has_active = bool(
                         await session.scalar(
@@ -1200,9 +1203,27 @@ class CollectionQueue:
                         run.finished_at = now
                         run.next_wakeup_at = None
                         run_became_terminal = True
-                        campaign_id = run.campaign_id
+                        campaign_reconcile_needed = True
+                    elif run.campaign_id is not None:
+                        has_immediate = bool(
+                            await session.scalar(
+                                select(
+                                    exists().where(
+                                        CollectionJob.collection_run_id == run.id,
+                                        CollectionJob.status.in_(
+                                            [
+                                                JobStatus.PENDING,
+                                                JobStatus.RUNNING,
+                                                JobStatus.PAUSED,
+                                            ]
+                                        ),
+                                    )
+                                )
+                            )
+                        )
+                        campaign_reconcile_needed = not has_immediate
             await session.commit()
-        if run_became_terminal and campaign_id is not None:
+        if campaign_reconcile_needed and campaign_id is not None:
             await self._reconcile_campaign(campaign_id)
         return run_became_terminal
 

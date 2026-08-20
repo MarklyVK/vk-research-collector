@@ -46,6 +46,11 @@ ACTIVE_JOB_STATUSES = (
     JobStatus.RETRY_WAIT,
     JobStatus.PAUSED,
 )
+IMMEDIATE_JOB_STATUSES = (
+    JobStatus.PENDING,
+    JobStatus.RUNNING,
+    JobStatus.PAUSED,
+)
 
 MINIMUM_RESERVE_FACTOR = 1.30
 SNAPSHOT_HEAP_BYTES_PER_USER = 64
@@ -976,20 +981,37 @@ class CampaignManager:
                 campaign.finished_at = datetime.now(UTC)
                 await session.commit()
                 return
-            active = int(
+            if campaign.status not in (
+                CampaignStatus.PLANNED.value,
+                CampaignStatus.RUNNING.value,
+            ):
+                await session.commit()
+                return
+            immediate = int(
                 await session.scalar(
                     select(func.count(CollectionJob.id))
                     .join(CollectionRun, CollectionRun.id == CollectionJob.collection_run_id)
                     .where(
                         CollectionRun.campaign_id == campaign.id,
-                        CollectionJob.status.in_(ACTIVE_JOB_STATUSES),
+                        CollectionJob.status.in_(IMMEDIATE_JOB_STATUSES),
                     )
                 )
                 or 0
             )
-            if active:
+            if immediate:
                 await session.commit()
                 return
+            deferred = int(
+                await session.scalar(
+                    select(func.count(CollectionJob.id))
+                    .join(CollectionRun, CollectionRun.id == CollectionJob.collection_run_id)
+                    .where(
+                        CollectionRun.campaign_id == campaign.id,
+                        CollectionJob.status == JobStatus.RETRY_WAIT,
+                    )
+                )
+                or 0
+            )
             if campaign.phase == CampaignPhase.SUBSCRIPTION_DISCOVERY.value:
                 unresolved = await self._unresolved_count(session, campaign)
                 if unresolved:
@@ -998,12 +1020,19 @@ class CampaignManager:
                         planned is None
                         and campaign.status != CampaignStatus.PAUSED_CAPACITY_LIMIT.value
                     ):
-                        campaign.status = CampaignStatus.FAILED.value
-                        campaign.phase = CampaignPhase.FAILED.value
-                        campaign.error_message = (
-                            f"Остались unresolved пользователи без runnable jobs: {unresolved}"
-                        )
-                        campaign.finished_at = datetime.now(UTC)
+                        if deferred:
+                            campaign.status = CampaignStatus.RUNNING.value
+                            campaign.error_message = (
+                                f"Ожидаются отложенные повторы: {deferred}; "
+                                f"неразрешённых пользователей: {unresolved}"
+                            )
+                        else:
+                            campaign.status = CampaignStatus.FAILED.value
+                            campaign.phase = CampaignPhase.FAILED.value
+                            campaign.error_message = (
+                                f"Остались unresolved пользователи без runnable jobs: {unresolved}"
+                            )
+                            campaign.finished_at = datetime.now(UTC)
                     await session.commit()
                     return
                 campaign.phase = CampaignPhase.SUBSCRIPTION_METADATA.value
@@ -1014,6 +1043,9 @@ class CampaignManager:
                     campaign.finished_at = datetime.now(UTC)
                     campaign.next_wakeup_at = None
             elif campaign.phase == CampaignPhase.SUBSCRIPTION_METADATA.value:
+                if deferred:
+                    await session.commit()
+                    return
                 if campaign.configuration.get("metadata_capacity_gate") != "passed":
                     await session.commit()
                     return

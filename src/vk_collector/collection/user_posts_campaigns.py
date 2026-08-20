@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from vk_collector.collection.campaigns import (
     ACTIVE_CAMPAIGN_STATUSES,
-    ACTIVE_JOB_STATUSES,
+    IMMEDIATE_JOB_STATUSES,
     MINIMUM_RESERVE_FACTOR,
     SNAPSHOT_HEAP_BYTES_PER_USER,
     SNAPSHOT_PRIMARY_KEY_BYTES_PER_USER,
@@ -778,25 +778,59 @@ class UserPostCampaignManager:
                 campaign.error_message = f"Кампания содержит failed jobs: {failed}"
                 campaign.finished_at = datetime.now(UTC)
             else:
-                active = int(
+                if campaign.status not in (
+                    CampaignStatus.PLANNED.value,
+                    CampaignStatus.RUNNING.value,
+                ):
+                    await session.commit()
+                    return
+                immediate = int(
                     await session.scalar(
                         select(func.count(CollectionJob.id))
                         .join(CollectionRun, CollectionRun.id == CollectionJob.collection_run_id)
                         .where(
                             CollectionRun.campaign_id == campaign_id,
-                            CollectionJob.status.in_(ACTIVE_JOB_STATUSES),
+                            CollectionJob.status.in_(IMMEDIATE_JOB_STATUSES),
                         )
                     )
                     or 0
                 )
-                if not active:
+                if not immediate:
+                    deferred = int(
+                        await session.scalar(
+                            select(func.count(CollectionJob.id))
+                            .join(
+                                CollectionRun,
+                                CollectionRun.id == CollectionJob.collection_run_id,
+                            )
+                            .where(
+                                CollectionRun.campaign_id == campaign_id,
+                                CollectionJob.status == JobStatus.RETRY_WAIT,
+                            )
+                        )
+                        or 0
+                    )
                     unresolved = await self._unresolved_count(session, campaign)
                     planned = await self._plan_cohort(session, campaign) if unresolved else None
                     if planned is None and campaign.status != CampaignStatus.PAUSED_CAPACITY_LIMIT:
-                        campaign.status = CampaignStatus.COMPLETED.value
-                        campaign.phase = CampaignPhase.COMPLETED.value
-                        campaign.finished_at = datetime.now(UTC)
-                        campaign.next_wakeup_at = None
+                        if deferred:
+                            campaign.status = CampaignStatus.RUNNING.value
+                            campaign.error_message = (
+                                f"Ожидаются отложенные повторы: {deferred}; "
+                                f"неразрешённых пользователей: {unresolved}"
+                            )
+                        elif unresolved:
+                            campaign.status = CampaignStatus.FAILED.value
+                            campaign.phase = CampaignPhase.FAILED.value
+                            campaign.error_message = (
+                                f"Остались unresolved пользователи без runnable jobs: {unresolved}"
+                            )
+                            campaign.finished_at = datetime.now(UTC)
+                        else:
+                            campaign.status = CampaignStatus.COMPLETED.value
+                            campaign.phase = CampaignPhase.COMPLETED.value
+                            campaign.finished_at = datetime.now(UTC)
+                            campaign.next_wakeup_at = None
             await session.commit()
 
     async def change_status(self, campaign_id: uuid.UUID, *, pause: bool) -> None:

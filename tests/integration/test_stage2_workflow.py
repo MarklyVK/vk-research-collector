@@ -1274,6 +1274,130 @@ async def test_campaign_transient_subscription_remains_durable_after_fast_retrie
 
 
 @pytest.mark.asyncio
+async def test_deferred_subscription_does_not_block_next_cohort() -> None:
+    engine = create_database_engine(database_url())
+    settings = Settings(
+        database_url=database_url(),
+        collection_export_dir=".",
+        collection_campaign_cohort_users=2,
+        collection_safe_database_limit_bytes=100 * 1024**3,
+        disk_warning_percent=100,
+        disk_stop_percent=100,
+    )
+    marker = int(uuid.uuid4().hex[:10], 16) + 55_000_000_000
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                now = datetime.now(UTC)
+                async with sessions() as session:
+                    database_bytes = int(
+                        await session.scalar(select(func.pg_database_size(func.current_database())))
+                        or 0
+                    )
+                    users = [
+                        VKUser(
+                            vk_id=marker + index,
+                            is_closed=False,
+                            can_access_closed=True,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                        )
+                        for index in range(3)
+                    ]
+                    campaign = CollectionCampaign(
+                        campaign_type="subscription_enrichment",
+                        status="running",
+                        phase="subscription_discovery",
+                        snapshot_at=now,
+                        snapshot_max_user_id=users[-1].vk_id,
+                        snapshot_user_count=3,
+                        last_planned_user_id=users[1].vk_id,
+                        configuration={
+                            "capacity_gate": "passed",
+                            "current_database_bytes": database_bytes,
+                            "projected_final_database_bytes": database_bytes + 1024**2,
+                            "discovery_due_users": 3,
+                            "aggregate_discovery_projected_growth_bytes": 0,
+                            "safe_database_limit_bytes": 100 * 1024**3,
+                        },
+                        configuration_hash=uuid.uuid4().hex,
+                    )
+                    session.add_all([*users, campaign])
+                    await session.flush()
+                    session.add_all(
+                        [
+                            CollectionCampaignUser(
+                                campaign_id=campaign.id,
+                                user_id=user.vk_id,
+                            )
+                            for user in users
+                        ]
+                    )
+                    run = CollectionRun(
+                        campaign_id=campaign.id,
+                        scope="subscription_discovery",
+                        status=CollectionRunStatus.RUNNING,
+                        total_jobs=2,
+                    )
+                    session.add(run)
+                    await session.flush()
+                    deferred = CollectionJob(
+                        collection_run_id=run.id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=users[0].vk_id,
+                        status=JobStatus.RETRY_WAIT,
+                        next_attempt_at=now + timedelta(hours=6),
+                    )
+                    finishing = CollectionJob(
+                        collection_run_id=run.id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=users[1].vk_id,
+                        status=JobStatus.RUNNING,
+                    )
+                    session.add_all([deferred, finishing])
+                    await session.commit()
+                    campaign_id = campaign.id
+                    finishing_id = finishing.id
+
+                became_terminal = await CollectionQueue(sessions, settings).finish(
+                    finishing_id,
+                    JobStatus.COMPLETED,
+                )
+                assert became_terminal is False
+
+                async with sessions() as session:
+                    jobs = list(
+                        (
+                            await session.execute(
+                                select(CollectionJob.entity_id, CollectionJob.status)
+                                .join(
+                                    CollectionRun,
+                                    CollectionRun.id == CollectionJob.collection_run_id,
+                                )
+                                .where(CollectionRun.campaign_id == campaign_id)
+                            )
+                        ).all()
+                    )
+                    campaign = await session.get(CollectionCampaign, campaign_id)
+                    assert campaign is not None and campaign.status == "running"
+                    assert len(jobs) == 3
+                    assert (users[0].vk_id, JobStatus.RETRY_WAIT) in jobs
+                    assert (users[2].vk_id, JobStatus.PENDING) in jobs
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_metadata_batch_partial_deactivated_and_transient_are_safe() -> None:
     engine = create_database_engine(database_url())
     settings = Settings(database_url=database_url(), collection_community_metadata_batch_size=100)
