@@ -5,6 +5,7 @@ import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from vk_collector.collection.backup import rotate_active_backup_evidence
 from vk_collector.collection.campaigns import CampaignManager
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import capacity_gate_passed, latest_runnable_run_id
@@ -68,6 +70,77 @@ pytestmark = pytest.mark.skipif(
     or not database_url().rsplit("/", 1)[-1].endswith("_test"),
     reason="PostgreSQL integration test требует явного запуска на изолированной *_test БД",
 )
+
+
+@pytest.mark.asyncio
+async def test_deployment_rotates_backup_evidence_and_reopens_only_backup_pause(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(database_url())
+    backup = tmp_path / "new-predeploy.dump"
+    backup.write_bytes(b"PGDMP\x01new-deployment-backup")
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+            )
+            try:
+                async with sessions() as session:
+                    campaign = CollectionCampaign(
+                        campaign_type="user_posts_enrichment",
+                        status="paused_capacity_limit",
+                        phase="user_posts_collection",
+                        snapshot_at=datetime.now(UTC),
+                        configuration={
+                            "verified_backup": {"path": "/missing/old.dump"},
+                            "immutable_marker": "preserved",
+                        },
+                        configuration_hash=uuid.uuid4().hex,
+                        error_message="Backup не читается: старый deployment backup удалён",
+                    )
+                    session.add(campaign)
+                    await session.flush()
+                    run = CollectionRun(
+                        campaign_id=campaign.id,
+                        scope="user_posts",
+                        status=CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                        configuration={
+                            "capacity_gate": "passed",
+                            "verified_backup": {"path": "/missing/old.dump"},
+                            "immutable_marker": "preserved",
+                        },
+                        error_message="Backup не читается: старый deployment backup удалён",
+                    )
+                    session.add(run)
+                    await session.commit()
+                    campaign_id, run_id = campaign.id, run.id
+
+                result = await rotate_active_backup_evidence(
+                    sessions,
+                    backup,
+                    confirmation="ROTATE_ACTIVE_BACKUP_EVIDENCE",
+                )
+                assert result["campaigns_updated"] == 1
+                assert result["runs_reopened"] == 1
+                async with sessions() as session:
+                    campaign = await session.get(CollectionCampaign, campaign_id)
+                    run = await session.get(CollectionRun, run_id)
+                    assert campaign is not None and campaign.status == "running"
+                    assert run is not None and run.status == CollectionRunStatus.RUNNING
+                    assert campaign.configuration["immutable_marker"] == "preserved"
+                    assert run.configuration["immutable_marker"] == "preserved"
+                    assert campaign.configuration["verified_backup"]["path"] == str(
+                        backup.resolve()
+                    )
+                    assert (
+                        run.configuration["verified_backup"]
+                        == campaign.configuration["verified_backup"]
+                    )
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
 
 
 class FakeVK:

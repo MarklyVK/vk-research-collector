@@ -30,7 +30,7 @@ from vk_collector.classification.service import (
 )
 from vk_collector.collection import CollectionQueue, CollectionWorker
 from vk_collector.collection.backlog import canonical_backlog
-from vk_collector.collection.backup import BackupVerifier
+from vk_collector.collection.backup import BackupVerifier, rotate_active_backup_evidence
 from vk_collector.collection.campaigns import CampaignManager, build_aggregate_capacity_projection
 from vk_collector.collection.capacity import (
     build_capacity_report,
@@ -974,6 +974,34 @@ def collection_worker() -> None:
     except ValueError as exc:
         typer.echo(f"Worker остановлен: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+
+async def _rotate_active_backup(backup: Path, confirmation: str) -> dict[str, int | str]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        return await rotate_active_backup_evidence(
+            sessions,
+            backup,
+            confirmation=confirmation,
+        )
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("rotate-backup-evidence", hidden=True)
+def rotate_backup_evidence(
+    backup: Annotated[Path, typer.Option("--backup")],
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+) -> None:
+    """Ротировать operational backup proof активных кампаний при deployment."""
+    try:
+        result = asyncio.run(_rotate_active_backup(backup, confirmation))
+    except ValueError as exc:
+        typer.echo(f"Ротация backup evidence отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 async def _user_posts_pilot_preview() -> dict[str, object]:

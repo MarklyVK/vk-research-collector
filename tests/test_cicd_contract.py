@@ -254,6 +254,15 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
     assert not any(item in script for item in forbidden)
 
 
+def test_deployment_rotates_active_backup_evidence_before_worker_start() -> None:
+    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    rotation = script.index("collection rotate-backup-evidence")
+    worker_start = script.rindex("compose up -d --no-deps --no-build collector-worker")
+    assert rotation < worker_start
+    assert "ROTATE_ACTIVE_BACKUP_EVIDENCE" in script
+    assert 'PROTECTED_BACKUPS+=("$BACKUP_FILE")' in script
+
+
 def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -> None:
     workflow_path = ROOT / ".github/workflows/production-collection-control.yml"
     workflow = load_yaml(workflow_path)

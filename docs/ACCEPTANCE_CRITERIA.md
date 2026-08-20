@@ -60,6 +60,9 @@
 22. Уже разрешённая bounded-кампания автоматически выходит из `paused_capacity_limit`
     после увеличения доступного места только при повторном успешном live capacity recheck;
     исходный aggregate evidence, snapshot и резерв диска не изменяются.
+23. Deployment с одним сохраняемым backup транзакционно ротирует только operational
+    `verified_backup` активных bounded campaigns/runs; отсутствующий старый backup не
+    блокирует следующий cohort, а snapshot и capacity evidence остаются неизменными.
 18. Личная стена сохраняет максимум 20 постов не старше 180 дней, включая корректный
     zero-post success, durable checkpoint/retry и terminal privacy/unavailable state.
 19. `groups.get`, `users.get` и `wall.get` имеют независимые method cooldown; новый

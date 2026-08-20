@@ -501,6 +501,8 @@ log "Создаётся backup: $BACKUP_FILE"
 compose exec -T postgres pg_dump -U "$(env_value POSTGRES_USER)" -d "$(env_value POSTGRES_DB)" -Fc > "$BACKUP_FILE"
 test -s "$BACKUP_FILE" || die 'Backup пуст.'
 compose exec -T postgres pg_restore --list < "$BACKUP_FILE" >/dev/null || die 'pg_restore --list отклонил backup.'
+PROTECTED_BACKUPS+=("$BACKUP_FILE")
+grant_collector_protected_backup_read
 
 mapfile -t OLD_BACKUPS < <(find "$DEPLOY_DIR/backups" -maxdepth 1 -type f -name 'predeploy-*.dump' -printf '%T@ %p\n' \
   | sort -rn | tail -n "+$((BACKUP_KEEP + 1))" | cut -d' ' -f2-)
@@ -545,6 +547,9 @@ compose_cli alembic current
 ROLLBACK_ALLOWED=0
 compose_cli alembic upgrade head
 compose_cli alembic check
+compose_cli collection rotate-backup-evidence \
+  --backup "/app/backups/$(basename "$BACKUP_FILE")" \
+  --confirmation ROTATE_ACTIVE_BACKUP_EVIDENCE
 ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
 [[ "$ALEMBIC_REVISION" == *20260820_0013* ]] \
   || die "Alembic находится не на ожидаемом head 20260820_0013: $ALEMBIC_REVISION"

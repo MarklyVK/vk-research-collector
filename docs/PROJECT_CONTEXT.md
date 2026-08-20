@@ -89,6 +89,12 @@ terminal управляющий статус без удаления jobs, check
 только если его aggregate evidence, абсолютный резерв и процентные disk limits снова
 проходят. Это не создаёт новый snapshot и не обходит rejected aggregate gate.
 
+Каждый production deployment создаёт новый проверенный backup и оставляет только одну
+копию. До запуска worker operational `verified_backup` активных bounded campaigns/runs
+транзакционно ротируется на эту новую копию. Snapshot, aggregate capacity evidence и
+collection configuration при этом не меняются; run, остановленный только отсутствием
+предыдущего backup, безопасно возвращается в `running`.
+
 Небольшой light repair по уже сохранённым пользователям и сообществам может
 чередоваться с bounded discovery cohorts. Metadata найденных сообществ, включая
 название и описание, не начинается, пока discovery всего snapshot не завершён и
