@@ -28,9 +28,23 @@ class DiskState:
     free_bytes: int
 
 
-def inspect_disk(path: Path, warning_percent: int, stop_percent: int) -> DiskState:
+def inspect_disk(
+    path: Path,
+    warning_percent: int,
+    stop_percent: int,
+    *,
+    min_free_bytes: int = 0,
+) -> DiskState:
     """Проверить файловую систему без удаления данных."""
     target = path if path.exists() else Path.cwd()
     usage = shutil.disk_usage(target)
     used = 100.0 * (usage.total - usage.free) / usage.total
-    return DiskState(used, used >= warning_percent, used >= stop_percent, usage.total, usage.free)
+    absolute_stop = min_free_bytes > 0 and usage.free <= min_free_bytes
+    absolute_warning = min_free_bytes > 0 and usage.free <= min_free_bytes + 512 * 1024**2
+    return DiskState(
+        used,
+        used >= warning_percent or absolute_warning,
+        used >= stop_percent or absolute_stop,
+        usage.total,
+        usage.free,
+    )

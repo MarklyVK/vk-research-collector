@@ -61,6 +61,8 @@ def build_aggregate_capacity_projection(
     database_bytes: int,
     disk: DiskState,
     warning_percent: int,
+    safe_database_limit_bytes: int = SAFE_DISK_LIMIT_BYTES,
+    min_free_bytes: int = 0,
 ) -> dict[str, object]:
     """Scale validated Pilot A evidence to the complete immutable discovery snapshot."""
     reasons: list[str] = []
@@ -103,19 +105,20 @@ def build_aggregate_capacity_projection(
         if disk.total_bytes > 0
         else 100.0
     )
-    available_database_growth = max(0, SAFE_DISK_LIMIT_BYTES - database_bytes)
-    available_growth = min(available_database_growth, disk.free_bytes)
+    available_database_growth = max(0, safe_database_limit_bytes - database_bytes)
+    available_disk_growth = max(0, disk.free_bytes - min_free_bytes)
+    available_growth = min(available_database_growth, available_disk_growth)
     if database_bytes < 0 or disk.free_bytes < 0 or disk.total_bytes <= 0:
         reasons.append("текущие database/disk измерения некорректны")
-    if projected_database > SAFE_DISK_LIMIT_BYTES:
+    if projected_database > safe_database_limit_bytes:
         reasons.append(
             f"projected final database {projected_database} bytes превышает "
-            f"safe limit {SAFE_DISK_LIMIT_BYTES} bytes"
+            f"safe limit {safe_database_limit_bytes} bytes"
         )
-    if aggregate_growth > disk.free_bytes:
+    if aggregate_growth > available_disk_growth:
         reasons.append(
             f"aggregate growth {aggregate_growth} bytes превышает свободный диск "
-            f"{disk.free_bytes} bytes"
+            f"{available_disk_growth} bytes after reserve"
         )
     if disk.warning or disk.stop or projected_used >= warning_percent:
         reasons.append(
@@ -135,7 +138,8 @@ def build_aggregate_capacity_projection(
         "projected_final_database_bytes": projected_database,
         "current_disk_free_bytes": disk.free_bytes,
         "projected_final_disk_used_percent": projected_used,
-        "safe_database_limit_bytes": SAFE_DISK_LIMIT_BYTES,
+        "safe_database_limit_bytes": safe_database_limit_bytes,
+        "minimum_disk_free_bytes": min_free_bytes,
         "available_growth_bytes": available_growth,
         "additional_disk_required_bytes": max(0, aggregate_growth - available_growth),
         "decision": "passed" if not reasons else "rejected",
@@ -203,6 +207,9 @@ class CampaignManager:
         return {
             "campaign_type": "subscription_enrichment",
             "cohort_users": self._settings.collection_campaign_cohort_users,
+            "snapshot_user_limit": self._settings.collection_subscription_snapshot_user_limit,
+            "minimum_disk_free_bytes": self._settings.collection_disk_min_free_bytes,
+            "safe_database_limit_bytes": self._settings.collection_safe_database_limit_bytes,
             "metadata_batch_size": self._settings.collection_community_metadata_batch_size,
             "metadata_ttl_days": self._settings.collection_community_metadata_ttl_days,
             "subscription_limit": self._settings.collection_subscriptions_max_per_user,
@@ -235,16 +242,27 @@ class CampaignManager:
         configuration_hash = hashlib.sha256(
             json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        full_due = max(0, users - already_resolved)
+        limit = self._settings.collection_subscription_snapshot_user_limit
+        bounded = limit is not None
+        target_due = min(full_due, limit) if limit is not None else full_due
+        snapshot_users = target_due if bounded else users
+        snapshot_resolved = 0 if bounded else already_resolved
         return {
             "apply": False,
             "campaign_type": "subscription_enrichment",
-            "snapshot_users": users,
-            "already_resolved_users": already_resolved,
-            "discovery_due_users": max(0, users - already_resolved),
+            "snapshot_users": snapshot_users,
+            "already_resolved_users": snapshot_resolved,
+            "discovery_due_users": target_due,
+            "eligible_users": users,
+            "eligible_resolved_users": already_resolved,
+            "eligible_due_users": full_due,
+            "bounded_snapshot": bounded,
+            "snapshot_user_limit": limit,
             "snapshot_storage_estimate": {
                 "method": "local PostgreSQL 16 measurement with conservative rounding",
-                "heap_bytes": users * SNAPSHOT_HEAP_BYTES_PER_USER,
-                "primary_key_bytes": users * SNAPSHOT_PRIMARY_KEY_BYTES_PER_USER,
+                "heap_bytes": snapshot_users * SNAPSHOT_HEAP_BYTES_PER_USER,
+                "primary_key_bytes": snapshot_users * SNAPSHOT_PRIMARY_KEY_BYTES_PER_USER,
                 "historical_job_bytes_per_discovery_user": HISTORICAL_JOB_BYTES_PER_USER,
                 "reserve_factor": MINIMUM_RESERVE_FACTOR,
             },
@@ -310,15 +328,22 @@ class CampaignManager:
         safe_limit = gate_evidence.get("safe_database_limit_bytes")
         aggregate_growth = aggregate_value
         disk_free = gate_evidence.get("current_disk_free_bytes")
+        minimum_disk_free = gate_evidence.get("minimum_disk_free_bytes", 0)
         assert isinstance(projected_final, int)
         assert isinstance(safe_limit, int)
         assert isinstance(aggregate_growth, int)
         assert isinstance(disk_free, int)
+        if not isinstance(minimum_disk_free, int) or minimum_disk_free < 0:
+            raise ValueError("Aggregate evidence не содержит корректный disk reserve")
+        if safe_limit != self._settings.collection_safe_database_limit_bytes:
+            raise ValueError("Aggregate evidence содержит неожиданный safe database limit")
+        if minimum_disk_free != self._settings.collection_disk_min_free_bytes:
+            raise ValueError("Aggregate evidence содержит неожиданный disk reserve")
         if projected_final < current_database_value + aggregate_growth:
             raise ValueError("Aggregate evidence содержит заниженный projected final database")
         if projected_final > safe_limit:
             raise ValueError("Aggregate projection превышает safe database limit")
-        if aggregate_growth > disk_free:
+        if aggregate_growth > max(0, disk_free - minimum_disk_free):
             raise ValueError("Aggregate projection превышает свободный диск")
         configuration = self.configuration()
         configuration_hash = hashlib.sha256(
@@ -363,28 +388,31 @@ class CampaignManager:
                 )
                 or 0
             )
+            eligible_due = max(0, eligible_count - resolved_count)
+            snapshot_limit = self._settings.collection_subscription_snapshot_user_limit
+            bounded = snapshot_limit is not None
+            snapshot_expected = (
+                min(eligible_due, snapshot_limit) if snapshot_limit is not None else eligible_count
+            )
+            snapshot_resolved = 0 if bounded else resolved_count
+            snapshot_due = snapshot_expected if bounded else eligible_due
             if (
-                gate_evidence.get("snapshot_users") != eligible_count
-                or gate_evidence.get("already_resolved_users") != resolved_count
-                or gate_evidence.get("discovery_due_users") != eligible_count - resolved_count
+                gate_evidence.get("eligible_users", eligible_count) != eligible_count
+                or gate_evidence.get("eligible_resolved_users", resolved_count) != resolved_count
+                or gate_evidence.get("eligible_due_users", eligible_due) != eligible_due
+                or gate_evidence.get("snapshot_users") != snapshot_expected
+                or gate_evidence.get("already_resolved_users") != snapshot_resolved
+                or gate_evidence.get("discovery_due_users") != snapshot_due
             ):
                 raise ValueError(
                     "Eligible/resolved counts изменились после preview; повторите capacity checks"
                 )
-            snapshot_max = int(
-                await session.scalar(
-                    select(func.coalesce(func.max(VKUser.vk_id), 0)).where(
-                        self._eligible_user_predicate(now)
-                    )
-                )
-                or 0
-            )
             campaign = CollectionCampaign(
                 campaign_type="subscription_enrichment",
                 status=CampaignStatus.PAUSED_CAPACITY_LIMIT.value,
                 phase=CampaignPhase.SUBSCRIPTION_DISCOVERY.value,
                 snapshot_at=now,
-                snapshot_max_user_id=snapshot_max,
+                snapshot_max_user_id=0,
                 configuration=configuration,
                 configuration_hash=configuration_hash,
             )
@@ -395,10 +423,22 @@ class CampaignManager:
             }
             session.add(campaign)
             await session.flush()
-            snapshot_select = select(literal(campaign.id), VKUser.vk_id).where(
-                self._eligible_user_predicate(now),
-                VKUser.vk_id <= snapshot_max,
-            )
+            if bounded:
+                bounded_ids = (
+                    select(VKUser.vk_id.label("user_id"))
+                    .where(
+                        self._eligible_user_predicate(now),
+                        VKUser.vk_id.not_in(self._resolved_user_ids_at(now)),
+                    )
+                    .order_by(VKUser.vk_id)
+                    .limit(snapshot_expected)
+                    .subquery()
+                )
+                snapshot_select = select(literal(campaign.id), bounded_ids.c.user_id)
+            else:
+                snapshot_select = select(literal(campaign.id), VKUser.vk_id).where(
+                    self._eligible_user_predicate(now)
+                )
             await session.execute(
                 insert(CollectionCampaignUser)
                 .from_select(["campaign_id", "user_id"], snapshot_select)
@@ -407,6 +447,14 @@ class CampaignManager:
             campaign.snapshot_user_count = int(
                 await session.scalar(
                     select(func.count(CollectionCampaignUser.user_id)).where(
+                        CollectionCampaignUser.campaign_id == campaign.id
+                    )
+                )
+                or 0
+            )
+            campaign.snapshot_max_user_id = int(
+                await session.scalar(
+                    select(func.coalesce(func.max(CollectionCampaignUser.user_id), 0)).where(
                         CollectionCampaignUser.campaign_id == campaign.id
                     )
                 )
@@ -424,8 +472,8 @@ class CampaignManager:
                 or 0
             )
             if (
-                campaign.snapshot_user_count != eligible_count
-                or materialized_resolved_count != resolved_count
+                campaign.snapshot_user_count != snapshot_expected
+                or materialized_resolved_count != snapshot_resolved
             ):
                 raise ValueError(
                     "Eligible/resolved snapshot изменился во время materialization; "
@@ -569,6 +617,7 @@ class CampaignManager:
             self._settings.collection_export_dir,
             self._settings.disk_warning_percent,
             self._settings.disk_stop_percent,
+            min_free_bytes=self._settings.collection_disk_min_free_bytes,
         )
         required_final = current_database + remaining_growth
         projected_used = (
@@ -578,8 +627,9 @@ class CampaignManager:
         )
         if (
             required_final > projected_final
-            or required_final > SAFE_DISK_LIMIT_BYTES
-            or remaining_growth > disk.free_bytes
+            or required_final > self._settings.collection_safe_database_limit_bytes
+            or remaining_growth
+            > max(0, disk.free_bytes - self._settings.collection_disk_min_free_bytes)
             or disk.warning
             or disk.stop
             or projected_used >= self._settings.disk_warning_percent
@@ -771,6 +821,7 @@ class CampaignManager:
             self._settings.collection_export_dir,
             self._settings.disk_warning_percent,
             self._settings.disk_stop_percent,
+            min_free_bytes=self._settings.collection_disk_min_free_bytes,
         )
         projected_database = database_bytes + projected_growth
         projected_used = (
@@ -779,9 +830,11 @@ class CampaignManager:
             else 100.0
         )
         reasons: list[str] = []
-        if projected_database > SAFE_DISK_LIMIT_BYTES:
+        if projected_database > self._settings.collection_safe_database_limit_bytes:
             reasons.append("metadata projected database превышает safe limit")
-        if projected_growth > disk.free_bytes:
+        if projected_growth > max(
+            0, disk.free_bytes - self._settings.collection_disk_min_free_bytes
+        ):
             reasons.append("metadata projected growth превышает свободный диск")
         if disk.warning or disk.stop or projected_used >= self._settings.disk_warning_percent:
             reasons.append("metadata projected disk usage достигает warning")
@@ -796,7 +849,8 @@ class CampaignManager:
             "projected_final_database_bytes": projected_database,
             "current_disk_free_bytes": disk.free_bytes,
             "projected_final_disk_used_percent": projected_used,
-            "safe_database_limit_bytes": SAFE_DISK_LIMIT_BYTES,
+            "safe_database_limit_bytes": self._settings.collection_safe_database_limit_bytes,
+            "minimum_disk_free_bytes": self._settings.collection_disk_min_free_bytes,
             "reserve_factor": MINIMUM_RESERVE_FACTOR,
             "decision": "passed" if not reasons else "rejected",
             "rejection_reasons": reasons,
@@ -871,6 +925,7 @@ class CampaignManager:
             self._settings.collection_export_dir,
             self._settings.disk_warning_percent,
             self._settings.disk_stop_percent,
+            min_free_bytes=self._settings.collection_disk_min_free_bytes,
         )
         required_final = current_database + remaining_growth
         projected_used = (
@@ -881,8 +936,9 @@ class CampaignManager:
         if (
             current_database < initial_database
             or required_final > projected_final
-            or required_final > SAFE_DISK_LIMIT_BYTES
-            or remaining_growth > disk.free_bytes
+            or required_final > self._settings.collection_safe_database_limit_bytes
+            or remaining_growth
+            > max(0, disk.free_bytes - self._settings.collection_disk_min_free_bytes)
             or disk.warning
             or disk.stop
             or projected_used >= self._settings.disk_warning_percent

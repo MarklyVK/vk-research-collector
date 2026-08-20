@@ -152,6 +152,7 @@ class CollectionWorker:
                 self._settings.collection_export_dir,
                 self._settings.disk_warning_percent,
                 self._settings.disk_stop_percent,
+                min_free_bytes=self._settings.collection_disk_min_free_bytes,
             )
             if disk.stop:
                 await self._queue.set_run_status(

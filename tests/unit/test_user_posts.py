@@ -99,6 +99,38 @@ def test_user_posts_capacity_projection_rejects_full_snapshot() -> None:
     assert result["additional_disk_required_bytes"] > 0
 
 
+def test_user_posts_capacity_reserves_absolute_free_space() -> None:
+    result = build_user_posts_capacity_projection(
+        preview={"snapshot_users": 1_000, "due_users": 1_000},
+        pilot={
+            "measured_users": 100,
+            "database_growth_bytes": 50_000_000,
+            "user_posts": 1_000,
+            "attachments": 100,
+        },
+        database_bytes=2 * 1024**3,
+        disk=DiskState(70.0, False, False, 10 * 1024**3, 3 * 1024**3),
+        warning_percent=95,
+        safe_database_limit_bytes=8 * 1024**3,
+        min_free_bytes=2 * 1024**3,
+    )
+    assert result["minimum_disk_free_bytes"] == 2 * 1024**3
+    assert result["available_growth_bytes"] == 1024**3
+    assert result["decision"] == "passed"
+
+
+def test_bounded_snapshot_settings_accept_explicit_owner_limits() -> None:
+    settings = Settings(
+        collection_subscription_snapshot_user_limit=150_000,
+        collection_user_posts_snapshot_user_limit=250_000,
+        collection_disk_min_free_bytes=2 * 1024**3,
+        collection_safe_database_limit_bytes=12 * 1024**3,
+    )
+    assert settings.collection_subscription_snapshot_user_limit == 150_000
+    assert settings.collection_user_posts_snapshot_user_limit == 250_000
+    assert settings.collection_disk_min_free_bytes == 2 * 1024**3
+
+
 @pytest.mark.asyncio
 async def test_vk_client_get_user_wall_page() -> None:
     import asyncio

@@ -44,6 +44,7 @@ from vk_collector.collection.pilots import (
     finalize_deferred_subscription_pilot,
     pilot_previews,
     quarantine_incompatible_pilots,
+    supersede_paused_capacity_campaigns,
 )
 from vk_collector.collection.reporting import (
     bounded_wakeup_delay,
@@ -1062,6 +1063,7 @@ async def _user_posts_plan(
             settings.collection_export_dir,
             settings.disk_warning_percent,
             settings.disk_stop_percent,
+            min_free_bytes=settings.collection_disk_min_free_bytes,
         )
         gate = build_user_posts_capacity_projection(
             preview=preview,
@@ -1069,6 +1071,8 @@ async def _user_posts_plan(
             database_bytes=current["database_bytes"],
             disk=disk,
             warning_percent=settings.disk_warning_percent,
+            safe_database_limit_bytes=settings.collection_safe_database_limit_bytes,
+            min_free_bytes=settings.collection_disk_min_free_bytes,
         )
         gate["capacity_report"] = str(source.resolve())
         gate["verified_at"] = datetime.now(UTC).isoformat()
@@ -1215,6 +1219,29 @@ def quarantine_legacy_pilots(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+@collection_app.command("supersede-paused-capacity-campaigns")
+def supersede_capacity_campaigns(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+) -> None:
+    """Заменить только capacity-rejected campaigns без удаления истории и данных."""
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+
+    async def apply() -> dict[str, Any]:
+        try:
+            return await supersede_paused_capacity_campaigns(sessions, confirmation=confirmation)
+        finally:
+            await engine.dispose()
+
+    try:
+        payload = asyncio.run(apply())
+    except ValueError as exc:
+        typer.echo(f"Замена capacity campaigns отклонена: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 async def _show_status(run_id: uuid.UUID | None) -> dict[str, Any]:
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -1307,6 +1334,7 @@ async def _aggregate_campaign_preview(
         settings.collection_export_dir,
         settings.disk_warning_percent,
         settings.disk_stop_percent,
+        min_free_bytes=settings.collection_disk_min_free_bytes,
     )
     report_path = source or settings.collection_export_dir / "subscription-gate-a.json"
     if not report_path.is_file():
@@ -1327,7 +1355,8 @@ async def _aggregate_campaign_preview(
             "projected_final_database_bytes": None,
             "current_disk_free_bytes": disk.free_bytes,
             "projected_final_disk_used_percent": None,
-            "safe_database_limit_bytes": 7 * 1024**3,
+            "safe_database_limit_bytes": settings.collection_safe_database_limit_bytes,
+            "minimum_disk_free_bytes": settings.collection_disk_min_free_bytes,
             "decision": "rejected",
             "rejection_reasons": [
                 f"validated Pilot A capacity report отсутствует: {report_path.resolve()}"
@@ -1360,6 +1389,8 @@ async def _aggregate_campaign_preview(
         database_bytes=database_bytes,
         disk=disk,
         warning_percent=settings.disk_warning_percent,
+        safe_database_limit_bytes=settings.collection_safe_database_limit_bytes,
+        min_free_bytes=settings.collection_disk_min_free_bytes,
     )
     return {
         **result,

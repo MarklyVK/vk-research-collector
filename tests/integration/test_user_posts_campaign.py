@@ -61,6 +61,7 @@ async def test_user_posts_campaign_is_direct_idempotent_and_immutable() -> None:
         database_url=database_url(),
         collection_export_dir=".",
         collection_campaign_cohort_users=10,
+        collection_user_posts_snapshot_user_limit=1,
     )
     marker = int(uuid.uuid4().hex[:10], 16)
     try:
@@ -90,16 +91,32 @@ async def test_user_posts_campaign_is_direct_idempotent_and_immutable() -> None:
                         first_seen_at=now,
                         last_seen_at=now,
                     )
-                    session.add_all([group, user])
+                    second_user = VKUser(
+                        vk_id=marker + 1,
+                        is_closed=False,
+                        can_access_closed=False,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                    session.add_all([group, user, second_user])
                     await session.flush()
-                    session.add(
-                        GroupMembership(
-                            group_id=group.id,
-                            user_id=user.vk_id,
-                            first_seen_at=now,
-                            last_seen_at=now,
-                            is_current=True,
-                        )
+                    session.add_all(
+                        [
+                            GroupMembership(
+                                group_id=group.id,
+                                user_id=user.vk_id,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                                is_current=True,
+                            ),
+                            GroupMembership(
+                                group_id=group.id,
+                                user_id=second_user.vk_id,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                                is_current=True,
+                            ),
+                        ]
                     )
                     await session.commit()
 
@@ -115,6 +132,9 @@ async def test_user_posts_campaign_is_direct_idempotent_and_immutable() -> None:
                 preview = await manager.plan_preview()
                 assert preview["snapshot_users"] == 1
                 assert preview["due_users"] == 1
+                assert preview["eligible_users"] == 2
+                assert preview["eligible_due_users"] == 2
+                assert preview["bounded_snapshot"] is True
                 gate = {
                     **preview,
                     "decision": "passed",
@@ -149,7 +169,7 @@ async def test_user_posts_campaign_is_direct_idempotent_and_immutable() -> None:
                     assert job_types == {"collect_user_posts"}
 
                     late_user = VKUser(
-                        vk_id=marker + 1,
+                        vk_id=marker + 2,
                         is_closed=False,
                         can_access_closed=False,
                         first_seen_at=datetime.now(UTC),

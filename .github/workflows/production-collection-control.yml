@@ -14,9 +14,10 @@ on:
           - report
           - start-subscriptions
           - start-user-posts
+          - start-budgeted-collection
           - quarantine-incompatible-pilots
       confirmation:
-        description: START_SUBSCRIPTIONS, START_USER_POSTS или QUARANTINE_INCOMPATIBLE_PILOTS
+        description: START_SUBSCRIPTIONS, START_USER_POSTS, START_BUDGETED_COLLECTION или QUARANTINE_INCOMPATIBLE_PILOTS
         required: false
         type: string
 
@@ -57,6 +58,10 @@ jobs:
             start-user-posts)
               test "$GITHUB_EVENT_NAME" = workflow_dispatch
               test "$CONTROL_CONFIRMATION" = START_USER_POSTS
+              ;;
+            start-budgeted-collection)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              test "$CONTROL_CONFIRMATION" = START_BUDGETED_COLLECTION
               ;;
             quarantine-incompatible-pilots)
               test "$GITHUB_EVENT_NAME" = workflow_dispatch

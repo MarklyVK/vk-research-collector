@@ -13,6 +13,7 @@ from vk_collector.collection.pilots import (
     cancel_pilot,
     finalize_deferred_subscription_pilot,
     pilot_previews,
+    supersede_paused_capacity_campaigns,
 )
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.worker import CollectionWorker
@@ -79,6 +80,98 @@ class MetadataVK:
             }
             for value in ids
         ]
+
+
+@pytest.mark.asyncio
+async def test_supersede_capacity_campaign_preserves_pending_history_and_checkpoint() -> None:
+    engine = create_database_engine(database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    campaign_id: uuid.UUID | None = None
+    run_id: uuid.UUID | None = None
+    try:
+        async with sessions() as session:
+            campaign = CollectionCampaign(
+                campaign_type="subscription_enrichment",
+                status=CampaignStatus.PAUSED_CAPACITY_LIMIT.value,
+                phase=CampaignPhase.PAUSED_CAPACITY_LIMIT.value,
+                snapshot_at=datetime.now(UTC),
+                snapshot_max_user_id=1,
+                snapshot_user_count=2,
+                configuration={},
+                configuration_hash=uuid.uuid4().hex,
+            )
+            session.add(campaign)
+            await session.flush()
+            run = CollectionRun(
+                campaign_id=campaign.id,
+                scope="subscription_discovery",
+                status=CollectionRunStatus.PAUSED_CAPACITY_LIMIT,
+                total_jobs=2,
+            )
+            session.add(run)
+            await session.flush()
+            session.add_all(
+                [
+                    CollectionJob(
+                        collection_run_id=run.id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=1,
+                        status=JobStatus.RUNNING,
+                        locked_at=datetime.now(UTC),
+                        locked_by="old-worker",
+                        checkpoint={"offset": 50},
+                        progress_offset=50,
+                    ),
+                    CollectionJob(
+                        collection_run_id=run.id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=2,
+                        status=JobStatus.PENDING,
+                    ),
+                ]
+            )
+            await session.commit()
+            campaign_id, run_id = campaign.id, run.id
+
+        result = await supersede_paused_capacity_campaigns(
+            sessions, confirmation="SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS"
+        )
+        assert result["superseded_campaign_count"] == 1
+        assert result["cancelled_stale_leases"] == 1
+        assert result["jobs_checkpoints_data_deleted"] is False
+        async with sessions() as session:
+            campaign = await session.get(CollectionCampaign, campaign_id)
+            run = await session.get(CollectionRun, run_id)
+            jobs = list(
+                (
+                    await session.scalars(
+                        select(CollectionJob)
+                        .where(CollectionJob.collection_run_id == run_id)
+                        .order_by(CollectionJob.entity_id)
+                    )
+                ).all()
+            )
+            assert campaign is not None and campaign.status == CampaignStatus.CANCELLED.value
+            assert run is not None and run.status == CollectionRunStatus.CANCELLED
+            assert jobs[0].status == JobStatus.CANCELLED
+            assert jobs[0].checkpoint == {"offset": 50}
+            assert jobs[0].progress_offset == 50
+            assert jobs[1].status == JobStatus.PENDING
+    finally:
+        async with sessions() as session:
+            if run_id is not None:
+                await session.execute(
+                    delete(CollectionJob).where(CollectionJob.collection_run_id == run_id)
+                )
+                await session.execute(delete(CollectionRun).where(CollectionRun.id == run_id))
+            if campaign_id is not None:
+                await session.execute(
+                    delete(CollectionCampaign).where(CollectionCampaign.id == campaign_id)
+                )
+            await session.commit()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

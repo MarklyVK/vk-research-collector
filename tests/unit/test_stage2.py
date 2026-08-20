@@ -23,6 +23,7 @@ from vk_collector.collection.notifications import notify
 from vk_collector.collection.pilots import (
     choose_pilot_control_action,
     quarantine_incompatible_pilots,
+    supersede_paused_capacity_campaigns,
 )
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.collection.reporting import bounded_wakeup_delay
@@ -46,6 +47,12 @@ async def test_legacy_quarantine_requires_exact_confirmation() -> None:
         await quarantine_incompatible_pilots(  # type: ignore[arg-type]
             None, Settings(), confirmation="yes"
         )
+
+
+@pytest.mark.asyncio
+async def test_capacity_campaign_supersede_requires_exact_confirmation() -> None:
+    with pytest.raises(ValueError, match="SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS"):
+        await supersede_paused_capacity_campaigns(None, confirmation="yes")  # type: ignore[arg-type]
 
 
 def test_subscription_limit_accepts_50_but_rejects_more() -> None:
@@ -106,6 +113,29 @@ def test_aggregate_capacity_scales_gate_a_to_full_discovery_snapshot() -> None:
     assert passed["decision"] == "passed"
     assert passed["snapshot_projected_growth_bytes"] == 2_912_000
     assert passed["aggregate_projected_growth_bytes"] == 402_912_000
+
+
+def test_aggregate_capacity_never_consumes_absolute_disk_reserve() -> None:
+    result = build_aggregate_capacity_projection(
+        preview={
+            "snapshot_users": 10_000,
+            "already_resolved_users": 0,
+            "discovery_due_users": 10_000,
+            "snapshot_storage_estimate": {"heap_bytes": 640_000, "primary_key_bytes": 480_000},
+        },
+        report={
+            "limits": {"production_users": 10_000},
+            "projected": {"database_growth_bytes": 2 * 1024**3, "reserve_factor": 1.30},
+        },
+        database_bytes=2 * 1024**3,
+        disk=DiskState(70.0, False, False, 10 * 1024**3, 3 * 1024**3),
+        warning_percent=95,
+        safe_database_limit_bytes=8 * 1024**3,
+        min_free_bytes=2 * 1024**3,
+    )
+    assert result["available_growth_bytes"] == 1024**3
+    assert result["decision"] == "rejected"
+    assert result["additional_disk_required_bytes"] > 0
 
 
 def test_pilot_control_decision_is_run_id_specific_and_terminal_safe() -> None:

@@ -274,6 +274,7 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
     assert 'test "$GITHUB_EVENT_NAME" = workflow_dispatch' in workflow_text
     assert "schedule' && 'start-subscriptions'" not in workflow_text
     assert "START_USER_POSTS" in workflow_text
+    assert "START_BUDGETED_COLLECTION" in workflow_text
     assert "QUARANTINE_INCOMPATIBLE_PILOTS" in workflow_text
     assert "collection user-posts pilot" in script
     assert "collection user-posts capacity-apply" in script
@@ -321,6 +322,11 @@ def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -
         "FINALIZE_DEFERRED_SUBSCRIPTION_PILOT",
         "finalized-pilot-report",
         "REPORT_FINALIZED_SUBSCRIPTION_PILOT",
+        "COLLECTION_DISK_MIN_FREE_BYTES 2147483648",
+        "COLLECTION_SAFE_DATABASE_LIMIT_BYTES 12884901888",
+        "COLLECTION_SUBSCRIPTION_SNAPSHOT_USER_LIMIT 150000",
+        "COLLECTION_USER_POSTS_SNAPSHOT_USER_LIMIT 250000",
+        "SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS",
     )
     assert all(item in script for item in required)
     active_run_query = script.split("active_runs=$(", 1)[1].split(

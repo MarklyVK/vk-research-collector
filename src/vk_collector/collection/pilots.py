@@ -12,6 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from vk_collector.collection.queue import CollectionQueue
 from vk_collector.config import Settings
 from vk_collector.database.models import (
+    CampaignPhase,
+    CampaignStatus,
+    CollectionCampaign,
     CollectionJob,
     CollectionRun,
     CollectionRunStatus,
@@ -356,4 +359,89 @@ async def quarantine_incompatible_pilots(
             "operator_paused",
             "terminal",
         ],
+    }
+
+
+async def supersede_paused_capacity_campaigns(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    confirmation: str,
+) -> dict[str, Any]:
+    """Close capacity-rejected campaigns without deleting their jobs or checkpoints."""
+    expected = "SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS"
+    if confirmation != expected:
+        raise ValueError(f"Требуется точное confirmation {expected}")
+    now = datetime.now(UTC)
+    reason = "Заменено owner-authorized bounded snapshot; данные и checkpoints сохранены"
+    async with sessions() as session:
+        campaigns = list(
+            (
+                await session.scalars(
+                    select(CollectionCampaign)
+                    .where(
+                        CollectionCampaign.campaign_type.in_(
+                            ["subscription_enrichment", "user_posts_enrichment"]
+                        ),
+                        CollectionCampaign.status == CampaignStatus.PAUSED_CAPACITY_LIMIT.value,
+                    )
+                    .order_by(CollectionCampaign.created_at)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        campaign_ids = [campaign.id for campaign in campaigns]
+        run_ids: list[uuid.UUID] = []
+        if campaign_ids:
+            run_ids = list(
+                (
+                    await session.scalars(
+                        select(CollectionRun.id).where(
+                            CollectionRun.campaign_id.in_(campaign_ids),
+                            CollectionRun.status.not_in(TERMINAL_RUN_STATUSES),
+                        )
+                    )
+                ).all()
+            )
+        cancelled_leases = 0
+        if run_ids:
+            changed = await session.execute(
+                update(CollectionJob)
+                .where(
+                    CollectionJob.collection_run_id.in_(run_ids),
+                    CollectionJob.status == JobStatus.RUNNING,
+                )
+                .values(
+                    status=JobStatus.CANCELLED,
+                    locked_at=None,
+                    locked_by=None,
+                    heartbeat_at=None,
+                    finished_at=now,
+                    last_error_type="superseded_capacity_campaign",
+                    last_error_message=reason,
+                )
+            )
+            cancelled_leases = int(changed.rowcount or 0)  # type: ignore[attr-defined]
+            await session.execute(
+                update(CollectionRun)
+                .where(CollectionRun.id.in_(run_ids))
+                .values(
+                    status=CollectionRunStatus.CANCELLED,
+                    finished_at=now,
+                    next_wakeup_at=None,
+                    error_message=reason,
+                )
+            )
+        for campaign in campaigns:
+            campaign.status = CampaignStatus.CANCELLED.value
+            campaign.phase = CampaignPhase.CANCELLED.value
+            campaign.finished_at = now
+            campaign.next_wakeup_at = None
+            campaign.error_message = reason
+        await session.commit()
+    return {
+        "superseded_campaigns": [str(value) for value in campaign_ids],
+        "superseded_campaign_count": len(campaign_ids),
+        "cancelled_stale_leases": cancelled_leases,
+        "jobs_checkpoints_data_deleted": False,
+        "pending_history_rows_preserved": True,
     }

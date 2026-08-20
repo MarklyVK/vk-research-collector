@@ -70,6 +70,14 @@ Aggregate gate оценивает весь разрешённый snapshot и н
 cohort. Rejected decision не создаёт campaign, snapshot, run или jobs. Перед следующими
 cohorts выполняется live capacity recheck.
 
+Решением владельца от 2026-08-20 разрешён отдельный bounded production snapshot для
+продолжения сбора на существующем диске: до 150 000 due-пользователей для подписок и
+до 250 000 due-пользователей для личных стен. Это граница самого разрешённого immutable
+snapshot, а не уменьшение cohort после rejected gate: каждый bounded snapshot целиком
+проходит aggregate gate. Сбор сохраняет минимум 2 GiB свободного диска, использует
+warning 90%, emergency stop 92% и database limit 12 GiB. При достижении любого из этих
+ограничений worker и live cohort recheck ставят кампанию на capacity-паузу.
+
 Небольшой light repair по уже сохранённым пользователям и сообществам может
 чередоваться с bounded discovery cohorts. Metadata найденных сообществ, включая
 название и описание, не начинается, пока discovery всего snapshot не завершён и

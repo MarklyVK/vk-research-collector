@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     telegram_ram_warning_available_mb: int = Field(default=100, ge=1)
     disk_warning_percent: int = 85
     disk_stop_percent: int = 95
+    collection_disk_min_free_bytes: int = Field(default=0, ge=0)
+    collection_safe_database_limit_bytes: int = Field(default=7 * 1024**3, ge=1024**3)
     collection_worker_id: str = "collector-1"
     collection_max_concurrency: int = Field(default=3, ge=1, le=10)
     collection_job_lease_seconds: int = Field(default=300, ge=30)
@@ -76,6 +78,7 @@ class Settings(BaseSettings):
     collection_user_posts_ttl_days: int = Field(default=30, ge=1)
     collection_user_posts_stop_at_date: str = ""
     collection_user_posts_pilot_users: int = Field(default=500, ge=1, le=500)
+    collection_user_posts_snapshot_user_limit: int | None = Field(default=None, ge=1)
     collection_subscriptions_enabled: bool = False
     collection_subscriptions_max_per_user: int = Field(default=50, ge=1, le=50)
     collection_subscriptions_page_size: int = Field(default=50, ge=1, le=1000)
@@ -88,6 +91,7 @@ class Settings(BaseSettings):
     collection_scheduler_quantum: int = Field(default=10, ge=1, le=100)
     collection_subscription_pilot_users: int = Field(default=500, ge=1, le=500)
     collection_subscription_pilot_min_users: int = Field(default=100, ge=1, le=500)
+    collection_subscription_snapshot_user_limit: int | None = Field(default=None, ge=1)
     collection_subscription_group_posts_enabled: bool = False
     collection_subscription_group_posts_max: int = Field(default=20, ge=1, le=20)
     collection_subscription_group_posts_ttl_days: int = Field(default=30, ge=1)
@@ -100,6 +104,8 @@ class Settings(BaseSettings):
 
     @field_validator(
         "collection_members_max_per_group",
+        "collection_user_posts_snapshot_user_limit",
+        "collection_subscription_snapshot_user_limit",
         mode="before",
     )
     @classmethod

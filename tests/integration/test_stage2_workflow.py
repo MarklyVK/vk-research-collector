@@ -738,6 +738,7 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
         database_url=database_url(),
         collection_campaign_cohort_users=2,
         collection_community_metadata_ttl_days=31,
+        collection_subscription_snapshot_user_limit=1,
     )
     try:
         async with engine.connect() as connection:
@@ -789,6 +790,11 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
                     await session.commit()
                 manager = CampaignManager(sessions, settings)
                 campaign_preview = await manager.plan_preview()
+                assert campaign_preview["snapshot_users"] == 1
+                assert campaign_preview["discovery_due_users"] == 1
+                assert campaign_preview["eligible_users"] == 2
+                assert campaign_preview["eligible_due_users"] == 2
+                assert campaign_preview["bounded_snapshot"] is True
                 gate = {
                     "decision": "passed",
                     **{
@@ -912,8 +918,8 @@ async def test_campaign_is_idempotent_and_metadata_waits_for_discovery() -> None
                     for membership in memberships:
                         membership.is_current = False
                     await session.commit()
-                assert snapshot_before == 2
-                assert (await manager.status(campaign_id))["eligible_users"] == 2
+                assert snapshot_before == 1
+                assert (await manager.status(campaign_id))["eligible_users"] == 1
                 await manager.reconcile(campaign_id)
                 async with sessions() as session:
                     campaign = await session.get(CollectionCampaign, campaign_id)

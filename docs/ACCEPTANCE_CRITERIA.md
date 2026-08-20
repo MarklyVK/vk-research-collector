@@ -41,6 +41,13 @@
     attachments, state, snapshot, jobs и indexes с reserve factor не менее 1.30.
 17. Rejected user-post gate не создаёт campaign/snapshot/run/jobs; уменьшение cohort не
     обходит решение, а перед следующей cohort выполняется live capacity recheck.
+18. Owner-authorized bounded mode материализует только заранее объявленный лимит due users
+    (150 000 subscriptions и 250 000 user posts), выполняет aggregate gate для всего этого
+    snapshot и не расширяет его после создания.
+19. Bounded mode сохраняет не менее 2 GiB свободного диска; абсолютный резерв действует
+    одновременно с процентными warning/stop и проверяется worker перед выдачей jobs.
+20. Замена старых capacity-rejected campaigns не удаляет jobs, checkpoints или собранные
+    данные; terminal status получают только управляющие campaign/run и stale leases.
 18. Личная стена сохраняет максимум 20 постов не старше 180 дней, включая корректный
     zero-post success, durable checkpoint/retry и terminal privacy/unavailable state.
 19. `groups.get`, `users.get` и `wall.get` имеют независимые method cooldown; новый
