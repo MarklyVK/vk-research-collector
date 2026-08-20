@@ -508,12 +508,12 @@ start_budgeted_collection() {
 }
 
 continue_bounded_subscriptions() {
-  log 'Продолжаю подписки новым immutable snapshot до 50 000 due users с резервом 2 GiB.'
+  log 'Продолжаю подписки новым immutable snapshot до 40 000 due users с резервом 2 GiB.'
   set_env_value DISK_WARNING_PERCENT 90
   set_env_value DISK_STOP_PERCENT 92
   set_env_value COLLECTION_DISK_MIN_FREE_BYTES 2147483648
   set_env_value COLLECTION_SAFE_DATABASE_LIMIT_BYTES 12884901888
-  set_env_value COLLECTION_SUBSCRIPTION_SNAPSHOT_USER_LIMIT 50000
+  set_env_value COLLECTION_SUBSCRIPTION_SNAPSHOT_USER_LIMIT 40000
   collector collection supersede-paused-capacity-campaigns \
     --confirmation SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS
   start_subscriptions

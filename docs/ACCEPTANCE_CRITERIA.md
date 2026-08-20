@@ -55,7 +55,7 @@
 20. Замена старых capacity-rejected campaigns не удаляет jobs, checkpoints или собранные
     данные; terminal status получают только управляющие campaign/run и stale leases.
 21. Ручное продолжение подписок после capacity-паузы создаёт новый immutable snapshot
-    не более 50 000 due users, повторяет Pilot A и aggregate gate, сохраняет резерв 2 GiB
+    не более 40 000 due users, повторяет Pilot A и aggregate gate, сохраняет резерв 2 GiB
     и не изменяет активную user-post campaign.
 18. Личная стена сохраняет максимум 20 постов не старше 180 дней, включая корректный
     zero-post success, durable checkpoint/retry и terminal privacy/unavailable state.
