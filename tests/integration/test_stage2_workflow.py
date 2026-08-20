@@ -1131,7 +1131,7 @@ async def test_next_discovery_cohort_pauses_when_durable_budget_is_exceeded(
                     "current_database_bytes": initial_database,
                     "aggregate_discovery_projected_growth_bytes": 100,
                     "aggregate_projected_growth_bytes": 100,
-                    "projected_final_database_bytes": initial_database + 100,
+                    "projected_final_database_bytes": initial_database + 1024**3,
                     "current_disk_free_bytes": 8 * 1024**3,
                     "safe_database_limit_bytes": 7 * 1024**3,
                 }
