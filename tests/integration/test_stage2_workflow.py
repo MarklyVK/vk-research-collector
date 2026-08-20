@@ -1398,6 +1398,47 @@ async def test_deferred_subscription_does_not_block_next_cohort() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subscription_control_ignores_active_user_post_campaign() -> None:
+    engine = create_database_engine(database_url())
+    settings = Settings(database_url=database_url())
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            sessions = async_sessionmaker(
+                connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                now = datetime.now(UTC)
+                async with sessions() as session:
+                    session.add(
+                        CollectionCampaign(
+                            campaign_type="user_posts_enrichment",
+                            status="waiting_method_limit",
+                            phase="user_posts_collection",
+                            snapshot_at=now,
+                            snapshot_max_user_id=0,
+                            snapshot_user_count=0,
+                            configuration={},
+                            configuration_hash=uuid.uuid4().hex,
+                        )
+                    )
+                    await session.commit()
+
+                result = await CampaignManager(sessions, settings).control_decision()
+                assert result["campaigns"] == []
+                assert result["decision"] == {
+                    "action": "pilot_required",
+                    "reason": "active campaign отсутствует",
+                }
+            finally:
+                await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_metadata_batch_partial_deactivated_and_transient_are_safe() -> None:
     engine = create_database_engine(database_url())
     settings = Settings(database_url=database_url(), collection_community_metadata_batch_size=100)

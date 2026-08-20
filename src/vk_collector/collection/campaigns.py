@@ -293,7 +293,10 @@ class CampaignManager:
                 await session.execute(
                     select(CollectionCampaign, CollectionRun)
                     .outerjoin(CollectionRun, CollectionRun.campaign_id == CollectionCampaign.id)
-                    .where(CollectionCampaign.status.in_(ACTIVE_CAMPAIGN_STATUSES))
+                    .where(
+                        CollectionCampaign.campaign_type == "subscription_enrichment",
+                        CollectionCampaign.status.in_(ACTIVE_CAMPAIGN_STATUSES),
+                    )
                     .order_by(CollectionCampaign.created_at, CollectionRun.created_at)
                 )
             ).all()
