@@ -78,6 +78,11 @@ snapshot, а не уменьшение cohort после rejected gate: кажд
 warning 90%, emergency stop 92% и database limit 12 GiB. При достижении любого из этих
 ограничений worker и live cohort recheck ставят кампанию на capacity-паузу.
 
+После такой паузы владелец разрешил продолжать подписки отдельным новым immutable
+snapshot до 50 000 due-пользователей. Старый rejected snapshot при этом получает
+terminal управляющий статус без удаления jobs, checkpoints или данных; новый snapshot
+снова целиком проходит Pilot A и aggregate capacity gate с тем же резервом 2 GiB.
+
 Небольшой light repair по уже сохранённым пользователям и сообществам может
 чередоваться с bounded discovery cohorts. Metadata найденных сообществ, включая
 название и описание, не начинается, пока discovery всего snapshot не завершён и

@@ -507,6 +507,18 @@ start_budgeted_collection() {
   start_user_posts
 }
 
+continue_bounded_subscriptions() {
+  log 'Продолжаю подписки новым immutable snapshot до 50 000 due users с резервом 2 GiB.'
+  set_env_value DISK_WARNING_PERCENT 90
+  set_env_value DISK_STOP_PERCENT 92
+  set_env_value COLLECTION_DISK_MIN_FREE_BYTES 2147483648
+  set_env_value COLLECTION_SAFE_DATABASE_LIMIT_BYTES 12884901888
+  set_env_value COLLECTION_SUBSCRIPTION_SNAPSHOT_USER_LIMIT 50000
+  collector collection supersede-paused-capacity-campaigns \
+    --confirmation SUPERSEDE_PAUSED_CAPACITY_CAMPAIGNS
+  start_subscriptions
+}
+
 start_user_posts() {
   local latest_backup report_path
   log 'Фиксирую owner-authorized лимиты личных стен: 20 постов, окно 180 дней.'
@@ -539,12 +551,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --action) ACTION=${2:?}; shift 2 ;;
     --deploy-dir) DEPLOY_DIR=${2:?}; shift 2 ;;
-    -h|--help) printf 'usage: %s --action report|start-subscriptions|start-user-posts|start-budgeted-collection|accelerate-active-collection|quarantine-incompatible-pilots [--deploy-dir PATH]\n' "$0"; exit 0 ;;
+    -h|--help) printf 'usage: %s --action report|start-subscriptions|start-user-posts|start-budgeted-collection|continue-bounded-subscriptions|accelerate-active-collection|quarantine-incompatible-pilots [--deploy-dir PATH]\n' "$0"; exit 0 ;;
     *) die "Неизвестный аргумент: $1" ;;
   esac
 done
 
-[[ "$ACTION" == report || "$ACTION" == start-subscriptions || "$ACTION" == start-user-posts || "$ACTION" == start-budgeted-collection || "$ACTION" == accelerate-active-collection || "$ACTION" == quarantine-incompatible-pilots ]] \
+[[ "$ACTION" == report || "$ACTION" == start-subscriptions || "$ACTION" == start-user-posts || "$ACTION" == start-budgeted-collection || "$ACTION" == continue-bounded-subscriptions || "$ACTION" == accelerate-active-collection || "$ACTION" == quarantine-incompatible-pilots ]] \
   || die "Неизвестное действие: $ACTION"
 for command in docker flock realpath sed awk find sort df grep mktemp python3 chmod chown; do
   command -v "$command" >/dev/null 2>&1 || die "Не найдена команда: $command"
@@ -584,6 +596,11 @@ fi
 if [[ "$ACTION" == start-budgeted-collection ]]; then
   start_budgeted_collection
   log 'Срез после запуска bounded subscriptions и user posts:'
+  report
+fi
+if [[ "$ACTION" == continue-bounded-subscriptions ]]; then
+  continue_bounded_subscriptions
+  log 'Срез после продолжения bounded subscriptions:'
   report
 fi
 if [[ "$ACTION" == accelerate-active-collection ]]; then
