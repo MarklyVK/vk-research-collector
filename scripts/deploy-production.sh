@@ -550,6 +550,14 @@ compose_cli alembic check
 compose_cli collection rotate-backup-evidence \
   --backup "/app/backups/$(basename "$BACKUP_FILE")" \
   --confirmation ROTATE_ACTIVE_BACKUP_EVIDENCE
+load_protected_backups
+mapfile -t OLD_BACKUPS < <(find "$DEPLOY_DIR/backups" -maxdepth 1 -type f -name 'predeploy-*.dump' -printf '%T@ %p\n' \
+  | sort -rn | tail -n "+$((BACKUP_KEEP + 1))" | cut -d' ' -f2-)
+for old_backup in "${OLD_BACKUPS[@]}"; do
+  if [[ "$old_backup" != "$BACKUP_FILE" ]] && ! is_protected_backup "$old_backup"; then
+    rm -f -- "$old_backup"
+  fi
+done
 ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
 [[ "$ALEMBIC_REVISION" == *20260820_0013* ]] \
   || die "Alembic находится не на ожидаемом head 20260820_0013: $ALEMBIC_REVISION"

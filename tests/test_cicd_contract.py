@@ -261,6 +261,8 @@ def test_deployment_rotates_active_backup_evidence_before_worker_start() -> None
     assert rotation < worker_start
     assert "ROTATE_ACTIVE_BACKUP_EVIDENCE" in script
     assert 'PROTECTED_BACKUPS+=("$BACKUP_FILE")' in script
+    assert script.index("load_protected_backups", rotation) < worker_start
+    assert script.index('rm -f -- "$old_backup"', rotation) < worker_start
 
 
 def test_collection_control_is_scheduled_gated_and_preserves_capacity_guards() -> None:
