@@ -40,6 +40,7 @@ packages = ["src/vk_collector"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

@@ -183,8 +183,54 @@ async def fetch_eligible_company_posts(
     return posts
 
 
+def append_posts_to_jsonl(posts: list[MultimodalPost], destination: Path) -> int:
+    """Дозапись списка постов в формате JSONL (append mode)."""
+    if not posts:
+        return 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8") as f:
+        for post in posts:
+            f.write(post.model_dump_json() + "\n")
+    return len(posts)
+
+
+def get_jsonl_checkpoint(destination: Path) -> tuple[int, int, set[int]]:
+    """Быстрое определение контрольной точки из существующего JSONL файла.
+
+    Возвращает:
+        (total_posts, max_group_id, set_of_existing_post_ids)
+    """
+    if not destination.exists():
+        return 0, 0, set()
+
+    import json
+
+    total_posts = 0
+    max_group_id = 0
+    existing_post_ids: set[int] = set()
+
+    with destination.open("r", encoding="utf-8") as f:
+        for line in f:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            total_posts += 1
+            try:
+                data = json.loads(line_str)
+                pid = data.get("post_id")
+                gid = data.get("group_id")
+                if pid is not None:
+                    existing_post_ids.add(int(pid))
+                if gid is not None and int(gid) > max_group_id:
+                    max_group_id = int(gid)
+            except Exception:
+                continue
+
+    return total_posts, max_group_id, existing_post_ids
+
+
 def export_posts_to_jsonl(posts: list[MultimodalPost], destination: Path) -> Path:
-    """Сохранить список постов в формате JSONL."""
+    """Сохранить список постов в формате JSONL (перезапись)."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8") as f:
         for post in posts:
@@ -192,14 +238,24 @@ def export_posts_to_jsonl(posts: list[MultimodalPost], destination: Path) -> Pat
     return destination
 
 
-def load_posts_from_jsonl(source: Path) -> list[MultimodalPost]:
-    """Загрузить посты из файла JSONL."""
+def load_posts_from_jsonl(
+    source: Path,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[MultimodalPost]:
+    """Загрузить посты из файла JSONL с поддержкой лимита и смещения."""
     posts: list[MultimodalPost] = []
+    if not source.exists():
+        return posts
     with source.open("r", encoding="utf-8") as f:
-        for line in f:
+        for idx, line in enumerate(f):
+            if idx < offset:
+                continue
             line_str = line.strip()
             if line_str:
                 posts.append(MultimodalPost.model_validate_json(line_str))
+            if limit is not None and len(posts) >= limit:
+                break
     return posts
 
 
