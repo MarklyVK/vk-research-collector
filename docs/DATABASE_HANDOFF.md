@@ -12,7 +12,7 @@ clean restore → Alembic → verify → server worker.
 ```powershell
 .\scripts\export-server-handoff.ps1 `
   -ServerUser deploy `
-  -ServerHost 1.2.3.4 `
+  -ServerHost <SERVER_HOST> `
   -RemoteDirectory /opt/vk-research-collector/backups `
   -RunId 9be2813e-e1de-4ac9-bc07-7d92ac82438c
 ```

@@ -43,7 +43,7 @@ class OpenCVVideoDecoder:
 
     def decode_frames(self, source: Any) -> list[np.ndarray]:
         try:
-            import cv2  # type: ignore[import-not-found]
+            import cv2
         except ImportError as e:
             raise RuntimeError("OpenCV (cv2) не установлен в текущем окружении.") from e
 
