@@ -22,6 +22,7 @@ from vk_collector.database.models import (
     CollectionJobError,
     CollectionRun,
     CollectionRunStatus,
+    CommunityMemberSnapshot,
     CommunityPostCollectionState,
     GroupCandidate,
     GroupCollectionState,
@@ -1186,6 +1187,28 @@ class CollectionWorker:
                             "members_count": statement.excluded.members_count,
                             "last_seen_at": statement.excluded.last_seen_at,
                             "metadata_updated_at": statement.excluded.metadata_updated_at,
+                        },
+                    )
+                )
+                # VK не отдаёт прирост подписчиков напрямую (нет такого метода) —
+                # копим один снимок members_count в день на сообщество, чтобы
+                # считать day-over-day прирост для оценки эффективности групп.
+                snapshot_statement = insert(CommunityMemberSnapshot).values(
+                    [
+                        {
+                            "community_vk_id": row["vk_id"],
+                            "members_count": row["members_count"],
+                            "captured_at": now,
+                        }
+                        for row in normalized
+                    ]
+                )
+                await session.execute(
+                    snapshot_statement.on_conflict_do_update(
+                        constraint="uq_community_member_snapshots_community_date",
+                        set_={
+                            "members_count": snapshot_statement.excluded.members_count,
+                            "captured_at": snapshot_statement.excluded.captured_at,
                         },
                     )
                 )

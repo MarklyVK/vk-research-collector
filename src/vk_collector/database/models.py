@@ -1,7 +1,7 @@
 """Нормализованная модель данных первого этапа."""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -9,6 +9,8 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -736,6 +738,35 @@ class VKCommunity(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     metadata_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CommunityMemberSnapshot(Base):
+    """Дневной снимок members_count сообщества.
+
+    VK API не отдаёт прирост подписчиков напрямую — только текущее значение
+    в groups.getById. Эта таблица накапливает историю по одному снимку в день
+    на сообщество (идемпотентно по community_vk_id+snapshot_date), что даёт
+    возможность считать day-over-day прирост для оценки эффективности
+    конкурентных групп.
+    """
+
+    __tablename__ = "community_member_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "community_vk_id", "snapshot_date", name="uq_community_member_snapshots_community_date"
+        ),
+        Index("ix_community_member_snapshots_community_captured", "community_vk_id", "captured_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    community_vk_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_communities.vk_id", ondelete="CASCADE"), nullable=False
+    )
+    members_count: Mapped[int | None] = mapped_column(Integer)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    snapshot_date: Mapped[date] = mapped_column(
+        Date, Computed("(captured_at AT TIME ZONE 'UTC')::date", persisted=True), nullable=False
+    )
 
 
 class UserSubscriptionState(Base):

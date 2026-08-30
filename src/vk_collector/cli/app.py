@@ -33,6 +33,7 @@ from vk_collector.collection.backlog import canonical_backlog
 from vk_collector.collection.backup import BackupVerifier, rotate_active_backup_evidence
 from vk_collector.collection.campaigns import CampaignManager, build_aggregate_capacity_projection
 from vk_collector.collection.capacity import (
+    SAFE_DISK_LIMIT_BYTES,
     build_capacity_report,
     validate_capacity_report,
     write_capacity_report,
@@ -1837,7 +1838,7 @@ def subscriptions_capacity_preview() -> None:
             "posts_upper": posts,
             "estimated_bytes_upper": gate_b_bytes,
         },
-        "safe_disk_limit_bytes": 7 * 1024**3,
+        "safe_disk_limit_bytes": SAFE_DISK_LIMIT_BYTES,
         "production_allowed": False,
     }
     target = settings.collection_export_dir / "subscription-capacity-preview.json"
@@ -2322,7 +2323,7 @@ async def _run_subscription_pilot(
             and measured_growth > 0
             and isinstance(projected_growth, int)
             and isinstance(projected_database, int)
-            and projected_database <= 7 * 1024**3
+            and projected_database <= SAFE_DISK_LIMIT_BYTES
             and projected_growth <= disk.free_bytes
         )
         measured: dict[str, int | float] = {
@@ -2433,7 +2434,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
         completed = summary["status"] in {"completed", "completed_with_errors"}
         decision = (
             "passed"
-            if completed and projected is not None and projected <= 7 * 1024**3
+            if completed and projected is not None and projected <= SAFE_DISK_LIMIT_BYTES
             else "failed"
             if completed and projected is not None
             else "paused_no_tokens"
@@ -2454,7 +2455,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
             "run_id": str(run_id),
             "database_delta_bytes": delta,
             "projected_database_bytes": projected,
-            "safe_limit_bytes": 7 * 1024**3,
+            "safe_limit_bytes": SAFE_DISK_LIMIT_BYTES,
             "reserve_factor": 1.30,
             "decision": decision,
             "configuration": queue.collection_configuration(),

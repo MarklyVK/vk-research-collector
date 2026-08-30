@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 REPORT_SCHEMA_VERSION = 2
-SAFE_DISK_LIMIT_BYTES = 7 * 1024**3
+# Раньше был захардкожен как 7 * 1024**3 независимо от
+# Settings.collection_safe_database_limit_bytes (тот же COLLECTION_SAFE_DATABASE_LIMIT_BYTES,
+# который честно соблюдают campaigns.py и user_posts_campaigns.py) — из-за рассинхронизации
+# Gate A/B подписок отклонял production run на серверах с диском больше дефолтных ~7 ГиБ,
+# даже когда оператор явно поднял лимит в .env. Читаем ту же переменную окружения напрямую,
+# сохраняя дефолт 7 ГиБ для окружений, где она не задана.
+SAFE_DISK_LIMIT_BYTES = int(os.environ.get("COLLECTION_SAFE_DATABASE_LIMIT_BYTES", 7 * 1024**3))
 CapacityPhase = Literal["A", "B"]
 
 
