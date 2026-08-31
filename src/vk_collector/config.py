@@ -74,7 +74,9 @@ class Settings(BaseSettings):
     collection_user_posts_enabled: bool = True
     collection_user_posts_max_per_user: int = Field(default=20, ge=1, le=20)
     collection_user_posts_page_size: int = Field(default=20, ge=1, le=20)
-    collection_user_posts_window_days: int = Field(default=180, ge=1, le=180)
+    # Потолок поднят с 180 до 365: методология статьи (разд. 3.2) заявляет
+    # окно постов пользователя "не старше одного года", а не полугода.
+    collection_user_posts_window_days: int = Field(default=365, ge=1, le=365)
     collection_user_posts_ttl_days: int = Field(default=30, ge=1)
     collection_user_posts_stop_at_date: str = ""
     collection_user_posts_pilot_users: int = Field(default=500, ge=1, le=500)
