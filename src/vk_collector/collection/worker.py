@@ -507,6 +507,18 @@ class CollectionWorker:
                         "description": current.description,
                         "status_text": current.status_text,
                         "screen_name": current.screen_name,
+                        "community_type": str(value.get("type")) if value.get("type") else None,
+                        "is_closed": bool(value.get("is_closed", False)),
+                        "deactivated": str(value["deactivated"]) if value.get("deactivated") else None,
+                        # COALESCE: не затирать уже известный members_count, если в этом
+                        # конкретном ответе VK его не прислал (ранее ON CONFLICT вообще
+                        # не трогал колонку, из-за чего она не заполнялась годами).
+                        "members_count": func.coalesce(
+                            value.get("members_count")
+                            if isinstance(value.get("members_count"), int)
+                            else None,
+                            VKCommunity.members_count,
+                        ),
                         "last_seen_at": now,
                         "metadata_updated_at": now,
                     },
