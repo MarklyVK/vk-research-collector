@@ -1113,6 +1113,58 @@ class CollectionQueue:
             await session.commit()
             return claimed
 
+    async def claim_group_batch(self, run_id: uuid.UUID, *, limit: int) -> list[ClaimedJob]:
+        """Claim extra refresh_group jobs for one groups.getById request.
+
+        Mirrors claim_metadata_batch: groups.getById accepts up to 500 IDs per
+        call (verified live against the VK API), yet refresh_group previously
+        issued one request per group.
+        """
+        if limit <= 0:
+            return []
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            jobs = list(
+                (
+                    await session.scalars(
+                        select(CollectionJob)
+                        .where(
+                            CollectionJob.collection_run_id == run_id,
+                            CollectionJob.job_type == "refresh_group",
+                            CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY_WAIT]),
+                            or_(
+                                CollectionJob.next_attempt_at.is_(None),
+                                CollectionJob.next_attempt_at <= now,
+                            ),
+                        )
+                        .order_by(CollectionJob.entity_id)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+            claimed: list[ClaimedJob] = []
+            for job in jobs:
+                job.status = JobStatus.RUNNING
+                job.locked_at = now
+                job.heartbeat_at = now
+                job.locked_by = self._settings.collection_worker_id
+                job.started_at = job.started_at or now
+                job.attempt_count += 1
+                claimed.append(
+                    ClaimedJob(
+                        job.id,
+                        job.collection_run_id,
+                        job.job_type,
+                        job.entity_type,
+                        job.entity_id,
+                        dict(job.checkpoint),
+                        job.attempt_count,
+                    )
+                )
+            await session.commit()
+            return claimed
+
     async def release(self, jobs: list[ClaimedJob]) -> None:
         """Вернуть дополнительные batch jobs после неуспешного общего API-запроса."""
         if not jobs:

@@ -273,7 +273,8 @@ class CollectionWorker:
         started = time.monotonic()
         try:
             if job.job_type == "refresh_group":
-                await self._refresh_group(job)
+                if not await self._refresh_group(job):
+                    return
             elif job.job_type == "collect_group_posts":
                 await self._collect_posts(job)
             elif job.job_type == "collect_group_members":
@@ -463,77 +464,139 @@ class CollectionWorker:
                 raise ValueError("Approved-группа не найдена")
             return group
 
-    async def _refresh_group(self, job: ClaimedJob) -> None:
-        group = await self._group(job.entity_id)
-        rows = await self._client.get_groups([group.vk_id])
-        if not rows:
-            raise VKAPIError(18, "Группа удалена или недоступна")
-        value = rows[0]
-        if value.get("deactivated") or int(value.get("is_closed", 0)) != 0:
-            raise VKAPIError(15, "Группа закрыта, удалена или заблокирована")
+    async def _refresh_group(self, job: ClaimedJob) -> bool:
+        """Process up to collection_community_metadata_batch_size groups per
+        groups.getById request (verified live: VK accepts up to 500 IDs per call;
+        this previously issued one request per group).
+        """
+        extras = await self._queue.claim_group_batch(
+            job.run_id, limit=self._settings.collection_community_metadata_batch_size - 1
+        )
+        batch = [job, *extras]
+        try:
+            async with self._sessions() as session:
+                groups = list(
+                    (
+                        await session.scalars(
+                            select(GroupCandidate).where(
+                                GroupCandidate.id.in_([item.entity_id for item in batch])
+                            )
+                        )
+                    ).all()
+                )
+            by_group_id = {g.id: g for g in groups}
+            missing_ids = [item.entity_id for item in batch if item.entity_id not in by_group_id]
+            if missing_ids:
+                raise ValueError(f"Группы исчезли во время обновления: {missing_ids}")
+            rows = await self._client.get_groups([g.vk_id for g in groups])
+        except Exception:
+            await self._queue.release(extras)
+            raise
+        by_vk_id = {
+            value["id"]: value
+            for value in rows
+            if isinstance(value.get("id"), int) and not isinstance(value.get("id"), bool)
+        }
         now = datetime.now(UTC)
+        unavailable: dict[int, str] = {}
         async with self._sessions() as session:
-            current = await session.get(GroupCandidate, group.id, with_for_update=True)
-            if current is None:
-                raise ValueError("Группа исчезла во время обновления")
-            current.name = str(value.get("name", current.name))
-            current.description = str(value.get("description", ""))
-            current.status_text = str(value.get("status", ""))
-            screen_name = value.get("screen_name")
-            current.screen_name = str(screen_name) if screen_name else current.screen_name
-            current.last_seen_at = now
-            await session.execute(
-                insert(VKCommunity)
-                .values(
-                    vk_id=current.vk_id,
-                    name=current.name,
-                    description=current.description,
-                    status_text=current.status_text,
-                    screen_name=current.screen_name,
-                    community_type=str(value.get("type")) if value.get("type") else None,
-                    is_closed=bool(value.get("is_closed", False)),
-                    deactivated=str(value["deactivated"]) if value.get("deactivated") else None,
-                    members_count=value.get("members_count")
-                    if isinstance(value.get("members_count"), int)
-                    else None,
-                    first_seen_at=current.first_seen_at,
-                    last_seen_at=now,
-                    metadata_updated_at=now,
-                )
-                .on_conflict_do_update(
-                    index_elements=[VKCommunity.vk_id],
-                    set_={
-                        "name": current.name,
-                        "description": current.description,
-                        "status_text": current.status_text,
-                        "screen_name": current.screen_name,
-                        "community_type": str(value.get("type")) if value.get("type") else None,
-                        "is_closed": bool(value.get("is_closed", False)),
-                        "deactivated": str(value["deactivated"]) if value.get("deactivated") else None,
-                        # COALESCE: не затирать уже известный members_count, если в этом
-                        # конкретном ответе VK его не прислал (ранее ON CONFLICT вообще
-                        # не трогал колонку, из-за чего она не заполнялась годами).
-                        "members_count": func.coalesce(
-                            value.get("members_count")
-                            if isinstance(value.get("members_count"), int)
+            for group in groups:
+                value = by_vk_id.get(group.vk_id)
+                if value is None:
+                    unavailable[group.id] = "Группа удалена или недоступна"
+                    continue
+                if value.get("deactivated") or int(value.get("is_closed", 0)) != 0:
+                    unavailable[group.id] = "Группа закрыта, удалена или заблокирована"
+                    continue
+                current = await session.get(GroupCandidate, group.id, with_for_update=True)
+                if current is None:
+                    unavailable[group.id] = "Группа исчезла во время обновления"
+                    continue
+                current.name = str(value.get("name", current.name))
+                current.description = str(value.get("description", ""))
+                current.status_text = str(value.get("status", ""))
+                screen_name = value.get("screen_name")
+                current.screen_name = str(screen_name) if screen_name else current.screen_name
+                current.last_seen_at = now
+                await session.execute(
+                    insert(VKCommunity)
+                    .values(
+                        vk_id=current.vk_id,
+                        name=current.name,
+                        description=current.description,
+                        status_text=current.status_text,
+                        screen_name=current.screen_name,
+                        community_type=str(value.get("type")) if value.get("type") else None,
+                        is_closed=bool(value.get("is_closed", False)),
+                        deactivated=str(value["deactivated"]) if value.get("deactivated") else None,
+                        members_count=value.get("members_count")
+                        if isinstance(value.get("members_count"), int)
+                        else None,
+                        first_seen_at=current.first_seen_at,
+                        last_seen_at=now,
+                        metadata_updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[VKCommunity.vk_id],
+                        set_={
+                            "name": current.name,
+                            "description": current.description,
+                            "status_text": current.status_text,
+                            "screen_name": current.screen_name,
+                            "community_type": str(value.get("type")) if value.get("type") else None,
+                            "is_closed": bool(value.get("is_closed", False)),
+                            "deactivated": str(value["deactivated"])
+                            if value.get("deactivated")
                             else None,
-                            VKCommunity.members_count,
-                        ),
-                        "last_seen_at": now,
-                        "metadata_updated_at": now,
-                    },
+                            # COALESCE: не затирать уже известный members_count, если в
+                            # этом конкретном ответе VK его не прислал (раньше ON CONFLICT
+                            # вообще не трогал колонку, из-за чего она не заполнялась годами).
+                            "members_count": func.coalesce(
+                                value.get("members_count")
+                                if isinstance(value.get("members_count"), int)
+                                else None,
+                                VKCommunity.members_count,
+                            ),
+                            "last_seen_at": now,
+                            "metadata_updated_at": now,
+                        },
+                    )
                 )
-            )
-            await session.execute(
-                insert(GroupCollectionState)
-                .values(group_id=group.id, last_group_success_at=now)
-                .on_conflict_do_update(
-                    index_elements=[GroupCollectionState.group_id],
-                    set_={"last_group_success_at": now, "unavailable": False, "skip_reason": None},
+                await session.execute(
+                    insert(GroupCollectionState)
+                    .values(group_id=group.id, last_group_success_at=now)
+                    .on_conflict_do_update(
+                        index_elements=[GroupCollectionState.group_id],
+                        set_={
+                            "last_group_success_at": now,
+                            "unavailable": False,
+                            "skip_reason": None,
+                        },
+                    )
                 )
-            )
-            await self._update_metrics(session, job.id, requests=1, updated=1)
+            await self._update_metrics(session, job.id, requests=1, updated=len(groups) - len(unavailable))
             await session.commit()
+
+        for extra in extras:
+            reason = unavailable.get(extra.entity_id)
+            if reason is None:
+                await self._queue.finish(extra.id, JobStatus.COMPLETED)
+            else:
+                await self._queue.finish(
+                    extra.id,
+                    JobStatus.SKIPPED,
+                    error_type="permission_or_private",
+                    error_message=reason,
+                )
+        if job.entity_id in unavailable:
+            await self._queue.finish(
+                job.id,
+                JobStatus.SKIPPED,
+                error_type="permission_or_private",
+                error_message=unavailable[job.entity_id],
+            )
+            return False
+        return True
 
     async def _collect_posts(self, job: ClaimedJob) -> None:
         group = await self._group(job.entity_id)
