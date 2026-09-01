@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import random
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -756,17 +757,27 @@ class CollectionWorker:
             await session.commit()
 
     async def _collect_members(self, job: ClaimedJob) -> None:
+        """Two-phase member collection: exhaustively enumerate member IDs (cheap,
+        id-only pages), then draw a reproducible uniform random sample of
+        collection_members_max_per_group IDs and only fully process those.
+
+        Replaces the previous "first N members in VK's default id_asc order"
+        behaviour, which was an undisclosed order-bias (systematically the
+        oldest accounts in each group), not a representative sample.
+        """
         group = await self._group(job.entity_id)
         offset = int(job.checkpoint.get("offset", 0))
-        maximum = self._settings.collection_members_max_per_group
+        sample_size = self._settings.collection_members_max_per_group
         page_size = self._settings.collection_members_page_size
         total = 0
-        while maximum is None or offset < maximum:
-            count = page_size if maximum is None else min(page_size, maximum - offset)
-            response = await self._client.get_members_page(group.vk_id, offset, count)
+        discovered_user_ids: set[int] = set()
+
+        # Phase 1: exhaustive id-only enumeration (cheap — same endpoint/quota
+        # as before, just not stopped early at sample_size).
+        while True:
+            response = await self._client.get_members_page(group.vk_id, offset, page_size)
             raw_items = response.get("items", [])
             values = raw_items if isinstance(raw_items, list) else []
-            discovered_user_ids: set[int] = set()
             for item in values:
                 if isinstance(item, int):
                     discovered_user_ids.add(item)
@@ -774,98 +785,129 @@ class CollectionWorker:
                     raw_id = item.get("id")
                     if isinstance(raw_id, int):
                         discovered_user_ids.add(raw_id)
-            user_ids = sorted(discovered_user_ids)
             total = int(response.get("count", 0))
-            now = datetime.now(UTC)
+            offset += len(values)
             async with self._sessions() as session:
-                for user_id in user_ids:
-                    await session.execute(
-                        insert(VKUser)
-                        .values(vk_id=user_id, first_seen_at=now, last_seen_at=now)
-                        .on_conflict_do_update(
-                            index_elements=[VKUser.vk_id], set_={"last_seen_at": now}
-                        )
-                    )
-                    await session.execute(
-                        insert(GroupMembership)
-                        .values(
-                            group_id=group.id,
-                            user_id=user_id,
-                            first_seen_at=now,
-                            last_seen_at=now,
-                            source_run_id=job.run_id,
-                            is_current=True,
-                        )
-                        .on_conflict_do_update(
-                            constraint="uq_group_memberships_group_user",
-                            set_={
-                                "last_seen_at": now,
-                                "source_run_id": job.run_id,
-                                "is_current": True,
-                            },
-                        )
-                    )
-                if self._settings.collection_users_enabled and user_ids:
-                    cutoff = now - timedelta(days=self._settings.collection_user_profile_ttl_days)
-                    stale_ids = list(
-                        (
-                            await session.scalars(
-                                select(VKUser.vk_id).where(
-                                    VKUser.vk_id.in_(user_ids),
-                                    or_(
-                                        VKUser.profile_updated_at.is_(None),
-                                        VKUser.profile_updated_at < cutoff,
-                                    ),
-                                )
-                            )
-                        ).all()
-                    )
-                    for user_id in stale_ids:
-                        await session.execute(
-                            insert(CollectionJob)
-                            .values(
-                                collection_run_id=job.run_id,
-                                job_type="refresh_user_profile",
-                                entity_type="user",
-                                entity_id=user_id,
-                                priority=40,
-                            )
-                            .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
-                        )
-                offset += len(values)
                 await self._checkpoint(
-                    session, job.id, {"offset": offset, "total": total}, 1, len(user_ids)
+                    session,
+                    job.id,
+                    {"offset": offset, "total": total, "phase": "enumerate"},
+                    1,
+                    0,
                 )
                 await session.commit()
-            if not values or offset >= total or len(values) < count:
+            if not values or offset >= total or len(values) < page_size:
                 break
-        full_snapshot = offset >= total and (maximum is None or total <= maximum)
+            # Small jitter between pages: smooths the aggregate request pattern
+            # across concurrent workers on this method, on top of the token
+            # pool's own per-method rate limit (see vk_members_method_rps).
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+
+        # Phase 2: reproducible uniform random sample of the full membership.
+        # Seed is derived per-group from a fixed base seed so re-running the
+        # pipeline reproduces the same sample without storing all member IDs.
+        rng = random.Random(f"{self._settings.collection_members_sample_seed}:{group.vk_id}")
+        unique_ids = sorted(discovered_user_ids)
+        sampled_ids = (
+            unique_ids
+            if len(unique_ids) <= sample_size
+            else rng.sample(unique_ids, sample_size)
+        )
+
+        now = datetime.now(UTC)
         async with self._sessions() as session:
-            if full_snapshot:
+            for user_id in sampled_ids:
                 await session.execute(
-                    update(GroupMembership)
-                    .where(
-                        GroupMembership.group_id == group.id,
-                        GroupMembership.source_run_id != job.run_id,
+                    insert(VKUser)
+                    .values(vk_id=user_id, first_seen_at=now, last_seen_at=now)
+                    .on_conflict_do_update(
+                        index_elements=[VKUser.vk_id], set_={"last_seen_at": now}
                     )
-                    .values(is_current=False)
                 )
-            now = datetime.now(UTC)
+                await session.execute(
+                    insert(GroupMembership)
+                    .values(
+                        group_id=group.id,
+                        user_id=user_id,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        source_run_id=job.run_id,
+                        is_current=True,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_group_memberships_group_user",
+                        set_={
+                            "last_seen_at": now,
+                            "source_run_id": job.run_id,
+                            "is_current": True,
+                        },
+                    )
+                )
+            if self._settings.collection_users_enabled and sampled_ids:
+                cutoff = now - timedelta(days=self._settings.collection_user_profile_ttl_days)
+                stale_ids = list(
+                    (
+                        await session.scalars(
+                            select(VKUser.vk_id).where(
+                                VKUser.vk_id.in_(sampled_ids),
+                                or_(
+                                    VKUser.profile_updated_at.is_(None),
+                                    VKUser.profile_updated_at < cutoff,
+                                ),
+                            )
+                        )
+                    ).all()
+                )
+                for user_id in stale_ids:
+                    await session.execute(
+                        insert(CollectionJob)
+                        .values(
+                            collection_run_id=job.run_id,
+                            job_type="refresh_user_profile",
+                            entity_type="user",
+                            entity_id=user_id,
+                            priority=40,
+                        )
+                        .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                    )
+            # Superseded sample members from a previous run of this group
+            # (e.g. re-sampled after growth) are marked no longer current;
+            # enumeration is now always exhaustive, so the sample is always
+            # complete relative to the full membership known at this run.
+            await session.execute(
+                update(GroupMembership)
+                .where(
+                    GroupMembership.group_id == group.id,
+                    GroupMembership.source_run_id != job.run_id,
+                )
+                .values(is_current=False)
+            )
             await session.execute(
                 insert(GroupCollectionState)
                 .values(
                     group_id=group.id,
-                    members_checkpoint={"offset": offset, "complete": full_snapshot},
+                    members_checkpoint={
+                        "total_members": total,
+                        "sample_size": len(sampled_ids),
+                        "sample_seed": self._settings.collection_members_sample_seed,
+                        "complete": True,
+                    },
                     last_members_success_at=now,
                 )
                 .on_conflict_do_update(
                     index_elements=[GroupCollectionState.group_id],
                     set_={
-                        "members_checkpoint": {"offset": offset, "complete": full_snapshot},
+                        "members_checkpoint": {
+                            "total_members": total,
+                            "sample_size": len(sampled_ids),
+                            "sample_seed": self._settings.collection_members_sample_seed,
+                            "complete": True,
+                        },
                         "last_members_success_at": now,
                     },
                 )
             )
+            await self._update_metrics(session, job.id, requests=0, updated=len(sampled_ids))
             await session.commit()
 
     async def _refresh_user(self, job: ClaimedJob) -> None:

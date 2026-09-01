@@ -140,6 +140,7 @@ def _token_pool(
     return TokenPool(
         tokens,
         rps=settings.vk_per_token_rps,
+        method_rps_overrides={"groups.getMembers": settings.vk_members_method_rps},
         clock=time.monotonic,
         flood_initial_cooldown=settings.vk_method_flood_initial_cooldown_seconds,
         quota_initial_cooldown=settings.vk_method_quota_initial_cooldown_seconds,

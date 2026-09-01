@@ -81,6 +81,7 @@ class TokenPool:
         rps: float,
         clock: Clock,
         sleep: Sleep = asyncio.sleep,
+        method_rps_overrides: dict[str, float] | None = None,
         flood_initial_cooldown: float = 3600,
         quota_initial_cooldown: float = 3600,
         max_method_cooldown: float = 86400,
@@ -101,6 +102,11 @@ class TokenPool:
             _TokenState(value=token, fingerprint=token_fingerprint(token)) for token in clean
         ]
         self._interval = 1.0 / rps
+        if any(value <= 0 for value in (method_rps_overrides or {}).values()):
+            raise ValueError("method_rps_overrides должен быть больше нуля")
+        self._method_intervals = {
+            name: 1.0 / override_rps for name, override_rps in (method_rps_overrides or {}).items()
+        }
         self._clock = clock
         self._sleep = sleep
         self._flood_initial = flood_initial_cooldown
@@ -114,6 +120,15 @@ class TokenPool:
         self._db_initialized = False
         self._lock = asyncio.Lock()
         self._cursor = 0
+
+    def _interval_for(self, method: str) -> float:
+        """Вернуть минимальный интервал между запросами для method.
+
+        Отдельные методы (например groups.getMembers) могут иметь свой,
+        более консервативный лимит, если VK применяет к ним более строгий
+        anti-abuse порог, чем к обычным методам.
+        """
+        return self._method_intervals.get(method, self._interval)
 
     def __repr__(self) -> str:
         enabled = sum(not state.disabled for state in self._states)
@@ -145,7 +160,7 @@ class TokenPool:
                             ready_at = max(state.next_request_at, state.global_blocked_until)
                             if ready_at <= now:
                                 method_state.next_probe_at = now + self._probe_seconds
-                                state.next_request_at = now + self._interval
+                                state.next_request_at = now + self._interval_for(method)
                                 self._cursor = (index + 1) % len(self._states)
                                 return TokenLease(
                                     state.value, state.fingerprint, method, now, is_probe=True
@@ -160,7 +175,7 @@ class TokenPool:
                         continue
                     ready_at = max(state.next_request_at, state.global_blocked_until)
                     if ready_at <= now:
-                        state.next_request_at = now + self._interval
+                        state.next_request_at = now + self._interval_for(method)
                         self._cursor = (index + 1) % len(self._states)
                         return TokenLease(state.value, state.fingerprint, method, now)
                     global_retry.append(ready_at)
@@ -567,7 +582,7 @@ class TokenPool:
                                 method_row.next_probe_at = now_dt + timedelta(
                                     seconds=self._probe_seconds
                                 )
-                                row.next_request_at = now_dt + timedelta(seconds=self._interval)
+                                row.next_request_at = now_dt + timedelta(seconds=self._interval_for(method))
                                 self._cursor = (index + 1) % len(self._states)
                                 await session.commit()
                                 return TokenLease(
@@ -592,7 +607,7 @@ class TokenPool:
                         if value is not None
                     )
                     if ready_at <= now_dt:
-                        row.next_request_at = now_dt + timedelta(seconds=self._interval)
+                        row.next_request_at = now_dt + timedelta(seconds=self._interval_for(method))
                         self._cursor = (index + 1) % len(self._states)
                         await session.commit()
                         return TokenLease(local.value, local.fingerprint, method, self._clock())

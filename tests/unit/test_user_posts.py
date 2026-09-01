@@ -29,7 +29,7 @@ def test_user_posts_settings_defaults() -> None:
     assert settings.collection_user_posts_enabled is True
     assert settings.collection_user_posts_max_per_user == 20
     assert settings.collection_user_posts_page_size == 20
-    assert settings.collection_user_posts_window_days == 180
+    assert settings.collection_user_posts_window_days == 365
     assert settings.collection_user_posts_ttl_days == 30
     assert settings.collection_user_posts_pilot_users == 500
 
@@ -38,7 +38,7 @@ def test_user_posts_hard_limits_cannot_be_expanded() -> None:
     with pytest.raises(ValueError):
         Settings(collection_user_posts_max_per_user=21)
     with pytest.raises(ValueError):
-        Settings(collection_user_posts_window_days=181)
+        Settings(collection_user_posts_window_days=366)
     with pytest.raises(ValueError):
         Settings(collection_user_posts_pilot_users=501)
 
@@ -164,7 +164,7 @@ async def test_queue_enabled_scopes_and_config() -> None:
     config = queue.collection_configuration()
     assert config["user_posts_enabled"] is True
     assert config["user_posts_max_per_user"] == 20
-    assert config["user_posts_window_days"] == 180
+    assert config["user_posts_window_days"] == 365
 
 
 @pytest.mark.asyncio

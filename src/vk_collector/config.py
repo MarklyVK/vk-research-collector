@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     vk_request_timeout_seconds: float = 30
     vk_max_concurrency: int = Field(default=6, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
+    # groups.getMembers — сбор аудитории групп; VK применяет к массовому
+    # перечислению участников более строгий anti-abuse порог, чем к обычным
+    # методам (флуд-блок на ~24ч 2026-08-31 при устойчивой нагрузке 2.5 rps
+    # на токен). Отдельный, более консервативный лимит именно для этого
+    # метода снижает шанс повторной блокировки.
+    vk_members_method_rps: float = Field(default=1.0, gt=0)
     vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)
@@ -68,6 +74,10 @@ class Settings(BaseSettings):
     collection_members_enabled: bool = True
     collection_members_max_per_group: int | None = Field(default=200, ge=1)
     collection_members_page_size: int = Field(default=1000, ge=1, le=1000)
+    # Base seed for the per-group deterministic random sample of members
+    # (collection_members_max_per_group is now a sample size drawn from an
+    # exhaustively enumerated membership, not a hard fetch-and-stop cap).
+    collection_members_sample_seed: int = Field(default=20260728)
     collection_users_enabled: bool = True
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
