@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     # на токен). Отдельный, более консервативный лимит именно для этого
     # метода снижает шанс повторной блокировки.
     vk_members_method_rps: float = Field(default=1.0, gt=0)
+    # 2026-09-02: даже 1 rps/токен повторно поймал флуд-контроль в первые
+    # ~3ч после снятия предыдущей блокировки — резкий возврат на целевую
+    # скорость сразу после разблокировки сам по себе рискован. Поэтому
+    # первые vk_members_method_probation_window_seconds после последнего
+    # flood/quota-хита на токене действует более медленный probation-темп.
+    vk_members_method_probation_rps: float = Field(default=0.3, gt=0)
+    vk_members_method_probation_window_seconds: int = Field(default=7200, ge=1)
     vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)
