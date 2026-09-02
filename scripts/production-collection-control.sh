@@ -103,6 +103,21 @@ grant_collector_backup_read() {
   fi
 }
 
+create_backup() {
+  local timestamp backup_path
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  mkdir -p "$DEPLOY_DIR/backups"
+  chmod 0700 "$DEPLOY_DIR/backups"
+  backup_path="$DEPLOY_DIR/backups/pre-deploy-${timestamp}.dump"
+  log "Делаю pg_dump перед force-recreate: $backup_path"
+  compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$backup_path"
+  [[ -s "$backup_path" ]] || die "pg_dump создал пустой файл: $backup_path"
+  compose exec -T postgres pg_restore --list < "$backup_path" >/dev/null \
+    || die "Свежий backup не прошёл pg_restore --list: $backup_path"
+  chmod 0600 "$backup_path"
+  log "Backup подтверждён: $backup_path"
+}
+
 report() {
   local worker_state postgres_state current_commit
   postgres_state=$(service_state postgres)
@@ -477,6 +492,7 @@ quarantine_incompatible_pilots() {
 accelerate_active_collection() {
   local attempt worker_logs
   log 'Включаю безопасное ускорение: concurrency 6, quantum 30, VK RPS остаётся 2.5 на токен.'
+  create_backup
   set_env_value VK_MAX_CONCURRENCY 6
   set_env_value COLLECTION_MAX_CONCURRENCY 6
   set_env_value COLLECTION_SCHEDULER_QUANTUM 30
@@ -521,11 +537,11 @@ continue_bounded_subscriptions() {
 
 start_user_posts() {
   local latest_backup report_path
-  log 'Фиксирую owner-authorized лимиты личных стен: 20 постов, окно 180 дней.'
+  log 'Фиксирую owner-authorized лимиты личных стен: 20 постов, окно 365 дней.'
   set_env_value COLLECTION_USER_POSTS_ENABLED true
   set_env_value COLLECTION_USER_POSTS_MAX_PER_USER 20
   set_env_value COLLECTION_USER_POSTS_PAGE_SIZE 20
-  set_env_value COLLECTION_USER_POSTS_WINDOW_DAYS 180
+  set_env_value COLLECTION_USER_POSTS_WINDOW_DAYS 365
   latest_backup=$(find "$DEPLOY_DIR/backups" -type f -name '*.dump' -printf '%T@ %p\n' \
     | sort -nr | head -n 1 | cut -d' ' -f2-)
   [[ -n "$latest_backup" && -s "$latest_backup" ]] || die 'Нет непустого backup для user-post gate.'
