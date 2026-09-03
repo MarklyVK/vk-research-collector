@@ -866,6 +866,24 @@ class VKTokenMethodState(Base):
     )
 
 
+class VKMethodGlobalState(Base):
+    """Единый темп на VK method сразу для всего пула токенов.
+
+    Нужен методам вроде groups.getMembers, где VK, судя по наблюдениям
+    (все токены получают error 9 в пределах нескольких секунд друг от
+    друга), считает flood control по IP/приложению, а не по токену —
+    per-token пейсинга одного недостаточно.
+    """
+
+    __tablename__ = "vk_method_global_states"
+
+    method: Mapped[str] = mapped_column(String(100), primary_key=True)
+    next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class PostEmbedding(Base):
     """Мультимодальные L2-нормализованные эмбеддинги постов компаний."""
 

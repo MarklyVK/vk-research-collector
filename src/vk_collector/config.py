@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # flood/quota-хита на токене действует более медленный probation-темп.
     vk_members_method_probation_rps: float = Field(default=0.3, gt=0)
     vk_members_method_probation_window_seconds: int = Field(default=7200, ge=1)
+    # 2026-09-03: даже probation (0.3 rps на каждый из 3 токенов = 0.9 rps
+    # суммарно) не спас — все три токена поймали error 9 в пределах 3 секунд
+    # друг от друга. Похоже, VK считает flood control для этого метода по
+    # IP/приложению, а не по токену. vk_members_method_global_rps — жёсткий
+    # темп на метод сразу для ВСЕГО пула токенов (не умножается на их
+    # количество), обеспечивается через vk_method_global_states в БД.
+    vk_members_method_global_rps: float = Field(default=0.3, gt=0)
     vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)

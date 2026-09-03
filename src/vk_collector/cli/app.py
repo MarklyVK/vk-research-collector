@@ -145,6 +145,7 @@ def _token_pool(
             "groups.getMembers": settings.vk_members_method_probation_rps
         },
         method_probation_window_seconds=settings.vk_members_method_probation_window_seconds,
+        method_global_rps_overrides={"groups.getMembers": settings.vk_members_method_global_rps},
         clock=time.monotonic,
         flood_initial_cooldown=settings.vk_method_flood_initial_cooldown_seconds,
         quota_initial_cooldown=settings.vk_method_quota_initial_cooldown_seconds,
