@@ -533,6 +533,10 @@ class CollectionWorker:
                         members_count=value.get("members_count")
                         if isinstance(value.get("members_count"), int)
                         else None,
+                        city=value.get("city") if isinstance(value.get("city"), dict) else None,
+                        country=value.get("country")
+                        if isinstance(value.get("country"), dict)
+                        else None,
                         first_seen_at=current.first_seen_at,
                         last_seen_at=now,
                         metadata_updated_at=now,
@@ -558,6 +562,10 @@ class CollectionWorker:
                                 else None,
                                 VKCommunity.members_count,
                             ),
+                            "city": value.get("city") if isinstance(value.get("city"), dict) else None,
+                            "country": value.get("country")
+                            if isinstance(value.get("country"), dict)
+                            else None,
                             "last_seen_at": now,
                             "metadata_updated_at": now,
                         },

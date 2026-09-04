@@ -176,7 +176,10 @@ class VKClient:
             "groups.getById",
             {
                 "group_ids": ",".join(str(value) for value in group_ids),
-                "fields": "description,status,screen_name,members_count,is_closed,deactivated",
+                "fields": (
+                    "description,status,screen_name,members_count,is_closed,deactivated,"
+                    "city,country"
+                ),
             },
         )
         if isinstance(response, list):
