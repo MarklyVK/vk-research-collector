@@ -1290,6 +1290,10 @@ class CollectionWorker:
                     if isinstance(value.get("members_count"), int)
                     and not isinstance(value.get("members_count"), bool)
                     else None,
+                    "city": value.get("city") if isinstance(value.get("city"), dict) else None,
+                    "country": value.get("country")
+                    if isinstance(value.get("country"), dict)
+                    else None,
                     "first_seen_at": now,
                     "last_seen_at": now,
                     "metadata_updated_at": now,
@@ -1310,6 +1314,8 @@ class CollectionWorker:
                             "is_closed": statement.excluded.is_closed,
                             "deactivated": statement.excluded.deactivated,
                             "members_count": statement.excluded.members_count,
+                            "city": statement.excluded.city,
+                            "country": statement.excluded.country,
                             "last_seen_at": statement.excluded.last_seen_at,
                             "metadata_updated_at": statement.excluded.metadata_updated_at,
                         },
