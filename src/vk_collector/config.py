@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     # (collection_members_max_per_group is now a sample size drawn from an
     # exhaustively enumerated membership, not a hard fetch-and-stop cap).
     collection_members_sample_seed: int = Field(default=20260728)
+    # 2026-09-07: owner-authorized fast baseline pass — one groups.getMembers
+    # call per group (VK default order, no enumeration/random sampling),
+    # topping groups up to this many members so every approved group has a
+    # usable minimum quickly. Distinct from collection_members_max_per_group
+    # (the slower, methodologically-preferred two-phase random sample),
+    # which resumes as a second pass after this baseline completes.
+    collection_fast_top_up_target: int = Field(default=100, ge=1)
     collection_users_enabled: bool = True
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)

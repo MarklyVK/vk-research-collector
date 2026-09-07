@@ -57,6 +57,7 @@ JOB_METHODS = {
     "collect_user_subscriptions": "groups.get",
     "refresh_community_metadata": "groups.getById",
     "collect_subscription_group_posts": "wall.get",
+    "fast_top_up_members": "groups.getMembers",
 }
 FAIR_JOB_TYPES = tuple(JOB_METHODS)
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
@@ -291,6 +292,8 @@ class CollectionWorker:
                     return
             elif job.job_type == "collect_subscription_group_posts":
                 await self._collect_subscription_posts(job)
+            elif job.job_type == "fast_top_up_members":
+                await self._fast_top_up_members(job)
             else:
                 raise ValueError(f"Неизвестный тип задания: {job.job_type}")
             await self._queue.finish(job.id, JobStatus.COMPLETED)
@@ -916,6 +919,145 @@ class CollectionWorker:
                 )
             )
             await self._update_metrics(session, job.id, requests=0, updated=len(sampled_ids))
+            await session.commit()
+
+    async def _fast_top_up_members(self, job: ClaimedJob) -> None:
+        """Owner-authorized fast baseline pass (2026-09-07): one groups.getMembers
+        call per group, VK's default order, no enumeration/random sampling —
+        tops the group up to collection_fast_top_up_target members quickly.
+
+        Groups with fewer real members than the target are marked unavailable
+        with a skip_reason (excluded-group count for the article). Queues
+        refresh_user_profile / collect_user_subscriptions / collect_user_posts
+        for the returned members at elevated priority so the full profile
+        (demography + subscriptions + posts) completes fast for this cohort,
+        ahead of the much larger pre-existing general backlog.
+        """
+        group = await self._group(job.entity_id)
+        target = self._settings.collection_fast_top_up_target
+        response = await self._client.get_members_page(group.vk_id, 0, target)
+        raw_items = response.get("items", [])
+        values = raw_items if isinstance(raw_items, list) else []
+        member_ids: list[int] = []
+        for item in values:
+            if isinstance(item, int):
+                member_ids.append(item)
+            elif isinstance(item, dict):
+                raw_id = item.get("id")
+                if isinstance(raw_id, int):
+                    member_ids.append(raw_id)
+        total = int(response.get("count", 0))
+        now = datetime.now(UTC)
+
+        async with self._sessions() as session:
+            if total < target:
+                reason = f"fast_top_up: в группе {total} участников, меньше цели {target}"
+                await session.execute(
+                    insert(GroupCollectionState)
+                    .values(
+                        group_id=group.id,
+                        unavailable=True,
+                        skip_reason=reason,
+                        last_members_success_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[GroupCollectionState.group_id],
+                        set_={
+                            "unavailable": True,
+                            "skip_reason": reason,
+                            "last_members_success_at": now,
+                        },
+                    )
+                )
+                await self._update_metrics(session, job.id, requests=1, updated=0)
+                await session.commit()
+                return
+
+            for user_id in member_ids:
+                await session.execute(
+                    insert(VKUser)
+                    .values(vk_id=user_id, first_seen_at=now, last_seen_at=now)
+                    .on_conflict_do_update(
+                        index_elements=[VKUser.vk_id], set_={"last_seen_at": now}
+                    )
+                )
+                await session.execute(
+                    insert(GroupMembership)
+                    .values(
+                        group_id=group.id,
+                        user_id=user_id,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        source_run_id=job.run_id,
+                        is_current=True,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_group_memberships_group_user",
+                        set_={
+                            "last_seen_at": now,
+                            "source_run_id": job.run_id,
+                            "is_current": True,
+                        },
+                    )
+                )
+            for user_id in member_ids:
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        collection_run_id=job.run_id,
+                        job_type="refresh_user_profile",
+                        entity_type="user",
+                        entity_id=user_id,
+                        priority=5,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        collection_run_id=job.run_id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=user_id,
+                        priority=5,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        collection_run_id=job.run_id,
+                        job_type="collect_user_posts",
+                        entity_type="user",
+                        entity_id=user_id,
+                        priority=5,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+            await session.execute(
+                insert(GroupCollectionState)
+                .values(
+                    group_id=group.id,
+                    members_checkpoint={
+                        "fast_top_up": True,
+                        "target": target,
+                        "collected": len(member_ids),
+                    },
+                    last_members_success_at=now,
+                )
+                .on_conflict_do_update(
+                    index_elements=[GroupCollectionState.group_id],
+                    set_={
+                        "members_checkpoint": {
+                            "fast_top_up": True,
+                            "target": target,
+                            "collected": len(member_ids),
+                        },
+                        "last_members_success_at": now,
+                    },
+                )
+            )
+            await self._update_metrics(session, job.id, requests=1, updated=len(member_ids))
             await session.commit()
 
     async def _refresh_user(self, job: ClaimedJob) -> None:
