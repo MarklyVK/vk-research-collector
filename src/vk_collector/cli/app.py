@@ -140,9 +140,17 @@ def _token_pool(
     return TokenPool(
         tokens,
         rps=settings.vk_per_token_rps,
-        method_rps_overrides={"groups.getMembers": settings.vk_members_method_rps},
+        method_rps_overrides={
+            "groups.getMembers": settings.vk_members_method_rps,
+            "users.get": settings.vk_users_get_method_rps,
+            "groups.get": settings.vk_groups_get_method_rps,
+            "wall.get": settings.vk_wall_get_method_rps,
+        },
         method_probation_rps_overrides={
-            "groups.getMembers": settings.vk_members_method_probation_rps
+            "groups.getMembers": settings.vk_members_method_probation_rps,
+            "users.get": settings.vk_core_methods_probation_rps,
+            "groups.get": settings.vk_core_methods_probation_rps,
+            "wall.get": settings.vk_core_methods_probation_rps,
         },
         method_probation_window_seconds=settings.vk_members_method_probation_window_seconds,
         method_global_rps_overrides={"groups.getMembers": settings.vk_members_method_global_rps},

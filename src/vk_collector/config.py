@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     # темп на метод сразу для ВСЕГО пула токенов (не умножается на их
     # количество), обеспечивается через vk_method_global_states в БД.
     vk_members_method_global_rps: float = Field(default=0.3, gt=0)
+    # 2026-09-17: после починки claim-запроса (отсутствующий индекс держал
+    # реальную скорость << лимита VK неделями) система впервые вышла на
+    # устойчивые 2.5 rps/токен — и в течение ~20 минут users.get поймал
+    # флуд-контроль на ВСЕХ трёх токенах, groups.get/wall.get на одном.
+    # Отдельные, более консервативные лимиты для трёх основных методов,
+    # с тем же probation-механизмом, что уже проверен на groups.getMembers.
+    vk_users_get_method_rps: float = Field(default=1.5, gt=0)
+    vk_groups_get_method_rps: float = Field(default=1.5, gt=0)
+    vk_wall_get_method_rps: float = Field(default=1.5, gt=0)
+    vk_core_methods_probation_rps: float = Field(default=0.5, gt=0)
+    vk_core_methods_probation_window_seconds: int = Field(default=7200, ge=1)
     vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)
