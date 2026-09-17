@@ -166,7 +166,9 @@ def _token_pool(
     )
 
 
-async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]:
+async def _run_search(
+    subject: SubjectName | None, city_id: int | None = None
+) -> tuple[str, dict[str, Any]]:
     settings = get_settings()
     keyword_config = load_keyword_config()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -182,6 +184,7 @@ async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]
             client,
             PostgresSearchPersistence(sessions),
             group_types=tuple(keyword_config.community_types),
+            city_id=city_id,
         )
         keywords = tuple(
             Keyword(value=item.keyword, subject=item.subject)
@@ -203,11 +206,15 @@ def search_groups(
         str | None,
         typer.Option("--subject", help="Искать только одну предметную область."),
     ] = None,
+    city_id: Annotated[
+        int | None,
+        typer.Option("--city-id", help="Ограничить поиск VK city_id (groups.search)."),
+    ] = None,
 ) -> None:
     """Запустить новый поиск или продолжить незавершённый."""
     try:
         validated_subject = ensure_subject(subject) if subject is not None else None
-        run_id, summary = asyncio.run(_run_search(validated_subject))
+        run_id, summary = asyncio.run(_run_search(validated_subject, city_id))
     except ValueError as exc:
         typer.echo(f"Поиск отклонён: {exc}", err=True)
         raise typer.Exit(code=2) from exc
