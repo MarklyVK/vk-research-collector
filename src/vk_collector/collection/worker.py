@@ -10,7 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import Table, delete, func, or_, select, update
+from sqlalchemy import Table, and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -284,8 +284,12 @@ class CollectionWorker:
             elif job.job_type == "refresh_user_profile":
                 await self._refresh_user(job)
             elif job.job_type == "collect_user_posts":
+                if await self._skip_fresh(job):
+                    return
                 await self._collect_user_posts(job)
             elif job.job_type == "collect_user_subscriptions":
+                if await self._skip_fresh(job):
+                    return
                 await self._collect_subscriptions(job)
             elif job.job_type == "refresh_community_metadata":
                 if not await self._refresh_community_metadata(job):
@@ -1207,6 +1211,68 @@ class CollectionWorker:
             )
         if job.entity_id not in by_id:
             raise VKAPIError(18, "Пользователь удалён или недоступен")
+
+    async def _skip_fresh(self, job: ClaimedJob) -> bool:
+        """Закрыть job без запроса к VK, если пользователь собран недавно.
+
+        Состояние пользователя общее для всех runs и кампаний, поэтому тот же
+        пользователь из другого run (или повтор после недавнего сбора) не
+        запрашивается повторно. Job, начатый с ненулевого checkpoint, не
+        пропускается: его страницы уже частично записаны. Явно наступивший
+        next_scheduled_at (пересбор назначен системой) тоже отменяет пропуск.
+        """
+        days = self._settings.collection_skip_fresh_days
+        if days <= 0 or int(job.checkpoint.get("offset", 0)) > 0:
+            return False
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=days)
+        async with self._sessions() as session:
+            if job.job_type == "collect_user_subscriptions":
+                fresh = await session.scalar(
+                    select(UserSubscriptionState.user_id).where(
+                        UserSubscriptionState.user_id == job.entity_id,
+                        or_(
+                            UserSubscriptionState.next_scheduled_at.is_(None),
+                            UserSubscriptionState.next_scheduled_at > now,
+                        ),
+                        or_(
+                            UserSubscriptionState.last_success_at >= cutoff,
+                            and_(
+                                UserSubscriptionState.terminal_reason.is_not(None),
+                                UserSubscriptionState.last_attempt_at >= cutoff,
+                            ),
+                        ),
+                    )
+                )
+            else:
+                fresh = await session.scalar(
+                    select(UserPostCollectionState.user_id).where(
+                        UserPostCollectionState.user_id == job.entity_id,
+                        or_(
+                            UserPostCollectionState.next_scheduled_at.is_(None),
+                            UserPostCollectionState.next_scheduled_at > now,
+                        ),
+                        or_(
+                            UserPostCollectionState.last_success_at >= cutoff,
+                            and_(
+                                or_(
+                                    UserPostCollectionState.wall_private.is_(True),
+                                    UserPostCollectionState.unavailable.is_(True),
+                                ),
+                                UserPostCollectionState.last_attempt_at >= cutoff,
+                            ),
+                        ),
+                    )
+                )
+        if fresh is None:
+            return False
+        await self._queue.finish(
+            job.id,
+            JobStatus.SKIPPED,
+            error_type="fresh_recently_collected",
+            error_message=f"Данные пользователя собраны менее {days} дн. назад",
+        )
+        return True
 
     async def _collect_subscriptions(self, job: ClaimedJob) -> None:
         offset = int(job.checkpoint.get("offset", 0))

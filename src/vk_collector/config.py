@@ -128,6 +128,11 @@ class Settings(BaseSettings):
     collection_subscriptions_page_size: int = Field(default=50, ge=1, le=1000)
     collection_subscriptions_users_per_run: int = Field(default=10000, ge=1)
     collection_subscriptions_ttl_days: int = Field(default=30, ge=1)
+    # Не запрашивать у VK подписки/посты пользователя, если они уже собраны
+    # (или получен terminal-ответ) за последние N дней — в любом run/кампании.
+    # 0 выключает проверку. Намеренно не входит в collection_configuration():
+    # объём и семантика данных не меняются, а active runs не уходят в паузу.
+    collection_skip_fresh_days: int = Field(default=30, ge=0)
     collection_campaign_cohort_users: int = Field(default=10_000, ge=1, le=10_000)
     collection_light_repair_cohort_size: int = Field(default=10_000, ge=1, le=10_000)
     collection_community_metadata_batch_size: int = Field(default=100, ge=1, le=100)
