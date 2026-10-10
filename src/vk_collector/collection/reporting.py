@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import distinct, func, select
@@ -112,6 +112,68 @@ async def runnable_run_ids(
                 )
             ).all()
         )
+
+
+SCHEDULER_PRIORITY_KEY = "scheduler_priority"
+SCHEDULER_PRIORITY_MAX_HOURS = 24
+
+
+def scheduler_priority(hours: float, *, now: datetime) -> dict[str, str]:
+    """Собрать ограниченную по времени пометку приоритета для run.configuration."""
+    if not 0 < hours <= SCHEDULER_PRIORITY_MAX_HOURS:
+        raise ValueError(f"Приоритет задаётся на срок от 0 до {SCHEDULER_PRIORITY_MAX_HOURS} ч")
+    return {
+        "level": "high",
+        "set_at": now.isoformat(),
+        "until": (now + timedelta(hours=hours)).isoformat(),
+    }
+
+
+def priority_active(configuration: dict[str, Any], *, now: datetime) -> bool:
+    """Приоритет действует только до своего until и снимается сам."""
+    value = configuration.get(SCHEDULER_PRIORITY_KEY)
+    if not isinstance(value, dict) or value.get("level") != "high":
+        return False
+    try:
+        until = datetime.fromisoformat(str(value.get("until")))
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        return False
+    return until > now
+
+
+async def high_priority_run_ids(
+    sessions: async_sessionmaker[AsyncSession],
+    targets: list[uuid.UUID],
+    *,
+    now: datetime,
+) -> list[uuid.UUID]:
+    """Вернуть runnable runs с действующим приоритетом в порядке targets."""
+    if not targets:
+        return []
+    async with sessions() as session:
+        rows = (
+            await session.execute(
+                select(CollectionRun.id, CollectionRun.configuration).where(
+                    CollectionRun.id.in_(targets),
+                    CollectionRun.configuration.has_key(SCHEDULER_PRIORITY_KEY),
+                )
+            )
+        ).all()
+    active = {run_id for run_id, configuration in rows if priority_active(configuration, now=now)}
+    return [run_id for run_id in targets if run_id in active]
+
+
+def scheduling_order(
+    targets: list[uuid.UUID], high: list[uuid.UUID], cursor: int
+) -> list[uuid.UUID]:
+    """High-priority runs первыми, остальные — прежним справедливым кругом."""
+    normal = [run_id for run_id in targets if run_id not in set(high)]
+    if normal:
+        start = cursor % len(normal)
+        normal = normal[start:] + normal[:start]
+    return [*high, *normal]
 
 
 async def next_runnable_wakeup(

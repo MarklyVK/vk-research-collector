@@ -49,14 +49,18 @@ from vk_collector.collection.pilots import (
 )
 from vk_collector.collection.recovery import reconcile_capacity_paused_campaigns
 from vk_collector.collection.reporting import (
+    SCHEDULER_PRIORITY_KEY,
     bounded_wakeup_delay,
     capacity_gate_passed,
     database_metrics,
     global_summary,
+    high_priority_run_ids,
     latest_run_id,
     next_runnable_wakeup,
     run_summary,
     runnable_run_ids,
+    scheduler_priority,
+    scheduling_order,
     verify_run,
 )
 from vk_collector.collection.safety import inspect_disk
@@ -868,7 +872,8 @@ async def _collection_worker_service() -> None:
                     timeout=settings.vk_request_timeout_seconds,
                 )
                 worker = CollectionWorker(sessions, client, settings)
-            ordered = targets[run_cursor:] + targets[:run_cursor]
+            high = await high_priority_run_ids(sessions, targets, now=datetime.now(UTC))
+            ordered = scheduling_order(targets, high, run_cursor)
             run_cursor = (run_cursor + 1) % len(targets)
             processed = 0
             for target in ordered:
@@ -879,13 +884,18 @@ async def _collection_worker_service() -> None:
                         sessions, settings, target, backup_verifier=backup_verifier
                     )
                     assert worker is not None
-                    processed += await worker.run(
+                    target_processed = await worker.run(
                         target,
                         scope=claim_scope,
                         max_jobs=settings.collection_scheduler_quantum,
                         stop_event=stop_event,
                         until_idle=True,
                     )
+                    processed += target_processed
+                    if target in high and target_processed:
+                        # Приоритетный run с работой снова берётся первым на следующем круге;
+                        # остальные runs получают квант, только когда у него нет доступных jobs.
+                        break
                 except ValueError as exc:
                     queue = CollectionQueue(sessions, settings)
                     await queue.set_run_status(
@@ -2100,6 +2110,49 @@ def pause_collection(run_id: Annotated[uuid.UUID, typer.Option("--run-id")]) -> 
     """Поставить pending jobs на паузу."""
     asyncio.run(_change_run_status(run_id, CollectionRunStatus.PAUSED))
     typer.echo(f"Run {run_id} поставлен на паузу.")
+
+
+async def _set_run_priority(run_id: uuid.UUID, hours: float | None) -> dict[str, str] | None:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    try:
+        async with sessions() as session:
+            run = await session.get(CollectionRun, run_id, with_for_update=True)
+            if run is None:
+                raise ValueError("Run не найден")
+            configuration = dict(run.configuration)
+            value = scheduler_priority(hours, now=datetime.now(UTC)) if hours is not None else None
+            if value is None:
+                configuration.pop(SCHEDULER_PRIORITY_KEY, None)
+            else:
+                configuration[SCHEDULER_PRIORITY_KEY] = value
+            run.configuration = configuration
+            await session.commit()
+            return value
+    finally:
+        await engine.dispose()
+
+
+@collection_app.command("priority")
+def set_run_priority(
+    run_id: Annotated[uuid.UUID, typer.Option("--run-id")],
+    hours: Annotated[float | None, typer.Option("--hours", help="Срок, не более 24 ч")] = None,
+    clear: Annotated[bool, typer.Option("--clear")] = False,
+) -> None:
+    """Временно отдавать run первым в планировщике worker (снимается сам по сроку)."""
+    if clear == (hours is not None):
+        typer.echo("Укажите ровно одно: --hours N или --clear.", err=True)
+        raise typer.Exit(code=2)
+    try:
+        value = asyncio.run(_set_run_priority(run_id, None if clear else hours))
+    except ValueError as exc:
+        typer.echo(f"Приоритет не изменён: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if value is None:
+        typer.echo(f"Run {run_id}: приоритет снят.")
+    else:
+        typer.echo(f"Run {run_id}: высокий приоритет до {value['until']}.")
 
 
 @collection_app.command("resume")
