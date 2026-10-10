@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -39,7 +39,7 @@ class PostgresSearchPersistence:
             )
             .returning(SearchKeyword.id)
         )
-        return int(await session.scalar(statement))
+        return int(cast(int, await session.scalar(statement)))
 
     async def start_or_resume_run(
         self, keywords: tuple[Keyword, ...], *, city_id: int | None = None

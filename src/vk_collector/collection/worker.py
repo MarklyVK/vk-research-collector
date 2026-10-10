@@ -565,7 +565,9 @@ class CollectionWorker:
                                 else None,
                                 VKCommunity.members_count,
                             ),
-                            "city": value.get("city") if isinstance(value.get("city"), dict) else None,
+                            "city": value.get("city")
+                            if isinstance(value.get("city"), dict)
+                            else None,
                             "country": value.get("country")
                             if isinstance(value.get("country"), dict)
                             else None,
@@ -586,7 +588,9 @@ class CollectionWorker:
                         },
                     )
                 )
-            await self._update_metrics(session, job.id, requests=1, updated=len(groups) - len(unavailable))
+            await self._update_metrics(
+                session, job.id, requests=1, updated=len(groups) - len(unavailable)
+            )
             await session.commit()
 
         for extra in extras:
@@ -821,7 +825,7 @@ class CollectionWorker:
         unique_ids = sorted(discovered_user_ids)
         sampled_ids = (
             unique_ids
-            if len(unique_ids) <= sample_size
+            if sample_size is None or len(unique_ids) <= sample_size
             else rng.sample(unique_ids, sample_size)
         )
 

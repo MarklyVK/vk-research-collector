@@ -116,7 +116,7 @@ class VKClient:
         group_type: str = "group",
         city_id: int | None = None,
     ) -> VKSearchPage:
-        params: dict[str, object] = {
+        params: dict[str, str | int] = {
             "q": query,
             "offset": offset,
             "count": count,

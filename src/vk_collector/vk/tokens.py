@@ -157,11 +157,12 @@ class TokenPool:
         base = self._method_intervals.get(method, self._interval)
         probation = self._method_probation_intervals.get(method)
         if probation is not None and last_error_at is not None:
-            elapsed = (
-                (now - last_error_at).total_seconds()
-                if isinstance(now, datetime)
-                else now - last_error_at
-            )
+            if isinstance(now, datetime) and isinstance(last_error_at, datetime):
+                elapsed = (now - last_error_at).total_seconds()
+            elif isinstance(now, (int, float)) and isinstance(last_error_at, (int, float)):
+                elapsed = now - last_error_at
+            else:
+                return base
             if elapsed < self._probation_window:
                 return max(base, probation)
         return base
@@ -232,7 +233,8 @@ class TokenPool:
                                 self._method_global_next[method] = now + global_interval
                             return TokenLease(state.value, state.fingerprint, method, now)
                         global_retry.append(ready_at)
-                    # Если хотя бы один токен годится для method, ждём только короткий global/RPS slot.
+                    # Если хотя бы один токен годится для method,
+                    # ждём только короткий global/RPS slot.
                     method_capable = any(
                         state.methods.get(method, _MethodState()).blocked_until <= now
                         or state.methods.get(method, _MethodState()).next_probe_at <= now
@@ -652,7 +654,11 @@ class TokenPool:
                                 method_capable = True
                                 ready_at = max(
                                     value
-                                    for value in (row.next_request_at, row.global_blocked_until, now_dt)
+                                    for value in (
+                                        row.next_request_at,
+                                        row.global_blocked_until,
+                                        now_dt,
+                                    )
                                     if value is not None
                                 )
                                 if ready_at <= now_dt:
@@ -660,7 +666,9 @@ class TokenPool:
                                         seconds=self._probe_seconds
                                     )
                                     row.next_request_at = now_dt + timedelta(
-                                        seconds=self._interval_for(method, method_row.last_error_at, now_dt)
+                                        seconds=self._interval_for(
+                                            method, method_row.last_error_at, now_dt
+                                        )
                                     )
                                     self._cursor = (index + 1) % len(self._states)
                                     if global_interval is not None and global_row is not None:
@@ -697,7 +705,9 @@ class TokenPool:
                             )
                             self._cursor = (index + 1) % len(self._states)
                             if global_interval is not None and global_row is not None:
-                                global_row.next_request_at = now_dt + timedelta(seconds=global_interval)
+                                global_row.next_request_at = now_dt + timedelta(
+                                    seconds=global_interval
+                                )
                             await session.commit()
                             return TokenLease(local.value, local.fingerprint, method, self._clock())
                         global_retry.append(ready_at)

@@ -52,4 +52,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Downgrade community_member_snapshots migration запрещён; восстановите backup")
+    raise RuntimeError(
+        "Downgrade community_member_snapshots migration запрещён; восстановите backup"
+    )

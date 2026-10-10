@@ -738,8 +738,8 @@ class VKCommunity(Base):
     # {"id": int, "title": str} из groups.getById(fields=city,country) — не
     # у всех сообществ заполнено в VK, для локального бизнеса (наш домен:
     # доставка еды/кафе) обычно указано.
-    city: Mapped[dict | None] = mapped_column(JSONB)
-    country: Mapped[dict | None] = mapped_column(JSONB)
+    city: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    country: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     metadata_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

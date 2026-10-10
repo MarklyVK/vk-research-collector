@@ -1,4 +1,6 @@
-"""Add city/country jsonb columns to vk_communities (Mini App region filter needs real city data, previously not collected).
+"""Add city/country jsonb columns to vk_communities.
+
+Mini App region filter needs real city data, previously not collected.
 
 Revision ID: 20260904_0016
 Revises: 20260903_0015
@@ -28,4 +30,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Downgrade vk_communities city/country migration запрещён; восстановите backup")
+    raise RuntimeError(
+        "Downgrade vk_communities city/country migration запрещён; восстановите backup"
+    )

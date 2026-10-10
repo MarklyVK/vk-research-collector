@@ -1,4 +1,6 @@
-"""Create vk_method_global_states for cross-token method pacing (VK flood control appears app/IP-scoped, not per-token).
+"""Create vk_method_global_states for cross-token method pacing.
+
+VK flood control appears app/IP-scoped, not per-token.
 
 Revision ID: 20260903_0015
 Revises: 20260830_0014
