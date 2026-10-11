@@ -49,3 +49,16 @@ def test_unknown_subject_is_rejected(tmp_path: Path) -> None:
     target.write_text(source.replace("  food_service:", "  unknown_subject:"), encoding="utf-8")
     with pytest.raises(ValueError, match="Неизвестная"):
         load_keyword_config(target)
+
+
+def test_skip_fresh_days_is_outside_immutable_run_configuration() -> None:
+    """Active runs сверяют collection_configuration(); новая настройка не должна её менять."""
+    from vk_collector.collection.queue import CollectionQueue
+
+    def configuration(days: int) -> dict[str, object]:
+        settings = Settings(collection_skip_fresh_days=days)
+        return CollectionQueue(None, settings).collection_configuration()  # type: ignore[arg-type]
+
+    assert Settings().collection_skip_fresh_days == 30
+    assert configuration(30) == configuration(0) == configuration(7)
+    assert not any("fresh" in key for key in configuration(30))
