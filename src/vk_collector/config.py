@@ -24,6 +24,37 @@ class Settings(BaseSettings):
     vk_request_timeout_seconds: float = 30
     vk_max_concurrency: int = Field(default=6, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
+    # groups.getMembers — сбор аудитории групп; VK применяет к массовому
+    # перечислению участников более строгий anti-abuse порог, чем к обычным
+    # методам (флуд-блок на ~24ч 2026-08-31 при устойчивой нагрузке 2.5 rps
+    # на токен). Отдельный, более консервативный лимит именно для этого
+    # метода снижает шанс повторной блокировки.
+    vk_members_method_rps: float = Field(default=1.0, gt=0)
+    # 2026-09-02: даже 1 rps/токен повторно поймал флуд-контроль в первые
+    # ~3ч после снятия предыдущей блокировки — резкий возврат на целевую
+    # скорость сразу после разблокировки сам по себе рискован. Поэтому
+    # первые vk_members_method_probation_window_seconds после последнего
+    # flood/quota-хита на токене действует более медленный probation-темп.
+    vk_members_method_probation_rps: float = Field(default=0.3, gt=0)
+    vk_members_method_probation_window_seconds: int = Field(default=7200, ge=1)
+    # 2026-09-03: даже probation (0.3 rps на каждый из 3 токенов = 0.9 rps
+    # суммарно) не спас — все три токена поймали error 9 в пределах 3 секунд
+    # друг от друга. Похоже, VK считает flood control для этого метода по
+    # IP/приложению, а не по токену. vk_members_method_global_rps — жёсткий
+    # темп на метод сразу для ВСЕГО пула токенов (не умножается на их
+    # количество), обеспечивается через vk_method_global_states в БД.
+    vk_members_method_global_rps: float = Field(default=0.3, gt=0)
+    # 2026-09-17: после починки claim-запроса (отсутствующий индекс держал
+    # реальную скорость << лимита VK неделями) система впервые вышла на
+    # устойчивые 2.5 rps/токен — и в течение ~20 минут users.get поймал
+    # флуд-контроль на ВСЕХ трёх токенах, groups.get/wall.get на одном.
+    # Отдельные, более консервативные лимиты для трёх основных методов,
+    # с тем же probation-механизмом, что уже проверен на groups.getMembers.
+    vk_users_get_method_rps: float = Field(default=1.5, gt=0)
+    vk_groups_get_method_rps: float = Field(default=1.5, gt=0)
+    vk_wall_get_method_rps: float = Field(default=1.5, gt=0)
+    vk_core_methods_probation_rps: float = Field(default=0.5, gt=0)
+    vk_core_methods_probation_window_seconds: int = Field(default=7200, ge=1)
     vk_method_flood_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_quota_initial_cooldown_seconds: int = Field(default=3600, ge=1)
     vk_method_limit_max_cooldown_seconds: int = Field(default=86400, ge=1)
@@ -68,13 +99,26 @@ class Settings(BaseSettings):
     collection_members_enabled: bool = True
     collection_members_max_per_group: int | None = Field(default=200, ge=1)
     collection_members_page_size: int = Field(default=1000, ge=1, le=1000)
+    # Base seed for the per-group deterministic random sample of members
+    # (collection_members_max_per_group is now a sample size drawn from an
+    # exhaustively enumerated membership, not a hard fetch-and-stop cap).
+    collection_members_sample_seed: int = Field(default=20260728)
+    # 2026-09-07: owner-authorized fast baseline pass — one groups.getMembers
+    # call per group (VK default order, no enumeration/random sampling),
+    # topping groups up to this many members so every approved group has a
+    # usable minimum quickly. Distinct from collection_members_max_per_group
+    # (the slower, methodologically-preferred two-phase random sample),
+    # which resumes as a second pass after this baseline completes.
+    collection_fast_top_up_target: int = Field(default=100, ge=1)
     collection_users_enabled: bool = True
     collection_user_profile_ttl_days: int = Field(default=30, ge=1)
     collection_user_batch_size: int = Field(default=1000, ge=1, le=1000)
     collection_user_posts_enabled: bool = True
     collection_user_posts_max_per_user: int = Field(default=20, ge=1, le=20)
     collection_user_posts_page_size: int = Field(default=20, ge=1, le=20)
-    collection_user_posts_window_days: int = Field(default=180, ge=1, le=180)
+    # Потолок поднят с 180 до 365: методология статьи (разд. 3.2) заявляет
+    # окно постов пользователя "не старше одного года", а не полугода.
+    collection_user_posts_window_days: int = Field(default=365, ge=1, le=365)
     collection_user_posts_ttl_days: int = Field(default=30, ge=1)
     collection_user_posts_stop_at_date: str = ""
     collection_user_posts_pilot_users: int = Field(default=500, ge=1, le=500)
@@ -84,6 +128,11 @@ class Settings(BaseSettings):
     collection_subscriptions_page_size: int = Field(default=50, ge=1, le=1000)
     collection_subscriptions_users_per_run: int = Field(default=10000, ge=1)
     collection_subscriptions_ttl_days: int = Field(default=30, ge=1)
+    # Не запрашивать у VK подписки/посты пользователя, если они уже собраны
+    # (или получен terminal-ответ) за последние N дней — в любом run/кампании.
+    # 0 выключает проверку. Намеренно не входит в collection_configuration():
+    # объём и семантика данных не меняются, а active runs не уходят в паузу.
+    collection_skip_fresh_days: int = Field(default=30, ge=0)
     collection_campaign_cohort_users: int = Field(default=10_000, ge=1, le=10_000)
     collection_light_repair_cohort_size: int = Field(default=10_000, ge=1, le=10_000)
     collection_community_metadata_batch_size: int = Field(default=100, ge=1, le=100)

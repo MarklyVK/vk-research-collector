@@ -300,7 +300,7 @@ class CampaignManager:
                     .order_by(CollectionCampaign.created_at, CollectionRun.created_at)
                 )
             ).all()
-        payload = [
+        payload: list[dict[str, object]] = [
             {
                 "campaign_id": campaign.id,
                 "campaign_status": campaign.status,

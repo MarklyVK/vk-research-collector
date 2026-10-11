@@ -58,9 +58,9 @@ async def reconcile_capacity_paused_campaigns(
         else:
             await CampaignManager(sessions, settings).reconcile(campaign_id)
         async with sessions() as session:
-            status = await session.scalar(
+            current_status = await session.scalar(
                 select(CollectionCampaign.status).where(CollectionCampaign.id == campaign_id)
             )
-        if status != CampaignStatus.PAUSED_CAPACITY_LIMIT.value:
+        if current_status != CampaignStatus.PAUSED_CAPACITY_LIMIT.value:
             recovered.append(campaign_id)
     return recovered

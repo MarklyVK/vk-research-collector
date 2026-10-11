@@ -114,17 +114,18 @@ class VKClient:
         offset: int = 0,
         count: int = 1000,
         group_type: str = "group",
+        city_id: int | None = None,
     ) -> VKSearchPage:
-        response = await self.call(
-            "groups.search",
-            {
-                "q": query,
-                "offset": offset,
-                "count": count,
-                "type": group_type,
-                "fields": "description,status",
-            },
-        )
+        params: dict[str, str | int] = {
+            "q": query,
+            "offset": offset,
+            "count": count,
+            "type": group_type,
+            "fields": "description,status",
+        }
+        if city_id is not None:
+            params["city_id"] = city_id
+        response = await self.call("groups.search", params)
         if not isinstance(response, dict):
             raise VKAPIError(-1, "Некорректный ответ поиска групп")
         raw_items = response.get("items", [])
@@ -156,12 +157,13 @@ class VKClient:
         start_offset: int = 0,
         page_size: int = 1000,
         group_type: str = "group",
+        city_id: int | None = None,
     ) -> AsyncIterator[tuple[int, VKSearchPage]]:
         """Получить все доступные страницы, возвращая offset следующей страницы."""
         offset = start_offset
         while True:
             page = await self.search_page(
-                query, offset=offset, count=page_size, group_type=group_type
+                query, offset=offset, count=page_size, group_type=group_type, city_id=city_id
             )
             consumed = min(page_size, max(0, page.total - offset))
             next_offset = offset + consumed
@@ -176,7 +178,10 @@ class VKClient:
             "groups.getById",
             {
                 "group_ids": ",".join(str(value) for value in group_ids),
-                "fields": "description,status,screen_name,members_count,is_closed,deactivated",
+                "fields": (
+                    "description,status,screen_name,members_count,is_closed,deactivated,"
+                    "city,country"
+                ),
             },
         )
         if isinstance(response, list):

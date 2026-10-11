@@ -4,12 +4,13 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import random
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import Table, delete, func, or_, select, update
+from sqlalchemy import Table, and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -22,6 +23,7 @@ from vk_collector.database.models import (
     CollectionJobError,
     CollectionRun,
     CollectionRunStatus,
+    CommunityMemberSnapshot,
     CommunityPostCollectionState,
     GroupCandidate,
     GroupCollectionState,
@@ -55,6 +57,7 @@ JOB_METHODS = {
     "collect_user_subscriptions": "groups.get",
     "refresh_community_metadata": "groups.getById",
     "collect_subscription_group_posts": "wall.get",
+    "fast_top_up_members": "groups.getMembers",
 }
 FAIR_JOB_TYPES = tuple(JOB_METHODS)
 RETRY_DELAYS = (60, 300, 900, 3600, 21600)
@@ -272,7 +275,8 @@ class CollectionWorker:
         started = time.monotonic()
         try:
             if job.job_type == "refresh_group":
-                await self._refresh_group(job)
+                if not await self._refresh_group(job):
+                    return
             elif job.job_type == "collect_group_posts":
                 await self._collect_posts(job)
             elif job.job_type == "collect_group_members":
@@ -280,14 +284,20 @@ class CollectionWorker:
             elif job.job_type == "refresh_user_profile":
                 await self._refresh_user(job)
             elif job.job_type == "collect_user_posts":
+                if await self._skip_fresh(job):
+                    return
                 await self._collect_user_posts(job)
             elif job.job_type == "collect_user_subscriptions":
+                if await self._skip_fresh(job):
+                    return
                 await self._collect_subscriptions(job)
             elif job.job_type == "refresh_community_metadata":
                 if not await self._refresh_community_metadata(job):
                     return
             elif job.job_type == "collect_subscription_group_posts":
                 await self._collect_subscription_posts(job)
+            elif job.job_type == "fast_top_up_members":
+                await self._fast_top_up_members(job)
             else:
                 raise ValueError(f"Неизвестный тип задания: {job.job_type}")
             await self._queue.finish(job.id, JobStatus.COMPLETED)
@@ -462,65 +472,151 @@ class CollectionWorker:
                 raise ValueError("Approved-группа не найдена")
             return group
 
-    async def _refresh_group(self, job: ClaimedJob) -> None:
-        group = await self._group(job.entity_id)
-        rows = await self._client.get_groups([group.vk_id])
-        if not rows:
-            raise VKAPIError(18, "Группа удалена или недоступна")
-        value = rows[0]
-        if value.get("deactivated") or int(value.get("is_closed", 0)) != 0:
-            raise VKAPIError(15, "Группа закрыта, удалена или заблокирована")
+    async def _refresh_group(self, job: ClaimedJob) -> bool:
+        """Process up to collection_community_metadata_batch_size groups per
+        groups.getById request (verified live: VK accepts up to 500 IDs per call;
+        this previously issued one request per group).
+        """
+        extras = await self._queue.claim_group_batch(
+            job.run_id, limit=self._settings.collection_community_metadata_batch_size - 1
+        )
+        batch = [job, *extras]
+        try:
+            async with self._sessions() as session:
+                groups = list(
+                    (
+                        await session.scalars(
+                            select(GroupCandidate).where(
+                                GroupCandidate.id.in_([item.entity_id for item in batch])
+                            )
+                        )
+                    ).all()
+                )
+            by_group_id = {g.id: g for g in groups}
+            missing_ids = [item.entity_id for item in batch if item.entity_id not in by_group_id]
+            if missing_ids:
+                raise ValueError(f"Группы исчезли во время обновления: {missing_ids}")
+            rows = await self._client.get_groups([g.vk_id for g in groups])
+        except Exception:
+            await self._queue.release(extras)
+            raise
+        by_vk_id = {
+            value["id"]: value
+            for value in rows
+            if isinstance(value.get("id"), int) and not isinstance(value.get("id"), bool)
+        }
         now = datetime.now(UTC)
+        unavailable: dict[int, str] = {}
         async with self._sessions() as session:
-            current = await session.get(GroupCandidate, group.id, with_for_update=True)
-            if current is None:
-                raise ValueError("Группа исчезла во время обновления")
-            current.name = str(value.get("name", current.name))
-            current.description = str(value.get("description", ""))
-            current.status_text = str(value.get("status", ""))
-            screen_name = value.get("screen_name")
-            current.screen_name = str(screen_name) if screen_name else current.screen_name
-            current.last_seen_at = now
-            await session.execute(
-                insert(VKCommunity)
-                .values(
-                    vk_id=current.vk_id,
-                    name=current.name,
-                    description=current.description,
-                    status_text=current.status_text,
-                    screen_name=current.screen_name,
-                    community_type=str(value.get("type")) if value.get("type") else None,
-                    is_closed=bool(value.get("is_closed", False)),
-                    deactivated=str(value["deactivated"]) if value.get("deactivated") else None,
-                    members_count=value.get("members_count")
-                    if isinstance(value.get("members_count"), int)
-                    else None,
-                    first_seen_at=current.first_seen_at,
-                    last_seen_at=now,
-                    metadata_updated_at=now,
+            for group in groups:
+                value = by_vk_id.get(group.vk_id)
+                if value is None:
+                    unavailable[group.id] = "Группа удалена или недоступна"
+                    continue
+                if value.get("deactivated") or int(value.get("is_closed", 0)) != 0:
+                    unavailable[group.id] = "Группа закрыта, удалена или заблокирована"
+                    continue
+                current = await session.get(GroupCandidate, group.id, with_for_update=True)
+                if current is None:
+                    unavailable[group.id] = "Группа исчезла во время обновления"
+                    continue
+                current.name = str(value.get("name", current.name))
+                current.description = str(value.get("description", ""))
+                current.status_text = str(value.get("status", ""))
+                screen_name = value.get("screen_name")
+                current.screen_name = str(screen_name) if screen_name else current.screen_name
+                current.last_seen_at = now
+                await session.execute(
+                    insert(VKCommunity)
+                    .values(
+                        vk_id=current.vk_id,
+                        name=current.name,
+                        description=current.description,
+                        status_text=current.status_text,
+                        screen_name=current.screen_name,
+                        community_type=str(value.get("type")) if value.get("type") else None,
+                        is_closed=bool(value.get("is_closed", False)),
+                        deactivated=str(value["deactivated"]) if value.get("deactivated") else None,
+                        members_count=value.get("members_count")
+                        if isinstance(value.get("members_count"), int)
+                        else None,
+                        city=value.get("city") if isinstance(value.get("city"), dict) else None,
+                        country=value.get("country")
+                        if isinstance(value.get("country"), dict)
+                        else None,
+                        first_seen_at=current.first_seen_at,
+                        last_seen_at=now,
+                        metadata_updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[VKCommunity.vk_id],
+                        set_={
+                            "name": current.name,
+                            "description": current.description,
+                            "status_text": current.status_text,
+                            "screen_name": current.screen_name,
+                            "community_type": str(value.get("type")) if value.get("type") else None,
+                            "is_closed": bool(value.get("is_closed", False)),
+                            "deactivated": str(value["deactivated"])
+                            if value.get("deactivated")
+                            else None,
+                            # COALESCE: не затирать уже известный members_count, если в
+                            # этом конкретном ответе VK его не прислал (раньше ON CONFLICT
+                            # вообще не трогал колонку, из-за чего она не заполнялась годами).
+                            "members_count": func.coalesce(
+                                value.get("members_count")
+                                if isinstance(value.get("members_count"), int)
+                                else None,
+                                VKCommunity.members_count,
+                            ),
+                            "city": value.get("city")
+                            if isinstance(value.get("city"), dict)
+                            else None,
+                            "country": value.get("country")
+                            if isinstance(value.get("country"), dict)
+                            else None,
+                            "last_seen_at": now,
+                            "metadata_updated_at": now,
+                        },
+                    )
                 )
-                .on_conflict_do_update(
-                    index_elements=[VKCommunity.vk_id],
-                    set_={
-                        "name": current.name,
-                        "description": current.description,
-                        "status_text": current.status_text,
-                        "screen_name": current.screen_name,
-                        "last_seen_at": now,
-                        "metadata_updated_at": now,
-                    },
+                await session.execute(
+                    insert(GroupCollectionState)
+                    .values(group_id=group.id, last_group_success_at=now)
+                    .on_conflict_do_update(
+                        index_elements=[GroupCollectionState.group_id],
+                        set_={
+                            "last_group_success_at": now,
+                            "unavailable": False,
+                            "skip_reason": None,
+                        },
+                    )
                 )
+            await self._update_metrics(
+                session, job.id, requests=1, updated=len(groups) - len(unavailable)
             )
-            await session.execute(
-                insert(GroupCollectionState)
-                .values(group_id=group.id, last_group_success_at=now)
-                .on_conflict_do_update(
-                    index_elements=[GroupCollectionState.group_id],
-                    set_={"last_group_success_at": now, "unavailable": False, "skip_reason": None},
-                )
-            )
-            await self._update_metrics(session, job.id, requests=1, updated=1)
             await session.commit()
+
+        for extra in extras:
+            reason = unavailable.get(extra.entity_id)
+            if reason is None:
+                await self._queue.finish(extra.id, JobStatus.COMPLETED)
+            else:
+                await self._queue.finish(
+                    extra.id,
+                    JobStatus.SKIPPED,
+                    error_type="permission_or_private",
+                    error_message=reason,
+                )
+        if job.entity_id in unavailable:
+            await self._queue.finish(
+                job.id,
+                JobStatus.SKIPPED,
+                error_type="permission_or_private",
+                error_message=unavailable[job.entity_id],
+            )
+            return False
+        return True
 
     async def _collect_posts(self, job: ClaimedJob) -> None:
         group = await self._group(job.entity_id)
@@ -680,17 +776,27 @@ class CollectionWorker:
             await session.commit()
 
     async def _collect_members(self, job: ClaimedJob) -> None:
+        """Two-phase member collection: exhaustively enumerate member IDs (cheap,
+        id-only pages), then draw a reproducible uniform random sample of
+        collection_members_max_per_group IDs and only fully process those.
+
+        Replaces the previous "first N members in VK's default id_asc order"
+        behaviour, which was an undisclosed order-bias (systematically the
+        oldest accounts in each group), not a representative sample.
+        """
         group = await self._group(job.entity_id)
         offset = int(job.checkpoint.get("offset", 0))
-        maximum = self._settings.collection_members_max_per_group
+        sample_size = self._settings.collection_members_max_per_group
         page_size = self._settings.collection_members_page_size
         total = 0
-        while maximum is None or offset < maximum:
-            count = page_size if maximum is None else min(page_size, maximum - offset)
-            response = await self._client.get_members_page(group.vk_id, offset, count)
+        discovered_user_ids: set[int] = set()
+
+        # Phase 1: exhaustive id-only enumeration (cheap — same endpoint/quota
+        # as before, just not stopped early at sample_size).
+        while True:
+            response = await self._client.get_members_page(group.vk_id, offset, page_size)
             raw_items = response.get("items", [])
             values = raw_items if isinstance(raw_items, list) else []
-            discovered_user_ids: set[int] = set()
             for item in values:
                 if isinstance(item, int):
                     discovered_user_ids.add(item)
@@ -698,98 +804,268 @@ class CollectionWorker:
                     raw_id = item.get("id")
                     if isinstance(raw_id, int):
                         discovered_user_ids.add(raw_id)
-            user_ids = sorted(discovered_user_ids)
             total = int(response.get("count", 0))
-            now = datetime.now(UTC)
+            offset += len(values)
             async with self._sessions() as session:
-                for user_id in user_ids:
-                    await session.execute(
-                        insert(VKUser)
-                        .values(vk_id=user_id, first_seen_at=now, last_seen_at=now)
-                        .on_conflict_do_update(
-                            index_elements=[VKUser.vk_id], set_={"last_seen_at": now}
-                        )
-                    )
-                    await session.execute(
-                        insert(GroupMembership)
-                        .values(
-                            group_id=group.id,
-                            user_id=user_id,
-                            first_seen_at=now,
-                            last_seen_at=now,
-                            source_run_id=job.run_id,
-                            is_current=True,
-                        )
-                        .on_conflict_do_update(
-                            constraint="uq_group_memberships_group_user",
-                            set_={
-                                "last_seen_at": now,
-                                "source_run_id": job.run_id,
-                                "is_current": True,
-                            },
-                        )
-                    )
-                if self._settings.collection_users_enabled and user_ids:
-                    cutoff = now - timedelta(days=self._settings.collection_user_profile_ttl_days)
-                    stale_ids = list(
-                        (
-                            await session.scalars(
-                                select(VKUser.vk_id).where(
-                                    VKUser.vk_id.in_(user_ids),
-                                    or_(
-                                        VKUser.profile_updated_at.is_(None),
-                                        VKUser.profile_updated_at < cutoff,
-                                    ),
-                                )
-                            )
-                        ).all()
-                    )
-                    for user_id in stale_ids:
-                        await session.execute(
-                            insert(CollectionJob)
-                            .values(
-                                collection_run_id=job.run_id,
-                                job_type="refresh_user_profile",
-                                entity_type="user",
-                                entity_id=user_id,
-                                priority=40,
-                            )
-                            .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
-                        )
-                offset += len(values)
                 await self._checkpoint(
-                    session, job.id, {"offset": offset, "total": total}, 1, len(user_ids)
+                    session,
+                    job.id,
+                    {"offset": offset, "total": total, "phase": "enumerate"},
+                    1,
+                    0,
                 )
                 await session.commit()
-            if not values or offset >= total or len(values) < count:
+            if not values or offset >= total or len(values) < page_size:
                 break
-        full_snapshot = offset >= total and (maximum is None or total <= maximum)
+            # Small jitter between pages: smooths the aggregate request pattern
+            # across concurrent workers on this method, on top of the token
+            # pool's own per-method rate limit (see vk_members_method_rps).
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+
+        # Phase 2: reproducible uniform random sample of the full membership.
+        # Seed is derived per-group from a fixed base seed so re-running the
+        # pipeline reproduces the same sample without storing all member IDs.
+        rng = random.Random(f"{self._settings.collection_members_sample_seed}:{group.vk_id}")
+        unique_ids = sorted(discovered_user_ids)
+        sampled_ids = (
+            unique_ids
+            if sample_size is None or len(unique_ids) <= sample_size
+            else rng.sample(unique_ids, sample_size)
+        )
+
+        now = datetime.now(UTC)
         async with self._sessions() as session:
-            if full_snapshot:
+            for user_id in sampled_ids:
                 await session.execute(
-                    update(GroupMembership)
-                    .where(
-                        GroupMembership.group_id == group.id,
-                        GroupMembership.source_run_id != job.run_id,
+                    insert(VKUser)
+                    .values(vk_id=user_id, first_seen_at=now, last_seen_at=now)
+                    .on_conflict_do_update(
+                        index_elements=[VKUser.vk_id], set_={"last_seen_at": now}
                     )
-                    .values(is_current=False)
                 )
-            now = datetime.now(UTC)
+                await session.execute(
+                    insert(GroupMembership)
+                    .values(
+                        group_id=group.id,
+                        user_id=user_id,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        source_run_id=job.run_id,
+                        is_current=True,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_group_memberships_group_user",
+                        set_={
+                            "last_seen_at": now,
+                            "source_run_id": job.run_id,
+                            "is_current": True,
+                        },
+                    )
+                )
+            if self._settings.collection_users_enabled and sampled_ids:
+                cutoff = now - timedelta(days=self._settings.collection_user_profile_ttl_days)
+                stale_ids = list(
+                    (
+                        await session.scalars(
+                            select(VKUser.vk_id).where(
+                                VKUser.vk_id.in_(sampled_ids),
+                                or_(
+                                    VKUser.profile_updated_at.is_(None),
+                                    VKUser.profile_updated_at < cutoff,
+                                ),
+                            )
+                        )
+                    ).all()
+                )
+                for user_id in stale_ids:
+                    await session.execute(
+                        insert(CollectionJob)
+                        .values(
+                            collection_run_id=job.run_id,
+                            job_type="refresh_user_profile",
+                            entity_type="user",
+                            entity_id=user_id,
+                            priority=40,
+                        )
+                        .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                    )
+            # Superseded sample members from a previous run of this group
+            # (e.g. re-sampled after growth) are marked no longer current;
+            # enumeration is now always exhaustive, so the sample is always
+            # complete relative to the full membership known at this run.
+            await session.execute(
+                update(GroupMembership)
+                .where(
+                    GroupMembership.group_id == group.id,
+                    GroupMembership.source_run_id != job.run_id,
+                )
+                .values(is_current=False)
+            )
             await session.execute(
                 insert(GroupCollectionState)
                 .values(
                     group_id=group.id,
-                    members_checkpoint={"offset": offset, "complete": full_snapshot},
+                    members_checkpoint={
+                        "total_members": total,
+                        "sample_size": len(sampled_ids),
+                        "sample_seed": self._settings.collection_members_sample_seed,
+                        "complete": True,
+                    },
                     last_members_success_at=now,
                 )
                 .on_conflict_do_update(
                     index_elements=[GroupCollectionState.group_id],
                     set_={
-                        "members_checkpoint": {"offset": offset, "complete": full_snapshot},
+                        "members_checkpoint": {
+                            "total_members": total,
+                            "sample_size": len(sampled_ids),
+                            "sample_seed": self._settings.collection_members_sample_seed,
+                            "complete": True,
+                        },
                         "last_members_success_at": now,
                     },
                 )
             )
+            await self._update_metrics(session, job.id, requests=0, updated=len(sampled_ids))
+            await session.commit()
+
+    async def _fast_top_up_members(self, job: ClaimedJob) -> None:
+        """Owner-authorized fast baseline pass (2026-09-07): one groups.getMembers
+        call per group, VK's default order, no enumeration/random sampling —
+        tops the group up to collection_fast_top_up_target members quickly.
+
+        Groups with fewer real members than the target are marked unavailable
+        with a skip_reason (excluded-group count for the article). Queues
+        refresh_user_profile / collect_user_subscriptions / collect_user_posts
+        for the returned members at elevated priority so the full profile
+        (demography + subscriptions + posts) completes fast for this cohort,
+        ahead of the much larger pre-existing general backlog.
+        """
+        group = await self._group(job.entity_id)
+        target = self._settings.collection_fast_top_up_target
+        response = await self._client.get_members_page(group.vk_id, 0, target)
+        raw_items = response.get("items", [])
+        values = raw_items if isinstance(raw_items, list) else []
+        member_ids: list[int] = []
+        for item in values:
+            if isinstance(item, int):
+                member_ids.append(item)
+            elif isinstance(item, dict):
+                raw_id = item.get("id")
+                if isinstance(raw_id, int):
+                    member_ids.append(raw_id)
+        total = int(response.get("count", 0))
+        now = datetime.now(UTC)
+
+        async with self._sessions() as session:
+            if total < target:
+                reason = f"fast_top_up: в группе {total} участников, меньше цели {target}"
+                await session.execute(
+                    insert(GroupCollectionState)
+                    .values(
+                        group_id=group.id,
+                        unavailable=True,
+                        skip_reason=reason,
+                        last_members_success_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[GroupCollectionState.group_id],
+                        set_={
+                            "unavailable": True,
+                            "skip_reason": reason,
+                            "last_members_success_at": now,
+                        },
+                    )
+                )
+                await self._update_metrics(session, job.id, requests=1, updated=0)
+                await session.commit()
+                return
+
+            for user_id in member_ids:
+                await session.execute(
+                    insert(VKUser)
+                    .values(vk_id=user_id, first_seen_at=now, last_seen_at=now)
+                    .on_conflict_do_update(
+                        index_elements=[VKUser.vk_id], set_={"last_seen_at": now}
+                    )
+                )
+                await session.execute(
+                    insert(GroupMembership)
+                    .values(
+                        group_id=group.id,
+                        user_id=user_id,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        source_run_id=job.run_id,
+                        is_current=True,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_group_memberships_group_user",
+                        set_={
+                            "last_seen_at": now,
+                            "source_run_id": job.run_id,
+                            "is_current": True,
+                        },
+                    )
+                )
+            for user_id in member_ids:
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        collection_run_id=job.run_id,
+                        job_type="refresh_user_profile",
+                        entity_type="user",
+                        entity_id=user_id,
+                        priority=5,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        collection_run_id=job.run_id,
+                        job_type="collect_user_subscriptions",
+                        entity_type="user",
+                        entity_id=user_id,
+                        priority=5,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+                await session.execute(
+                    insert(CollectionJob)
+                    .values(
+                        collection_run_id=job.run_id,
+                        job_type="collect_user_posts",
+                        entity_type="user",
+                        entity_id=user_id,
+                        priority=5,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_collection_jobs_run_type_entity")
+                )
+            await session.execute(
+                insert(GroupCollectionState)
+                .values(
+                    group_id=group.id,
+                    members_checkpoint={
+                        "fast_top_up": True,
+                        "target": target,
+                        "collected": len(member_ids),
+                    },
+                    last_members_success_at=now,
+                )
+                .on_conflict_do_update(
+                    index_elements=[GroupCollectionState.group_id],
+                    set_={
+                        "members_checkpoint": {
+                            "fast_top_up": True,
+                            "target": target,
+                            "collected": len(member_ids),
+                        },
+                        "last_members_success_at": now,
+                    },
+                )
+            )
+            await self._update_metrics(session, job.id, requests=1, updated=len(member_ids))
             await session.commit()
 
     async def _refresh_user(self, job: ClaimedJob) -> None:
@@ -935,6 +1211,68 @@ class CollectionWorker:
             )
         if job.entity_id not in by_id:
             raise VKAPIError(18, "Пользователь удалён или недоступен")
+
+    async def _skip_fresh(self, job: ClaimedJob) -> bool:
+        """Закрыть job без запроса к VK, если пользователь собран недавно.
+
+        Состояние пользователя общее для всех runs и кампаний, поэтому тот же
+        пользователь из другого run (или повтор после недавнего сбора) не
+        запрашивается повторно. Job, начатый с ненулевого checkpoint, не
+        пропускается: его страницы уже частично записаны. Явно наступивший
+        next_scheduled_at (пересбор назначен системой) тоже отменяет пропуск.
+        """
+        days = self._settings.collection_skip_fresh_days
+        if days <= 0 or int(job.checkpoint.get("offset", 0)) > 0:
+            return False
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=days)
+        async with self._sessions() as session:
+            if job.job_type == "collect_user_subscriptions":
+                fresh = await session.scalar(
+                    select(UserSubscriptionState.user_id).where(
+                        UserSubscriptionState.user_id == job.entity_id,
+                        or_(
+                            UserSubscriptionState.next_scheduled_at.is_(None),
+                            UserSubscriptionState.next_scheduled_at > now,
+                        ),
+                        or_(
+                            UserSubscriptionState.last_success_at >= cutoff,
+                            and_(
+                                UserSubscriptionState.terminal_reason.is_not(None),
+                                UserSubscriptionState.last_attempt_at >= cutoff,
+                            ),
+                        ),
+                    )
+                )
+            else:
+                fresh = await session.scalar(
+                    select(UserPostCollectionState.user_id).where(
+                        UserPostCollectionState.user_id == job.entity_id,
+                        or_(
+                            UserPostCollectionState.next_scheduled_at.is_(None),
+                            UserPostCollectionState.next_scheduled_at > now,
+                        ),
+                        or_(
+                            UserPostCollectionState.last_success_at >= cutoff,
+                            and_(
+                                or_(
+                                    UserPostCollectionState.wall_private.is_(True),
+                                    UserPostCollectionState.unavailable.is_(True),
+                                ),
+                                UserPostCollectionState.last_attempt_at >= cutoff,
+                            ),
+                        ),
+                    )
+                )
+        if fresh is None:
+            return False
+        await self._queue.finish(
+            job.id,
+            JobStatus.SKIPPED,
+            error_type="fresh_recently_collected",
+            error_message=f"Данные пользователя собраны менее {days} дн. назад",
+        )
+        return True
 
     async def _collect_subscriptions(self, job: ClaimedJob) -> None:
         offset = int(job.checkpoint.get("offset", 0))
@@ -1164,6 +1502,10 @@ class CollectionWorker:
                     if isinstance(value.get("members_count"), int)
                     and not isinstance(value.get("members_count"), bool)
                     else None,
+                    "city": value.get("city") if isinstance(value.get("city"), dict) else None,
+                    "country": value.get("country")
+                    if isinstance(value.get("country"), dict)
+                    else None,
                     "first_seen_at": now,
                     "last_seen_at": now,
                     "metadata_updated_at": now,
@@ -1184,8 +1526,32 @@ class CollectionWorker:
                             "is_closed": statement.excluded.is_closed,
                             "deactivated": statement.excluded.deactivated,
                             "members_count": statement.excluded.members_count,
+                            "city": statement.excluded.city,
+                            "country": statement.excluded.country,
                             "last_seen_at": statement.excluded.last_seen_at,
                             "metadata_updated_at": statement.excluded.metadata_updated_at,
+                        },
+                    )
+                )
+                # VK не отдаёт прирост подписчиков напрямую (нет такого метода) —
+                # копим один снимок members_count в день на сообщество, чтобы
+                # считать day-over-day прирост для оценки эффективности групп.
+                snapshot_statement = insert(CommunityMemberSnapshot).values(
+                    [
+                        {
+                            "community_vk_id": row["vk_id"],
+                            "members_count": row["members_count"],
+                            "captured_at": now,
+                        }
+                        for row in normalized
+                    ]
+                )
+                await session.execute(
+                    snapshot_statement.on_conflict_do_update(
+                        constraint="uq_community_member_snapshots_community_date",
+                        set_={
+                            "members_count": snapshot_statement.excluded.members_count,
+                            "captured_at": snapshot_statement.excluded.captured_at,
                         },
                     )
                 )

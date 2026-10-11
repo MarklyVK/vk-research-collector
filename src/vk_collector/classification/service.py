@@ -144,7 +144,7 @@ async def import_classification(session: AsyncSession, source: Path) -> int:
     ).all()
     subjects: dict[int, set[AllowedLabel]] = defaultdict(set)
     for vk_id, subject in subjects_rows:
-        subjects[vk_id].add(subject)
+        subjects[vk_id].add(cast(AllowedLabel, subject))
 
     decisions = build_decisions(payload, set(internal_by_vk), subjects)
     if batch.imported_at is not None:

@@ -1,7 +1,7 @@
 """Нормализованная модель данных первого этапа."""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -9,6 +9,8 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -733,9 +735,43 @@ class VKCommunity(Base):
     is_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     deactivated: Mapped[str | None] = mapped_column(String(50))
     members_count: Mapped[int | None] = mapped_column(Integer)
+    # {"id": int, "title": str} из groups.getById(fields=city,country) — не
+    # у всех сообществ заполнено в VK, для локального бизнеса (наш домен:
+    # доставка еды/кафе) обычно указано.
+    city: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    country: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     metadata_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CommunityMemberSnapshot(Base):
+    """Дневной снимок members_count сообщества.
+
+    VK API не отдаёт прирост подписчиков напрямую — только текущее значение
+    в groups.getById. Эта таблица накапливает историю по одному снимку в день
+    на сообщество (идемпотентно по community_vk_id+snapshot_date), что даёт
+    возможность считать day-over-day прирост для оценки эффективности
+    конкурентных групп.
+    """
+
+    __tablename__ = "community_member_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "community_vk_id", "snapshot_date", name="uq_community_member_snapshots_community_date"
+        ),
+        Index("ix_community_member_snapshots_community_captured", "community_vk_id", "captured_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    community_vk_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vk_communities.vk_id", ondelete="CASCADE"), nullable=False
+    )
+    members_count: Mapped[int | None] = mapped_column(Integer)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    snapshot_date: Mapped[date] = mapped_column(
+        Date, Computed("(captured_at AT TIME ZONE 'UTC')::date", persisted=True), nullable=False
+    )
 
 
 class UserSubscriptionState(Base):
@@ -830,6 +866,24 @@ class VKTokenMethodState(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class VKMethodGlobalState(Base):
+    """Единый темп на VK method сразу для всего пула токенов.
+
+    Нужен методам вроде groups.getMembers, где VK, судя по наблюдениям
+    (все токены получают error 9 в пределах нескольких секунд друг от
+    друга), считает flood control по IP/приложению, а не по токену —
+    per-token пейсинга одного недостаточно.
+    """
+
+    __tablename__ = "vk_method_global_states"
+
+    method: Mapped[str] = mapped_column(String(100), primary_key=True)
+    next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from vk_collector.database.models import VKTokenMethodState, VKTokenState
+from vk_collector.database.models import VKMethodGlobalState, VKTokenMethodState, VKTokenState
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -81,6 +81,10 @@ class TokenPool:
         rps: float,
         clock: Clock,
         sleep: Sleep = asyncio.sleep,
+        method_rps_overrides: dict[str, float] | None = None,
+        method_probation_rps_overrides: dict[str, float] | None = None,
+        method_probation_window_seconds: float = 7200,
+        method_global_rps_overrides: dict[str, float] | None = None,
         flood_initial_cooldown: float = 3600,
         quota_initial_cooldown: float = 3600,
         max_method_cooldown: float = 86400,
@@ -101,6 +105,25 @@ class TokenPool:
             _TokenState(value=token, fingerprint=token_fingerprint(token)) for token in clean
         ]
         self._interval = 1.0 / rps
+        if any(value <= 0 for value in (method_rps_overrides or {}).values()):
+            raise ValueError("method_rps_overrides должен быть больше нуля")
+        self._method_intervals = {
+            name: 1.0 / override_rps for name, override_rps in (method_rps_overrides or {}).items()
+        }
+        if any(value <= 0 for value in (method_probation_rps_overrides or {}).values()):
+            raise ValueError("method_probation_rps_overrides должен быть больше нуля")
+        self._method_probation_intervals = {
+            name: 1.0 / probation_rps
+            for name, probation_rps in (method_probation_rps_overrides or {}).items()
+        }
+        self._probation_window = method_probation_window_seconds
+        if any(value <= 0 for value in (method_global_rps_overrides or {}).values()):
+            raise ValueError("method_global_rps_overrides должен быть больше нуля")
+        self._method_global_intervals = {
+            name: 1.0 / global_rps
+            for name, global_rps in (method_global_rps_overrides or {}).items()
+        }
+        self._method_global_next: dict[str, float] = {}
         self._clock = clock
         self._sleep = sleep
         self._flood_initial = flood_initial_cooldown
@@ -114,6 +137,35 @@ class TokenPool:
         self._db_initialized = False
         self._lock = asyncio.Lock()
         self._cursor = 0
+
+    def _interval_for(
+        self,
+        method: str,
+        last_error_at: float | datetime | None,
+        now: float | datetime,
+    ) -> float:
+        """Вернуть минимальный интервал между запросами для method и токена.
+
+        Отдельные методы (например groups.getMembers) могут иметь свой,
+        более консервативный лимит, если VK применяет к ним более строгий
+        anti-abuse порог, чем к обычным методам. Сразу после последнего
+        flood/quota-хита на конкретном токене действует более медленный
+        probation-интервал (см. method_probation_window_seconds) — резкий
+        возврат на полную целевую скорость сразу после снятия блокировки
+        рискует нащупать тот же порог повторно.
+        """
+        base = self._method_intervals.get(method, self._interval)
+        probation = self._method_probation_intervals.get(method)
+        if probation is not None and last_error_at is not None:
+            if isinstance(now, datetime) and isinstance(last_error_at, datetime):
+                elapsed = (now - last_error_at).total_seconds()
+            elif isinstance(now, (int, float)) and isinstance(last_error_at, (int, float)):
+                elapsed = now - last_error_at
+            else:
+                return base
+            if elapsed < self._probation_window:
+                return max(base, probation)
+        return base
 
     def __repr__(self) -> str:
         enabled = sum(not state.disabled for state in self._states)
@@ -131,46 +183,64 @@ class TokenPool:
                 if not enabled:
                     raise VKTokensUnavailable("Все VK-токены отключены")
                 now = self._clock()
+                global_interval = self._method_global_intervals.get(method)
+                global_next = self._method_global_next.get(method, 0.0)
                 method_retry: list[float] = []
                 global_retry: list[float] = []
-                for distance in range(len(self._states)):
-                    index = (self._cursor + distance) % len(self._states)
-                    state = self._states[index]
-                    if state.disabled:
-                        continue
-                    method_state = state.methods.get(method)
-                    blocked_until = method_state.blocked_until if method_state else 0.0
-                    if blocked_until > now:
-                        if method_state is not None and method_state.next_probe_at <= now:
-                            ready_at = max(state.next_request_at, state.global_blocked_until)
-                            if ready_at <= now:
-                                method_state.next_probe_at = now + self._probe_seconds
-                                state.next_request_at = now + self._interval
-                                self._cursor = (index + 1) % len(self._states)
-                                return TokenLease(
-                                    state.value, state.fingerprint, method, now, is_probe=True
-                                )
-                            global_retry.append(ready_at)
+                method_capable = False
+                global_gate_active = global_interval is not None and global_next > now
+                if global_gate_active:
+                    # Общий для всего пула темп на метод ещё не наступил — не
+                    # тратим per-token попытки, просто ждём до global_next.
+                    global_retry.append(global_next)
+                else:
+                    for distance in range(len(self._states)):
+                        index = (self._cursor + distance) % len(self._states)
+                        state = self._states[index]
+                        if state.disabled:
                             continue
-                        method_retry.append(
-                            min(blocked_until, method_state.next_probe_at)
-                            if method_state is not None and method_state.next_probe_at > now
-                            else blocked_until
-                        )
-                        continue
-                    ready_at = max(state.next_request_at, state.global_blocked_until)
-                    if ready_at <= now:
-                        state.next_request_at = now + self._interval
-                        self._cursor = (index + 1) % len(self._states)
-                        return TokenLease(state.value, state.fingerprint, method, now)
-                    global_retry.append(ready_at)
-                # Если хотя бы один токен годится для method, ждём только короткий global/RPS slot.
-                method_capable = any(
-                    state.methods.get(method, _MethodState()).blocked_until <= now
-                    or state.methods.get(method, _MethodState()).next_probe_at <= now
-                    for state in enabled
-                )
-                if not method_capable:
+                        method_state = state.methods.get(method)
+                        blocked_until = method_state.blocked_until if method_state else 0.0
+                        if blocked_until > now:
+                            if method_state is not None and method_state.next_probe_at <= now:
+                                ready_at = max(state.next_request_at, state.global_blocked_until)
+                                if ready_at <= now:
+                                    method_state.next_probe_at = now + self._probe_seconds
+                                    state.next_request_at = now + self._interval_for(
+                                        method, method_state.last_error_at, now
+                                    )
+                                    self._cursor = (index + 1) % len(self._states)
+                                    if global_interval is not None:
+                                        self._method_global_next[method] = now + global_interval
+                                    return TokenLease(
+                                        state.value, state.fingerprint, method, now, is_probe=True
+                                    )
+                                global_retry.append(ready_at)
+                                continue
+                            method_retry.append(
+                                min(blocked_until, method_state.next_probe_at)
+                                if method_state is not None and method_state.next_probe_at > now
+                                else blocked_until
+                            )
+                            continue
+                        ready_at = max(state.next_request_at, state.global_blocked_until)
+                        if ready_at <= now:
+                            state.next_request_at = now + self._interval_for(
+                                method, method_state.last_error_at if method_state else None, now
+                            )
+                            self._cursor = (index + 1) % len(self._states)
+                            if global_interval is not None:
+                                self._method_global_next[method] = now + global_interval
+                            return TokenLease(state.value, state.fingerprint, method, now)
+                        global_retry.append(ready_at)
+                    # Если хотя бы один токен годится для method,
+                    # ждём только короткий global/RPS slot.
+                    method_capable = any(
+                        state.methods.get(method, _MethodState()).blocked_until <= now
+                        or state.methods.get(method, _MethodState()).next_probe_at <= now
+                        for state in enabled
+                    )
+                if not global_gate_active and not method_capable:
                     retry_at = min(method_retry) if method_retry else None
                     events = [
                         (
@@ -501,6 +571,12 @@ class TokenPool:
                 .values([{"token_fingerprint": state.fingerprint} for state in self._states])
                 .on_conflict_do_nothing(index_elements=[VKTokenState.token_fingerprint])
             )
+            if self._method_global_intervals:
+                await session.execute(
+                    insert(VKMethodGlobalState)
+                    .values([{"method": name} for name in self._method_global_intervals])
+                    .on_conflict_do_nothing(index_elements=[VKMethodGlobalState.method])
+                )
             await session.commit()
         self._db_initialized = True
 
@@ -541,64 +617,102 @@ class TokenPool:
                 method_retry: list[datetime] = []
                 global_retry: list[datetime] = []
                 method_capable = False
-                for distance in range(len(self._states)):
-                    index = (self._cursor + distance) % len(self._states)
-                    local = self._states[index]
-                    row = by_fingerprint.get(local.fingerprint)
-                    if row is None or row.disabled:
-                        continue
-                    method_row = methods.get(local.fingerprint)
-                    if (
-                        method_row is not None
-                        and method_row.blocked_until is not None
-                        and method_row.blocked_until > now_dt
-                    ):
-                        if (
-                            method_row.next_probe_at is not None
-                            and method_row.next_probe_at <= now_dt
-                        ):
-                            method_capable = True
-                            ready_at = max(
-                                value
-                                for value in (row.next_request_at, row.global_blocked_until, now_dt)
-                                if value is not None
-                            )
-                            if ready_at <= now_dt:
-                                method_row.next_probe_at = now_dt + timedelta(
-                                    seconds=self._probe_seconds
-                                )
-                                row.next_request_at = now_dt + timedelta(seconds=self._interval)
-                                self._cursor = (index + 1) % len(self._states)
-                                await session.commit()
-                                return TokenLease(
-                                    local.value,
-                                    local.fingerprint,
-                                    method,
-                                    self._clock(),
-                                    is_probe=True,
-                                )
-                            global_retry.append(ready_at)
-                            continue
-                        method_retry.append(
-                            min(method_row.blocked_until, method_row.next_probe_at)
-                            if method_row.next_probe_at is not None
-                            else method_row.blocked_until
-                        )
-                        continue
-                    method_capable = True
-                    ready_at = max(
-                        value
-                        for value in (row.next_request_at, row.global_blocked_until, now_dt)
-                        if value is not None
+                global_interval = self._method_global_intervals.get(method)
+                global_row: VKMethodGlobalState | None = None
+                global_gate_active = False
+                if global_interval is not None:
+                    global_row = await session.get(
+                        VKMethodGlobalState, method, with_for_update=True
                     )
-                    if ready_at <= now_dt:
-                        row.next_request_at = now_dt + timedelta(seconds=self._interval)
-                        self._cursor = (index + 1) % len(self._states)
-                        await session.commit()
-                        return TokenLease(local.value, local.fingerprint, method, self._clock())
-                    global_retry.append(ready_at)
+                    if global_row is None:
+                        global_row = VKMethodGlobalState(method=method)
+                        session.add(global_row)
+                        await session.flush()
+                    if (
+                        global_row.next_request_at is not None
+                        and global_row.next_request_at > now_dt
+                    ):
+                        global_gate_active = True
+                        global_retry.append(global_row.next_request_at)
+                if not global_gate_active:
+                    for distance in range(len(self._states)):
+                        index = (self._cursor + distance) % len(self._states)
+                        local = self._states[index]
+                        row = by_fingerprint.get(local.fingerprint)
+                        if row is None or row.disabled:
+                            continue
+                        method_row = methods.get(local.fingerprint)
+                        if (
+                            method_row is not None
+                            and method_row.blocked_until is not None
+                            and method_row.blocked_until > now_dt
+                        ):
+                            if (
+                                method_row.next_probe_at is not None
+                                and method_row.next_probe_at <= now_dt
+                            ):
+                                method_capable = True
+                                ready_at = max(
+                                    value
+                                    for value in (
+                                        row.next_request_at,
+                                        row.global_blocked_until,
+                                        now_dt,
+                                    )
+                                    if value is not None
+                                )
+                                if ready_at <= now_dt:
+                                    method_row.next_probe_at = now_dt + timedelta(
+                                        seconds=self._probe_seconds
+                                    )
+                                    row.next_request_at = now_dt + timedelta(
+                                        seconds=self._interval_for(
+                                            method, method_row.last_error_at, now_dt
+                                        )
+                                    )
+                                    self._cursor = (index + 1) % len(self._states)
+                                    if global_interval is not None and global_row is not None:
+                                        global_row.next_request_at = now_dt + timedelta(
+                                            seconds=global_interval
+                                        )
+                                    await session.commit()
+                                    return TokenLease(
+                                        local.value,
+                                        local.fingerprint,
+                                        method,
+                                        self._clock(),
+                                        is_probe=True,
+                                    )
+                                global_retry.append(ready_at)
+                                continue
+                            method_retry.append(
+                                min(method_row.blocked_until, method_row.next_probe_at)
+                                if method_row.next_probe_at is not None
+                                else method_row.blocked_until
+                            )
+                            continue
+                        method_capable = True
+                        ready_at = max(
+                            value
+                            for value in (row.next_request_at, row.global_blocked_until, now_dt)
+                            if value is not None
+                        )
+                        if ready_at <= now_dt:
+                            row.next_request_at = now_dt + timedelta(
+                                seconds=self._interval_for(
+                                    method, method_row.last_error_at if method_row else None, now_dt
+                                )
+                            )
+                            self._cursor = (index + 1) % len(self._states)
+                            if global_interval is not None and global_row is not None:
+                                global_row.next_request_at = now_dt + timedelta(
+                                    seconds=global_interval
+                                )
+                            await session.commit()
+                            return TokenLease(local.value, local.fingerprint, method, self._clock())
+                        global_retry.append(ready_at)
                 await session.commit()
-                if not method_capable:
+                if not global_gate_active and not method_capable:
                     delay = max(0.0, (min(method_retry) - now_dt).total_seconds())
                     events = [
                         (row.last_error_at or datetime.min.replace(tzinfo=UTC), row.last_error_code)

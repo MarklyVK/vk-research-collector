@@ -17,7 +17,13 @@ def async_test(function: Callable[[], Coroutine[Any, Any, T]]) -> Callable[[], T
 
 class FakeClient:
     async def iter_search(
-        self, query: str, *, start_offset: int, page_size: int, group_type: str
+        self,
+        query: str,
+        *,
+        start_offset: int,
+        page_size: int,
+        group_type: str,
+        city_id: int | None = None,
     ) -> Any:
         yield (
             2,
@@ -32,7 +38,9 @@ class MemoryPersistence:
         self.complete = False
         self.paused = False
 
-    async def start_or_resume_run(self, keywords: tuple[Keyword, ...]) -> str:
+    async def start_or_resume_run(
+        self, keywords: tuple[Keyword, ...], *, city_id: int | None = None
+    ) -> str:
         return "run-id"
 
     async def get_offset(self, run_id: str, keyword: Keyword, group_type: str) -> int:
@@ -78,7 +86,13 @@ async def test_page_is_checkpointed_and_run_completed() -> None:
 
 class EmptyPoolClient:
     async def iter_search(
-        self, query: str, *, start_offset: int, page_size: int, group_type: str
+        self,
+        query: str,
+        *,
+        start_offset: int,
+        page_size: int,
+        group_type: str,
+        city_id: int | None = None,
     ) -> Any:
         raise VKTokensUnavailable("empty")
         yield

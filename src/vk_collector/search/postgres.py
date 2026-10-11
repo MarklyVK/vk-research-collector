@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -39,12 +39,17 @@ class PostgresSearchPersistence:
             )
             .returning(SearchKeyword.id)
         )
-        return int(await session.scalar(statement))
+        return int(cast(int, await session.scalar(statement)))
 
-    async def start_or_resume_run(self, keywords: tuple[Keyword, ...]) -> str:
-        key_payload = [
-            {"subject": keyword.subject, "keyword": keyword.value} for keyword in keywords
-        ]
+    async def start_or_resume_run(
+        self, keywords: tuple[Keyword, ...], *, city_id: int | None = None
+    ) -> str:
+        key_payload = {
+            "keywords": [
+                {"subject": keyword.subject, "keyword": keyword.value} for keyword in keywords
+            ],
+            "city_id": city_id,
+        }
         plan_key = hashlib.sha256(
             json.dumps(key_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -67,6 +72,7 @@ class PostgresSearchPersistence:
                         "plan_key": plan_key,
                         "subjects": subjects,
                         "keyword_count": len(keywords),
+                        "city_id": city_id,
                     },
                 )
                 session.add(run)

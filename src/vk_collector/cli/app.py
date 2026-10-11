@@ -33,6 +33,7 @@ from vk_collector.collection.backlog import canonical_backlog
 from vk_collector.collection.backup import BackupVerifier, rotate_active_backup_evidence
 from vk_collector.collection.campaigns import CampaignManager, build_aggregate_capacity_projection
 from vk_collector.collection.capacity import (
+    SAFE_DISK_LIMIT_BYTES,
     build_capacity_report,
     validate_capacity_report,
     write_capacity_report,
@@ -139,6 +140,20 @@ def _token_pool(
     return TokenPool(
         tokens,
         rps=settings.vk_per_token_rps,
+        method_rps_overrides={
+            "groups.getMembers": settings.vk_members_method_rps,
+            "users.get": settings.vk_users_get_method_rps,
+            "groups.get": settings.vk_groups_get_method_rps,
+            "wall.get": settings.vk_wall_get_method_rps,
+        },
+        method_probation_rps_overrides={
+            "groups.getMembers": settings.vk_members_method_probation_rps,
+            "users.get": settings.vk_core_methods_probation_rps,
+            "groups.get": settings.vk_core_methods_probation_rps,
+            "wall.get": settings.vk_core_methods_probation_rps,
+        },
+        method_probation_window_seconds=settings.vk_members_method_probation_window_seconds,
+        method_global_rps_overrides={"groups.getMembers": settings.vk_members_method_global_rps},
         clock=time.monotonic,
         flood_initial_cooldown=settings.vk_method_flood_initial_cooldown_seconds,
         quota_initial_cooldown=settings.vk_method_quota_initial_cooldown_seconds,
@@ -151,7 +166,9 @@ def _token_pool(
     )
 
 
-async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]:
+async def _run_search(
+    subject: SubjectName | None, city_id: int | None = None
+) -> tuple[str, dict[str, Any]]:
     settings = get_settings()
     keyword_config = load_keyword_config()
     engine = create_database_engine(settings.sqlalchemy_url)
@@ -167,6 +184,7 @@ async def _run_search(subject: SubjectName | None) -> tuple[str, dict[str, Any]]
             client,
             PostgresSearchPersistence(sessions),
             group_types=tuple(keyword_config.community_types),
+            city_id=city_id,
         )
         keywords = tuple(
             Keyword(value=item.keyword, subject=item.subject)
@@ -188,11 +206,15 @@ def search_groups(
         str | None,
         typer.Option("--subject", help="Искать только одну предметную область."),
     ] = None,
+    city_id: Annotated[
+        int | None,
+        typer.Option("--city-id", help="Ограничить поиск VK city_id (groups.search)."),
+    ] = None,
 ) -> None:
     """Запустить новый поиск или продолжить незавершённый."""
     try:
         validated_subject = ensure_subject(subject) if subject is not None else None
-        run_id, summary = asyncio.run(_run_search(validated_subject))
+        run_id, summary = asyncio.run(_run_search(validated_subject, city_id))
     except ValueError as exc:
         typer.echo(f"Поиск отклонён: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -1837,7 +1859,7 @@ def subscriptions_capacity_preview() -> None:
             "posts_upper": posts,
             "estimated_bytes_upper": gate_b_bytes,
         },
-        "safe_disk_limit_bytes": 7 * 1024**3,
+        "safe_disk_limit_bytes": SAFE_DISK_LIMIT_BYTES,
         "production_allowed": False,
     }
     target = settings.collection_export_dir / "subscription-capacity-preview.json"
@@ -2322,7 +2344,7 @@ async def _run_subscription_pilot(
             and measured_growth > 0
             and isinstance(projected_growth, int)
             and isinstance(projected_database, int)
-            and projected_database <= 7 * 1024**3
+            and projected_database <= SAFE_DISK_LIMIT_BYTES
             and projected_growth <= disk.free_bytes
         )
         measured: dict[str, int | float] = {
@@ -2433,7 +2455,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
         completed = summary["status"] in {"completed", "completed_with_errors"}
         decision = (
             "passed"
-            if completed and projected is not None and projected <= 7 * 1024**3
+            if completed and projected is not None and projected <= SAFE_DISK_LIMIT_BYTES
             else "failed"
             if completed and projected is not None
             else "paused_no_tokens"
@@ -2454,7 +2476,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
             "run_id": str(run_id),
             "database_delta_bytes": delta,
             "projected_database_bytes": projected,
-            "safe_limit_bytes": 7 * 1024**3,
+            "safe_limit_bytes": SAFE_DISK_LIMIT_BYTES,
             "reserve_factor": 1.30,
             "decision": decision,
             "configuration": queue.collection_configuration(),

@@ -13,7 +13,9 @@ class Keyword:
 
 
 class SearchPersistence(Protocol):
-    async def start_or_resume_run(self, keywords: tuple[Keyword, ...]) -> str: ...
+    async def start_or_resume_run(
+        self, keywords: tuple[Keyword, ...], *, city_id: int | None = None
+    ) -> str: ...
 
     async def get_offset(self, run_id: str, keyword: Keyword, group_type: str) -> int: ...
 
@@ -49,15 +51,17 @@ class SearchService:
         *,
         page_size: int = 1000,
         group_types: tuple[str, ...] = ("group",),
+        city_id: int | None = None,
     ) -> None:
         self._client = client
         self._persistence = persistence
         self._page_size = page_size
         self._group_types = group_types
+        self._city_id = city_id
 
     async def run(self, keywords: tuple[Keyword, ...]) -> str:
         """Запустить либо продолжить поиск; каждая сохранённая страница является checkpoint."""
-        run_id = await self._persistence.start_or_resume_run(keywords)
+        run_id = await self._persistence.start_or_resume_run(keywords, city_id=self._city_id)
         try:
             for keyword in keywords:
                 for group_type in self._group_types:
@@ -70,6 +74,7 @@ class SearchService:
                             start_offset=offset,
                             page_size=self._page_size,
                             group_type=group_type,
+                            city_id=self._city_id,
                         ):
                             await self._persistence.save_page(
                                 run_id, keyword, group_type, page, next_offset
