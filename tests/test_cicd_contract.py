@@ -152,7 +152,7 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "legacy run quarantined as expected",
         "transition_data_snapshot",
         "locked_at IS NOT NULL OR locked_by IS NOT NULL",
-        "20260904_0016",
+        "20261011_0017",
     )
     assert all(item in text + transition_text for item in required)
     assert "alembic downgrade" not in text
@@ -240,7 +240,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20260904_0016",
+        "20261011_0017",
     )
     assert all(item in script for item in required)
     forbidden = (
