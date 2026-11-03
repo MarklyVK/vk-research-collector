@@ -4,8 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
+
+# Ограничение вычислений и перекодирования до 1 ядра во избежание голодания PostgreSQL
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+try:
+    import cv2  # type: ignore[import-not-found]
+
+    cv2.setNumThreads(1)
+except ImportError:
+    pass
 
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker

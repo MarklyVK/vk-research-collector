@@ -3,6 +3,22 @@
 Все шаги этого документа выполняются один раз. Debian 12 сервер должен иметь минимум
 20 GB диска. До handoff локальный worker остаётся единственным активным worker.
 
+## Current Production Server (Cloud.ru)
+
+- **Провайдер**: Cloud.ru (Evolution)
+- **CPU**: 2 vCPU (Intel Xeon Processor Icelake, x86_64)
+- **RAM**: 4 GB (3.8 GiB total, ~3.5 GiB available)
+- **Диск**: 100 GB SSD (`/dev/vda`, root LVM-раздел 97 GB, ~84 GB свободно)
+- **Настроенный Swap**: 9.0 GiB суммарно (вывод `swapon --show`):
+  - `/dev/dm-1` (partition): 980M
+  - `/swapfile` (file): 8G
+- **ОС**: Debian GNU/Linux 12 (bookworm), Linux kernel 6.1.0-32-amd64
+- **SSH-алиас**: `vk-prod-server` (настроен в `~/.ssh/config`, прямое подключение: `ssh vk-prod-server`)
+- **Рабочая директория на сервере (`PROD_WORKDIR`)**: `/opt/vk-research-collector`
+- **Локальный файл реквизитов**: `.env.server.local` в корне репозитория (не индексируется в Git, содержит `PROD_SSH_HOST`, `PROD_SSH_PORT`, `PROD_SSH_USER`, `PROD_SSH_KEY_PATH`, `PROD_WORKDIR`).
+
+> **Безопасность**: приватные SSH-ключи, пароли и токены ВК не сохраняются в Git-файлах. Доступ осуществляется через локальный SSH-алиас `vk-prod-server` или параметры в `.env.server.local`.
+
 ## 1. Docker и системный пользователь
 
 ```bash

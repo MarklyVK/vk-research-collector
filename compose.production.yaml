@@ -2,6 +2,24 @@ services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:16-alpine}
     pull_policy: missing
+    command:
+      - postgres
+      - -c
+      - shared_buffers=768MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=40
+      - -c
+      - synchronous_commit=off
+      - -c
+      - checkpoint_completion_target=0.9
+    mem_limit: 1536m
+    cpus: 1.0
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/postgres-init-readonly.sh:/docker-entrypoint-initdb.d/20-readonly.sh:ro
@@ -9,6 +27,8 @@ services:
   collector:
     image: ${COLLECTOR_IMAGE:?COLLECTOR_IMAGE must contain an immutable sha tag}
     pull_policy: never
+    mem_limit: 1024m
+    cpus: 1.0
     volumes:
       - ./config:/app/config:ro
       - ./exports:/app/exports
@@ -19,6 +39,8 @@ services:
     image: ${COLLECTOR_IMAGE:?COLLECTOR_IMAGE must contain an immutable sha tag}
     pull_policy: never
     restart: unless-stopped
+    mem_limit: 1024m
+    cpus: 1.0
     volumes:
       - ./config:/app/config:ro
       - ./exports:/app/exports

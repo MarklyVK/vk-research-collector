@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     vk_request_timeout_seconds: float = 30
     vk_max_concurrency: int = Field(default=6, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
+    media_max_concurrency: int = Field(default=3, ge=1, le=10)
+    media_download_timeout_seconds: float = Field(default=30.0, gt=0)
+    media_max_video_seconds: int = Field(default=60, ge=1)
+    media_max_resolution_long_side: int = Field(default=768, ge=64)
     # groups.getMembers — сбор аудитории групп; VK применяет к массовому
     # перечислению участников более строгий anti-abuse порог, чем к обычным
     # методам (флуд-блок на ~24ч 2026-08-31 при устойчивой нагрузке 2.5 rps
