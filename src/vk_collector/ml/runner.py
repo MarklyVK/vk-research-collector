@@ -25,6 +25,7 @@ except ImportError:
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from vk_collector.ml.cdn_gate import CdnGateError
 from vk_collector.ml.contracts import (
     EmbeddingFailureRecord,
     MultimodalPost,
@@ -145,6 +146,10 @@ class EmbeddingRunner:
                 batch_item = dataset[i]
                 current_batch_items.append(batch_item)
                 current_batch_posts.append(post)
+            except CdnGateError:
+                # шлагбаум CDN (429 / стоп-флаг / не настроен): останавливаем весь прогон,
+                # а не помечаем каждый следующий пост как неудачный
+                raise
             except Exception as e:
                 failures.append(
                     EmbeddingFailureRecord(

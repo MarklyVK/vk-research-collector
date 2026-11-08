@@ -2,16 +2,20 @@
 
 from pathlib import Path
 
+import httpx
+
 from vk_collector.ml.artifacts import (
     load_vectorization_bundle,
     save_vectorization_bundle,
 )
+from vk_collector.ml.cdn_gate import CdnGate
 from vk_collector.ml.contracts import (
     ExecutionProvenance,
     SampleMode,
 )
 from vk_collector.ml.dataset import CompanyPostsDataset
 from vk_collector.ml.encoders.mock_encoder import MockMultimodalEncoder
+from vk_collector.ml.media_resolver import MediaResolver
 from vk_collector.ml.metrics import evaluate_embedding_quality
 from vk_collector.ml.runner import EmbeddingRunner
 from vk_collector.ml.sampling import generate_synthetic_posts, sample_company_posts
@@ -46,7 +50,15 @@ def test_full_vectorization_pipeline_e2e(tmp_path: Path) -> None:
         k_max=calib_result.optimal_k_max,
         target_size=448,
     )
-    dataset = CompanyPostsDataset(sample_posts, video_processor=video_proc)
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    # Без сети: CDN-заглушка отвечает 404, медиа отбрасывается
+    offline = MediaResolver(
+        cache_dir=tmp_path / "cache",
+        gate=CdnGate(gate_dir, who="test", pause_seconds=(0.0, 0.0)),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
+    )
+    dataset = CompanyPostsDataset(sample_posts, video_processor=video_proc, media_resolver=offline)
     assert len(dataset) == 100
 
     # 5. Инициализация энкодера и запуск векторизации

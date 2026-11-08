@@ -1,10 +1,13 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
+from vk_collector.ml.cdn_gate import CdnGate
 from vk_collector.ml.dataset import CompanyPostsDataset
 from vk_collector.ml.encoders.mock_encoder import MockMultimodalEncoder
+from vk_collector.ml.media_resolver import MediaResolver
 from vk_collector.ml.runner import EmbeddingRunner
 from vk_collector.ml.sampling import generate_synthetic_posts
 
@@ -12,7 +15,15 @@ from vk_collector.ml.sampling import generate_synthetic_posts
 @pytest.mark.asyncio
 async def test_embedding_runner_database_flush_at_intervals(tmp_path: Path) -> None:
     posts = generate_synthetic_posts(n=18)
-    dataset = CompanyPostsDataset(posts)
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    # Без сети: CDN-заглушка отвечает 404, медиа отбрасывается, текст кодируется
+    offline = MediaResolver(
+        cache_dir=tmp_path / "cache",
+        gate=CdnGate(gate_dir, who="test", pause_seconds=(0.0, 0.0)),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
+    )
+    dataset = CompanyPostsDataset(posts, media_resolver=offline)
     encoder = MockMultimodalEncoder(embedding_dim=64)
 
     mock_session = AsyncMock()

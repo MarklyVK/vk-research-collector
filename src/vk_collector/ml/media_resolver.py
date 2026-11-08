@@ -5,7 +5,8 @@
 - Ограничение видеопотока не выше 480p и обрезка первыми 60 секундами (ffmpeg -t 60, -threads 1).
 - Безотказный Fallback для видео (разделы 3.6-3.7) на превью из first_frame/image.
 - JIT-обновление протухших подписей URL через VK API (wall.getById / video.get).
-- Бережный сетевой режим для 1 IP без прокси: keep-alive, Semaphore(3), джиттер 0.25–0.6с.
+- Общий для сервера шлагбаум CDN (cdn_gate): 1 поток, не чаще 1 файла в 20–30 с на весь сервер,
+  первый 429 — стоп-флаг без повтора (снимает только человек), без шлагбаума скачивание запрещено.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any, TypeVar
 import httpx
 from PIL import Image
 
+from vk_collector.ml.cdn_gate import CdnGate, CdnGateError, CdnRateLimited
 from vk_collector.ml.contracts import MultimodalPost, PostAttachmentItem
 
 logger = logging.getLogger(__name__)
@@ -88,7 +90,8 @@ class MediaResolver:
         cache_dir: Path | None = None,
         *,
         vk_client: Any | None = None,
-        max_concurrency: int = 3,
+        max_concurrency: int = 1,
+        gate: CdnGate | None = None,
         timeout: float = 30.0,
         max_video_duration_sec: int = 60,
         http_client: httpx.AsyncClient | None = None,
@@ -96,11 +99,22 @@ class MediaResolver:
         self.cache_dir = cache_dir or Path("tmp/ml_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.vk_client = vk_client
-        self.max_concurrency = max(1, max_concurrency)
+        if max_concurrency != 1:
+            logger.warning(
+                "MediaResolver: max_concurrency=%s игнорируется — CDN качается в 1 поток",
+                max_concurrency,
+            )
+        self.max_concurrency = 1
+        self._gate = gate
         self.timeout = timeout
         self.max_video_duration_sec = max_video_duration_sec
         self._http_client = http_client
         self._semaphore: asyncio.Semaphore | None = None
+
+    def _get_gate(self) -> CdnGate:
+        if self._gate is None:
+            self._gate = CdnGate.from_env()
+        return self._gate
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         if self._semaphore is None:
@@ -227,85 +241,86 @@ class MediaResolver:
         is_video: bool = False,
         max_duration_sec: int | None = None,
     ) -> Path:
-        """Бережно скачать файл с семафором, джиттером и экспоненциальным backoff."""
-        sem = self._get_semaphore()
+        """Скачать один файл через общий шлагбаум CDN: одна попытка, 429 — стоп без повтора."""
+        gate = self._get_gate()
         duration = max_duration_sec or self.max_video_duration_sec
         destination.parent.mkdir(parents=True, exist_ok=True)
         temp_dest = destination.with_suffix(
             f"{destination.suffix}.part_{random.randint(1000, 9999)}"
         )
+        host = httpx.URL(url).host
 
-        async with sem:
-            # Случайный джиттер 0.25–0.6 сек между запросами с одного IP
-            await asyncio.sleep(random.uniform(0.25, 0.6))
+        async with self._get_semaphore():
+            await asyncio.to_thread(gate.acquire)
+            status: int | None = None
+            nbytes = 0
+            try:
+                # Видео при наличии ffmpeg: один поток, не длиннее duration секунд,
+                # без второй попытки
+                ffmpeg_bin = shutil.which("ffmpeg")
+                if is_video and ffmpeg_bin:
+                    cmd = [
+                        ffmpeg_bin,
+                        "-y",
+                        "-threads",
+                        "1",
+                        "-i",
+                        url,
+                        "-t",
+                        str(duration),
+                        "-c",
+                        "copy",
+                        "-bsf:a",
+                        "aac_adtstoasc",
+                        str(temp_dest),
+                    ]
+                    try:
+                        proc = await asyncio.to_thread(
+                            subprocess.run,
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=self.timeout + 30.0,
+                        )
+                        if (
+                            proc.returncode == 0
+                            and temp_dest.exists()
+                            and temp_dest.stat().st_size > 0
+                        ):
+                            nbytes = temp_dest.stat().st_size
+                            temp_dest.replace(destination)
+                            status = 200
+                            return destination
+                        if "429" in (proc.stderr or ""):
+                            status = 429
+                            raise CdnRateLimited(host)
+                        raise MediaDownloadHTTPError(502, url)
+                    finally:
+                        temp_dest.unlink(missing_ok=True)
 
-            # Для видео при наличии ffmpeg скачиваем с ограничением до duration секунд и 1 потоком
-            ffmpeg_bin = shutil.which("ffmpeg")
-            if is_video and ffmpeg_bin:
-                cmd = [
-                    ffmpeg_bin,
-                    "-y",
-                    "-threads",
-                    "1",
-                    "-i",
-                    url,
-                    "-t",
-                    str(duration),
-                    "-c",
-                    "copy",
-                    "-bsf:a",
-                    "aac_adtstoasc",
-                    str(temp_dest),
-                ]
-                try:
-                    proc = await asyncio.to_thread(
-                        subprocess.run,
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=self.timeout + 30.0,
-                    )
-                    if proc.returncode == 0 and temp_dest.exists() and temp_dest.stat().st_size > 0:
-                        temp_dest.replace(destination)
-                        return destination
-                except Exception as e:
-                    logger.debug(
-                        "ffmpeg direct stream download failed: %s; falling back to httpx", e
-                    )
-                finally:
-                    temp_dest.unlink(missing_ok=True)
-
-            # Скачивание через httpx с повторами при 429/5xx
-            client = self._get_http_client()
-            retries = 3
-            backoff_delays = (1.0, 2.5, 5.0)
-
-            for attempt in range(retries):
+                client = self._get_http_client()
                 try:
                     async with client.stream("GET", url) as response:
-                        if response.status_code in {403, 404, 410, 429}:
-                            raise MediaDownloadHTTPError(response.status_code, url)
+                        status = response.status_code
+                        if status == 429:
+                            raise CdnRateLimited(host)
+                        if status in {403, 404, 410}:
+                            raise MediaDownloadHTTPError(status, url)
                         response.raise_for_status()
-
                         with temp_dest.open("wb") as f:
                             async for chunk in response.aiter_bytes(chunk_size=65536):
                                 f.write(chunk)
-
                     if temp_dest.exists() and temp_dest.stat().st_size > 0:
+                        nbytes = temp_dest.stat().st_size
                         temp_dest.replace(destination)
                         return destination
-                except MediaDownloadHTTPError:
-                    temp_dest.unlink(missing_ok=True)
-                    raise
+                    raise MediaDownloadHTTPError(502, url)
                 except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
-                    temp_dest.unlink(missing_ok=True)
-                    if attempt < retries - 1:
-                        wait = backoff_delays[attempt] * random.uniform(0.9, 1.2)
-                        await asyncio.sleep(wait)
-                        continue
                     raise MediaDownloadHTTPError(500, url) from exc
-
-        raise MediaDownloadHTTPError(500, url)
+                finally:
+                    temp_dest.unlink(missing_ok=True)
+            finally:
+                await asyncio.to_thread(gate.release, status, host=host, nbytes=nbytes)
 
     async def refresh_post_attachments(self, posts: list[MultimodalPost]) -> None:
         """Just-In-Time (JIT) обновление метаданных постов и видео через VK API."""
@@ -427,10 +442,14 @@ class MediaResolver:
                         return await self.download_file_async(
                             fresh_url, cached_file, is_video=False
                         )
+                    except CdnGateError:
+                        raise
                     except Exception as retry_err:
                         logger.warning("Повторная загрузка фото не удалась: %s", retry_err)
             logger.warning("Не удалось загрузить изображение %s: %s", url, exc)
             return None
+        except CdnGateError:
+            raise
         except Exception as e:
             logger.warning("Ошибка при загрузке фото %s: %s", key, e)
             return None
@@ -473,10 +492,14 @@ class MediaResolver:
                             return await self.download_file_async(
                                 stream_url, cached_file, is_video=True
                             )
+                        except CdnGateError:
+                            raise
                         except Exception as retry_err:
                             logger.warning(
                                 "Повторное скачивание видеопотока не удалось: %s", retry_err
                             )
+            except CdnGateError:
+                raise
             except Exception as e:
                 logger.warning("Сбой скачивания видеопотока %s: %s", stream_url, e)
 
@@ -495,6 +518,8 @@ class MediaResolver:
                 )
                 attachment.attachment_metadata["video_fallback_source"] = preview_url
                 return res
+            except CdnGateError:
+                raise
             except Exception as fallback_err:
                 logger.warning("Fallback на превью видео не удался: %s", fallback_err)
 
