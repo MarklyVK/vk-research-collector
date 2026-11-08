@@ -2,16 +2,43 @@
 
 Формула (1) из статьи:
 MAD(f_t, f_{t+1}) = 1/(H * W) * sum_{i=1}^H sum_{j=1}^W |f_t(i, j) - f_{t+1}(i, j)|
+
+Оптимизирован для сервера с 2 vCPU / 4 GB RAM:
+- Ограничение вычислений и декодирования 1 ядром (cv2, OMP_NUM_THREADS=1, ffmpeg -threads 1).
+- Частота 2 кадра/с, K_max = 32 ключевых кадра (MAD > 10).
+- Безотказная поддержка изображений (превью-фолбэков).
+- Потоковое немедленное удаление сырых медиафайлов в блоке finally после сжатия.
 """
 
 from __future__ import annotations
 
+import logging
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 from PIL import Image
 
 from vk_collector.ml.contracts import VideoKeyFrame
+
+logger = logging.getLogger(__name__)
+
+# Принудительное ограничение потоков вычислений до 1 ядра во избежание голодания PostgreSQL
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+try:
+    import cv2  # type: ignore[import-not-found]
+
+    cv2.setNumThreads(1)
+except ImportError:
+    pass
 
 
 class VideoDecoderProtocol(Protocol):
@@ -29,9 +56,17 @@ class MockVideoDecoder:
         self.width = width
 
     def decode_frames(self, source: Any) -> list[np.ndarray]:
+        source_path = Path(source) if isinstance(source, (str, Path)) else None
+        if source_path and source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            try:
+                with Image.open(source_path) as img:
+                    rgb_img = img.convert("RGB")
+                    return [np.array(rgb_img, dtype=np.uint8)]
+            except Exception:
+                pass
+
         frames: list[np.ndarray] = []
         for i in range(self.num_frames):
-            # Создаем кадры с контролируемым межкадровым изменением
             val = (i * 25) % 256
             frame = np.full((self.height, self.width, 3), val, dtype=np.uint8)
             frames.append(frame)
@@ -39,24 +74,49 @@ class MockVideoDecoder:
 
 
 class OpenCVVideoDecoder:
-    """Декодер видео с использованием OpenCV (когда cv2 установлен)."""
+    """Декодер видео на OpenCV (строго 1 поток, поддержка 2 fps и fallback-картинок)."""
+
+    def __init__(self, target_fps: float = 2.0, max_frames: int = 120) -> None:
+        self.target_fps = target_fps
+        self.max_frames = max_frames
 
     def decode_frames(self, source: Any) -> list[np.ndarray]:
+        source_path = Path(source) if isinstance(source, (str, Path)) else None
+        # Безотказный фолбэк: если источник — превью-картинка
+        if source_path and source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            try:
+                with Image.open(source_path) as img:
+                    rgb_img = img.convert("RGB")
+                    return [np.array(rgb_img, dtype=np.uint8)]
+            except Exception:
+                pass
+
         try:
-            import cv2  # type: ignore[import-not-found]
+            import cv2
+
+            cv2.setNumThreads(1)
         except ImportError as e:
             raise RuntimeError("OpenCV (cv2) не установлен в текущем окружении.") from e
 
         cap = cv2.VideoCapture(str(source))
         frames: list[np.ndarray] = []
         try:
+            source_fps = cap.get(cv2.CAP_PROP_FPS)
+            if not source_fps or source_fps <= 0:
+                source_fps = 30.0
+
+            step = max(1, round(source_fps / self.target_fps))
+            frame_idx = 0
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
-                # BGR -> RGB
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(rgb_frame)
+                if frame_idx % step == 0:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(rgb_frame)
+                    if len(frames) >= self.max_frames:
+                        break
+                frame_idx += 1
         finally:
             cap.release()
         return frames
@@ -72,7 +132,6 @@ class MADCalculator:
         MAD(f_t, f_{t+1}) = 1/(H * W) * sum_{i,j} |f_t(i, j) - f_{t+1}(i, j)| / 255.0
         """
         if frame_a.shape != frame_b.shape:
-            # Привести к единому размеру при несовпадении
             h, w = min(frame_a.shape[0], frame_b.shape[0]), min(frame_a.shape[1], frame_b.shape[1])
             f_a = frame_a[:h, :w]
             f_b = frame_b[:h, :w]
@@ -94,14 +153,18 @@ class MADCalculator:
 
 
 class KeyFrameSelector:
-    """Отбор ключевых кадров K = {t | MAD(f_t, f_{t+1}) > theta}, bounded by |K| <= Kmax."""
+    """Отбор ключевых кадров K = {t | MAD(f_t, f_{t+1}) > theta}, bounded by |K| <= Kmax.
 
-    def __init__(self, theta: float = 0.15, k_max: int = 8, min_frames: int = 1) -> None:
+    По умолчанию согласно разделу 3.5 статьи:
+    theta = 10.0 / 255.0 (порог MAD > 10), K_max = 32.
+    """
+
+    def __init__(self, theta: float = 10.0 / 255.0, k_max: int = 32, min_frames: int = 1) -> None:
         self.theta = theta
         self.k_max = k_max
         self.min_frames = min_frames
 
-    def select_keyframes(self, frames: list[np.ndarray], fps: float = 30.0) -> list[VideoKeyFrame]:
+    def select_keyframes(self, frames: list[np.ndarray], fps: float = 2.0) -> list[VideoKeyFrame]:
         if not frames:
             return []
 
@@ -129,14 +192,13 @@ class KeyFrameSelector:
 
         # 3. Ограничение не более K_max
         if len(candidate_indices) > self.k_max:
-            # Выбираем первый кадр + топ по MAD скору, отсортированные по времени
             sorted_by_score = sorted(
                 candidate_indices[1:], key=lambda idx: scores[idx], reverse=True
             )
             top_k_indices = [0, *sorted_by_score[: self.k_max - 1]]
             candidate_indices = sorted(top_k_indices)
 
-        # 4. Если кандидатов меньше min_frames (например, статичное видео)
+        # 4. Если кандидатов меньше min_frames (например, очень статичное видео)
         if len(candidate_indices) < self.min_frames:
             step = max(1, total_frames // self.min_frames)
             candidate_indices = list(range(0, total_frames, step))[: self.min_frames]
@@ -157,10 +219,10 @@ class KeyFrameSelector:
 
 
 class FramePostprocessor:
-    """Масштабирование и нормализация кадров для передачи в мультимодальный энкодер."""
+    """Масштабирование и нормализация кадров для передачи в мультимодальный энкодер (до 768px)."""
 
     @staticmethod
-    def resize_frame(frame: np.ndarray, target_long_side: int = 448) -> np.ndarray:
+    def resize_frame(frame: np.ndarray, target_long_side: int = 768) -> np.ndarray:
         h, w = frame.shape[:2]
         if max(h, w) <= target_long_side:
             return frame
@@ -175,28 +237,147 @@ class FramePostprocessor:
 
 
 class VideoProcessor:
-    """Высокоуровневый фасад для обработки видео с сжатием по MAD."""
+    """Высокоуровневый фасад для обработки видео с сжатием по MAD и защитой ресурсов сервера."""
 
     def __init__(
         self,
         decoder: VideoDecoderProtocol | None = None,
-        theta: float = 0.15,
-        k_max: int = 8,
-        target_size: int = 448,
+        theta: float = 10.0 / 255.0,
+        k_max: int = 32,
+        target_size: int = 768,
     ) -> None:
         self.decoder = decoder or MockVideoDecoder()
         self.selector = KeyFrameSelector(theta=theta, k_max=k_max)
         self.target_size = target_size
 
-    def process_video(self, source: Any) -> list[np.ndarray]:
-        """Декодировать, сжать по MAD и вернуть список обработанных ключевых кадров."""
-        raw_frames = self.decoder.decode_frames(source)
-        if not raw_frames:
-            return []
-        keyframes = self.selector.select_keyframes(raw_frames)
-        processed: list[np.ndarray] = []
-        for kf in keyframes:
-            raw_frame = raw_frames[kf.frame_index]
-            resized = FramePostprocessor.resize_frame(raw_frame, self.target_size)
-            processed.append(resized)
-        return processed
+    def process_video(
+        self,
+        source: Any,
+        *,
+        cleanup_raw: bool = False,
+        output_compressed_mp4: Path | None = None,
+    ) -> list[np.ndarray]:
+        """Декодировать, сжать по MAD и вернуть список обработанных ключевых кадров.
+
+        Если cleanup_raw=True, гарантирует немедленное удаление исходного файла в finally.
+        """
+        raw_path = Path(source) if isinstance(source, (str, Path)) else None
+        try:
+            raw_frames = self.decoder.decode_frames(source)
+            if not raw_frames:
+                return []
+            keyframes = self.selector.select_keyframes(raw_frames)
+            processed: list[np.ndarray] = []
+            for kf in keyframes:
+                raw_frame = raw_frames[kf.frame_index]
+                resized = FramePostprocessor.resize_frame(raw_frame, self.target_size)
+                processed.append(resized)
+
+            if output_compressed_mp4 is not None and raw_path is not None and raw_path.exists():
+                self.compress_video_to_mp4(
+                    raw_source=raw_path,
+                    output_mp4_path=output_compressed_mp4,
+                    max_keyframes=self.selector.k_max,
+                    target_size=self.target_size,
+                    cleanup_raw=False,
+                )
+
+            return processed
+        finally:
+            if (
+                cleanup_raw
+                and raw_path is not None
+                and raw_path.exists()
+                and (
+                    output_compressed_mp4 is None
+                    or raw_path.resolve() != output_compressed_mp4.resolve()
+                )
+            ):
+                raw_path.unlink(missing_ok=True)
+
+    def compress_video_to_mp4(
+        self,
+        raw_source: Path | str,
+        output_mp4_path: Path,
+        max_keyframes: int = 32,
+        target_size: int = 768,
+        fps: float = 2.0,
+        cleanup_raw: bool = True,
+    ) -> Path:
+        """Сформировать сжатый MP4 (до 32 кадров, 768px по длинной стороне, 2 fps, 1 поток).
+
+        Исходный сырой файл гарантированно немедленно удаляется в блоке finally.
+        """
+        raw_path = Path(raw_source)
+        try:
+            output_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if ffmpeg_bin and raw_path.exists() and raw_path.stat().st_size > 0:
+                cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-threads",
+                    "1",
+                    "-i",
+                    str(raw_path),
+                    "-t",
+                    "60",
+                    "-r",
+                    str(fps),
+                    "-vf",
+                    (
+                        f"scale=if(gte(iw\\,ih)\\,min({target_size}\\,iw)\\,-2):"
+                        f"if(lt(iw\\,ih)\\,min({target_size}\\,ih)\\,-2)"
+                    ),
+                    "-vframes",
+                    str(max_keyframes),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "28",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(output_mp4_path),
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                if (
+                    proc.returncode == 0
+                    and output_mp4_path.exists()
+                    and output_mp4_path.stat().st_size > 0
+                ):
+                    return output_mp4_path
+
+            # Фолбэк через декодированные кадры
+            frames = self.process_video(raw_path, cleanup_raw=False)
+            if not frames:
+                output_mp4_path.touch()
+                return output_mp4_path
+
+            try:
+                import cv2
+
+                cv2.setNumThreads(1)
+                h, w = frames[0].shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(output_mp4_path), fourcc, fps, (w, h))
+                try:
+                    for f in frames[:max_keyframes]:
+                        bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+                        writer.write(bgr)
+                finally:
+                    writer.release()
+            except Exception:
+                img = Image.fromarray(frames[0])
+                img.save(output_mp4_path)
+
+            return output_mp4_path
+        finally:
+            if (
+                cleanup_raw
+                and raw_path.exists()
+                and raw_path.resolve() != output_mp4_path.resolve()
+            ):
+                raw_path.unlink(missing_ok=True)

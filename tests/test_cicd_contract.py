@@ -577,6 +577,24 @@ exit 0
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    for cmd in ("systemctl", "systemd-analyze"):
+        if shutil.which(cmd) is None:
+            stub = fake_bin / cmd
+            stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+    if subprocess.run(["stat", "-c", "%a", "/dev/null"], capture_output=True).returncode != 0:
+        stat_shim = fake_bin / "stat"
+        stat_shim.write_text(
+            """#!/usr/bin/env bash
+if [[ "$1" == "-c" ]]; then
+    python3 -c "import os, sys; print(oct(os.stat(sys.argv[1]).st_mode)[-3:])" "$3"
+else
+    /usr/bin/stat "$@"
+fi
+""",
+            encoding="utf-8",
+        )
+        stat_shim.chmod(0o755)
     env = os.environ.copy()
     env.update(
         {

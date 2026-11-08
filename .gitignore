@@ -1,6 +1,7 @@
 # Секреты
 .env
 .env.*
+.env.server.local
 !.env.example
 secrets/
 .deploy-secrets/
