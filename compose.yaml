@@ -132,6 +132,13 @@ services:
       COLLECTION_PILOT_SEED: ${COLLECTION_PILOT_SEED:-20260728}
       COLLECTION_PILOT_GROUPS_PER_CATEGORY: ${COLLECTION_PILOT_GROUPS_PER_CATEGORY:-10}
       COLLECTION_EXPORT_DIR: ${COLLECTION_EXPORT_DIR:-/app/exports/stage2-pilot}
+      # YouTube Virality Panel (IEEE Access)
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+      YOUTUBE_API_KEYS: ${YOUTUBE_API_KEYS:-}
+      YT_DAILY_QUOTA_LIMIT: ${YT_DAILY_QUOTA_LIMIT:-10000}
+      YT_QUOTA_SAFETY_MARGIN: ${YT_QUOTA_SAFETY_MARGIN:-200}
+      YT_THUMBS_DIR: ${YT_THUMBS_DIR:-/app/data/yt_thumbs}
+      YT_EXPORT_DIR: ${YT_EXPORT_DIR:-/app/data/yt_export}
     volumes: &collector-volumes
       - ./config:/app/config:ro
       - ./exports:/app/exports
