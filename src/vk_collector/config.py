@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     vk_request_timeout_seconds: float = 30
     vk_max_concurrency: int = Field(default=6, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
-    media_max_concurrency: int = Field(default=3, ge=1, le=10)
+    # CDN VK: 1 поток через общий шлагбаум (ml/cdn_gate.py, MEDIA_CDN_GATE_DIR);
+    # значения > 1 игнорируются MediaResolver
+    media_max_concurrency: int = Field(default=1, ge=1, le=10)
     media_download_timeout_seconds: float = Field(default=30.0, gt=0)
     media_max_video_seconds: int = Field(default=60, ge=1)
     media_max_resolution_long_side: int = Field(default=768, ge=64)

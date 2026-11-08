@@ -115,3 +115,19 @@ docker volume inspect vk_research_postgres_data
 После успешного импорта server worker уже запущен, а локальный остаётся остановлен.
 Перезапустите failed production workflow или сделайте следующий push в `main`.
 Дальнейшие deploy полностью автоматические.
+
+## Шлагбаум CDN для медиа (с 2026-11-08)
+
+CDN VK (`*.userapi.com`) отвечает 429 по IP, поэтому все процессы сервера, которые качают медиа
+(ML-конвейер `vk_collector.ml`, скрипты MLwA), проходят через один общий шлагбаум
+`vk_collector/ml/cdn_gate.py`:
+
+- каталог `/var/lib/markly-cdn` (root:vkcollector, 2770), переменная `MEDIA_CDN_GATE_DIR`;
+  без неё `MediaResolver` скачивать отказывается;
+- 1 поток, не чаще 1 файла в 20–30 с на весь сервер (`flock` + `state.json`);
+- первый 429 — файл `STOP_429`, повтора нет; пока файл есть, не качает никто.
+  Снимает только человек: `rm /var/lib/markly-cdn/STOP_429`;
+- журнал `gate_log.jsonl` (хост, статус, байты; без полных URL).
+
+Если ML-конвейер когда-нибудь запустят в контейнере: смонтировать `/var/lib/markly-cdn`
+и добавить контейнеру группу `vkcollector` (`group_add`), иначе uid 10001 не сможет взять замок.
