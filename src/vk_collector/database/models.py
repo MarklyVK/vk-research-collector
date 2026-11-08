@@ -494,6 +494,19 @@ class CollectionJob(TimestampMixin, Base):
         ),
         Index("ix_collection_jobs_lease", "status", "locked_at"),
         Index("ix_collection_jobs_run_status", "collection_run_id", "status"),
+        # Индекс claim-запроса воркера; создан на production вручную 2026-09-17,
+        # закреплён миграцией 20261011_0017.
+        Index(
+            "ix_collection_jobs_claim",
+            "collection_run_id",
+            "job_type",
+            "priority",
+            "created_at",
+            postgresql_where=text(
+                "status = ANY (ARRAY['pending'::collection_job_status, "
+                "'retry_wait'::collection_job_status])"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -569,6 +582,12 @@ class GroupPost(TimestampMixin, Base):
         Index("ix_group_posts_group_published", "group_id", "published_at"),
         Index("ix_group_posts_community_published", "community_vk_id", "published_at"),
         Index("ix_group_posts_signer", "signer_vk_user_id"),
+        # Создан на production вручную, закреплён миграцией 20261011_0017.
+        Index(
+            "ix_group_posts_engagement",
+            text("(likes_count + reposts_count + comments_count) DESC"),
+            "group_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

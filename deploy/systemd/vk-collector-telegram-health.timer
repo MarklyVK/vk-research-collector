@@ -1,9 +1,9 @@
 [Unit]
-Description=VK Collector Telegram health check every five minutes
+Description=VK Collector Telegram health check every thirty minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=30min
 AccuracySec=15s
 Persistent=true
 Unit=vk-collector-telegram-health.service

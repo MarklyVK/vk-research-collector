@@ -596,7 +596,7 @@ POSTGRES_DB=$(env_value POSTGRES_DB); POSTGRES_DB=${POSTGRES_DB:-vk_research}
 [[ "$(service_state postgres)" == running/healthy ]] || die 'PostgreSQL не healthy.'
 ensure_worker_healthy
 REVISION=$(psql_query -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20260820_0013 || "$REVISION" == 20260830_0014 || "$REVISION" == 20260903_0015 || "$REVISION" == 20260904_0016 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20260820_0013 || "$REVISION" == 20260830_0014 || "$REVISION" == 20260903_0015 || "$REVISION" == 20260904_0016 || "$REVISION" == 20261011_0017 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 report
 if [[ "$ACTION" == start-subscriptions ]]; then
