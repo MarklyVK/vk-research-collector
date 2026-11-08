@@ -477,7 +477,7 @@ def test_telegram_systemd_and_secret_contract() -> None:
         "vk-collector-telegram-daily.timer",
     } == set(units)
     assert "OnBootSec=2min" in units["vk-collector-telegram-health.timer"]
-    assert "OnUnitActiveSec=5min" in units["vk-collector-telegram-health.timer"]
+    assert "OnUnitActiveSec=30min" in units["vk-collector-telegram-health.timer"]
     assert "OnCalendar=*-*-* 09:00:00 Europe/Moscow" in units["vk-collector-telegram-daily.timer"]
     assert all(
         "Persistent=true" in units[name]
