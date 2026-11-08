@@ -14,6 +14,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -1193,3 +1194,187 @@ class PanelCommunitySnapshot(Base):
     members_count: Mapped[int | None] = mapped_column(Integer)
     is_closed: Mapped[int | None] = mapped_column(Integer)
     deactivated: Mapped[str | None] = mapped_column(String(50))
+
+
+# =============================================================================
+# YouTube Virality Panel (IEEE Access, TOTE Model)
+# =============================================================================
+
+
+class YTKeyDailyUsage(Base):
+    """Учёт суточного расхода квоты YouTube Data API v3 в часовом поясе America/Los_Angeles."""
+
+    __tablename__ = "yt_key_daily_usage"
+    __table_args__ = (
+        UniqueConstraint(
+            "key_fingerprint", "endpoint", "day_pt", name="uq_yt_key_daily_usage_key_endpoint_day"
+        ),
+        Index("ix_yt_key_daily_usage_day", "day_pt"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    key_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(100), nullable=False)
+    day_pt: Mapped[date] = mapped_column(Date, nullable=False)
+    calls_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    units_spent: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    quota_exceeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class YTSearchQueryLog(Base):
+    """Логирование поисковых запросов YouTube для воспроизводимости отчёта статьи."""
+
+    __tablename__ = "yt_search_query_logs"
+    __table_args__ = (Index("ix_yt_search_query_logs_domain", "domain"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    domain: Mapped[str] = mapped_column(String(100), nullable=False)
+    query_text: Mapped[str] = mapped_column(String(500), nullable=False)
+    executed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    results_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    units_cost: Mapped[int] = mapped_column(Integer, nullable=False, server_default="100")
+
+
+class YTChannel(Base):
+    """Канал YouTube в панели исследования виральности."""
+
+    __tablename__ = "yt_channels"
+    __table_args__ = (
+        Index("ix_yt_channels_domain_size", "domain", "size_tier"),
+        Index("ix_yt_channels_selected", "is_selected"),
+    )
+
+    channel_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, server_default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    country: Mapped[str | None] = mapped_column(String(10))
+    default_language: Mapped[str | None] = mapped_column(String(20))
+    subscribers_count: Mapped[int | None] = mapped_column(BigInteger)
+    size_tier: Mapped[str] = mapped_column(String(10), nullable=False)  # S, M, L, XL
+    domain: Mapped[str] = mapped_column(String(100), nullable=False)
+    uploads_playlist_id: Mapped[str] = mapped_column(String(100), nullable=False, server_default="")
+    is_selected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    selection_seed: Mapped[int | None] = mapped_column(BigInteger)
+    discovered_via_query: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class YTPost(Base):
+    """Видео YouTube в панели: актуальное состояние метрик и метаданных."""
+
+    __tablename__ = "yt_posts"
+    __table_args__ = (
+        Index("ix_yt_posts_channel", "channel_id"),
+        Index("ix_yt_posts_published", "published_at"),
+        Index("ix_yt_posts_backfill", "is_backfill"),
+        Index("ix_yt_posts_comments_status", "comments_status"),
+        Index("ix_yt_posts_media_downloaded", "media_downloaded"),
+    )
+
+    post_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    channel_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("yt_channels.channel_id", ondelete="CASCADE"), nullable=False
+    )
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    crawled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    age_hours: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.0")
+    views: Mapped[int | None] = mapped_column(BigInteger)
+    likes: Mapped[int | None] = mapped_column(BigInteger)
+    comments: Mapped[int | None] = mapped_column(BigInteger)
+    shares: Mapped[int | None] = mapped_column(BigInteger)  # Always None for YouTube
+    duration_s: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    is_short: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    title: Mapped[str] = mapped_column(String(1000), nullable=False, server_default="")
+    description: Mapped[Text] = mapped_column(Text, nullable=False, server_default="")
+    tags: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
+    )
+    category_id: Mapped[str | None] = mapped_column(String(50))
+    default_language: Mapped[str | None] = mapped_column(String(50))
+    thumbnail_url: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    is_backfill: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    media_downloaded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    comments_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="pending"
+    )  # pending | sampled | done | disabled | skipped
+
+
+class YTTimeseries(Base):
+    """Временные ряды замеров динамики видео YouTube (0h, 1h, 3h, 6h, 12h, 24h, 48h, 72h, 168h)."""
+
+    __tablename__ = "yt_timeseries"
+    __table_args__ = (
+        Index("ix_yt_timeseries_post", "post_id"),
+        Index(
+            "uq_yt_timeseries_post_target",
+            "post_id",
+            "target_age_h",
+            unique=True,
+            postgresql_where=text("target_age_h IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    post_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("yt_posts.post_id", ondelete="CASCADE"), nullable=False
+    )
+    crawled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_age_h: Mapped[int | None] = mapped_column(Integer)
+    age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    views: Mapped[int | None] = mapped_column(BigInteger)
+    likes: Mapped[int | None] = mapped_column(BigInteger)
+    comments: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class YTScheduledMeasurement(Base):
+    """Очередь плановых замеров для новых видео с обработкой SELECT ... FOR UPDATE SKIP LOCKED."""
+
+    __tablename__ = "yt_scheduled_measurements"
+    __table_args__ = (
+        UniqueConstraint("post_id", "target_age_h", name="uq_yt_sched_post_target"),
+        Index(
+            "ix_yt_scheduled_measurements_due",
+            "status",
+            "scheduled_for",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index("ix_yt_scheduled_measurements_post", "post_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    post_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("yt_posts.post_id", ondelete="CASCADE"), nullable=False
+    )
+    target_age_h: Mapped[int] = mapped_column(Integer, nullable=False)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class YTComment(Base):
+    """Топ-20 комментариев по релевантности для стратифицированной подвыборки видео."""
+
+    __tablename__ = "yt_comments"
+    __table_args__ = (Index("ix_yt_comments_post", "post_id"),)
+
+    comment_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    post_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("yt_posts.post_id", ondelete="CASCADE"), nullable=False
+    )
+    author_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    like_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    reply_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    crawled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

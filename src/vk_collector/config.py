@@ -164,6 +164,28 @@ class Settings(BaseSettings):
     collection_pilot_seed: int = 20260728
     collection_pilot_groups_per_category: int = Field(default=10, ge=1)
     collection_export_dir: Path = Path("/app/exports/stage2-pilot")
+    # YouTube Virality Panel (IEEE Access)
+    youtube_api_keys: list[str] = Field(default_factory=list)
+    youtube_api_key: SecretStr = SecretStr("")
+    yt_daily_quota_limit: int = Field(default=10000, ge=1)
+    yt_quota_safety_margin: int = Field(default=200, ge=0)
+    yt_thumbs_dir: Path = Path("data/yt_thumbs")
+    yt_export_dir: Path = Path("data/yt_export")
+
+    @field_validator("youtube_api_keys", mode="before")
+    @classmethod
+    def parse_youtube_api_keys(cls, value: object) -> list[str]:
+        if isinstance(value, str):
+            return [k.strip() for k in value.split(",") if k.strip()]
+        if isinstance(value, list):
+            res: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    for sub in item.split(","):
+                        if sub.strip():
+                            res.append(sub.strip())
+            return res
+        return []
 
     @field_validator(
         "collection_members_max_per_group",
@@ -236,6 +258,18 @@ class Settings(BaseSettings):
         except (OSError, UnicodeDecodeError):
             return ""
 
+    @property
+    def effective_youtube_api_keys(self) -> list[str]:
+        """Вернуть список валидных YouTube API ключей из пула."""
+        keys: list[str] = list(self.youtube_api_keys)
+        single = self.youtube_api_key.get_secret_value().strip()
+        if single:
+            for k in single.split(","):
+                k_clean = k.strip()
+                if k_clean and k_clean not in keys:
+                    keys.append(k_clean)
+        return keys
+
 
 class Keyword(BaseModel):
     subject: SubjectName
@@ -305,3 +339,22 @@ def load_keyword_config(path: Path = Path("config/keywords.yml")) -> KeywordConf
 def get_settings() -> Settings:
     """Вернуть кэшированные настройки процесса."""
     return Settings()
+
+
+def load_yt_keywords(path: Path = Path("config/yt_keywords.yml")) -> dict[str, list[str]]:
+    """Загрузить целевые поисковые запросы по 9 доменам для панели YouTube."""
+    raw_payload: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_payload, dict):
+        raise ValueError("Конфигурация YouTube запросов должна быть объектом YAML")
+    domains_raw = raw_payload.get("domains")
+    if not isinstance(domains_raw, dict):
+        raise ValueError("Раздел domains должен быть объектом YAML")
+    result: dict[str, list[str]] = {}
+    for domain, queries in domains_raw.items():
+        if not isinstance(queries, list) or not queries:
+            raise ValueError(f"Запросы для домена {domain} должны быть непустым списком")
+        cleaned = [str(q).strip() for q in queries if str(q).strip()]
+        if not cleaned:
+            raise ValueError(f"Для домена {domain} не задано ни одного непустого запроса")
+        result[str(domain)] = cleaned
+    return result

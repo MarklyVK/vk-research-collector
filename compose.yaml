@@ -137,6 +137,7 @@ services:
       - ./exports:/app/exports
       - ./backups:/app/backups:ro
       - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
+      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -174,6 +175,31 @@ services:
     stop_grace_period: 2m
     environment:
       <<: *collector-environment
+    volumes: *collector-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 512m
+    cpus: 0.5
+    logging: *default-logging
+
+  # YouTube-панель виральности (профиль yt-panel)
+  yt-panel-worker:
+    build:
+      context: .
+    init: true
+    profiles: ["yt-panel"]
+    command: ["yt", "worker"]
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      <<: *collector-environment
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+      YOUTUBE_API_KEYS: ${YOUTUBE_API_KEYS:-}
+      YT_DAILY_QUOTA_LIMIT: ${YT_DAILY_QUOTA_LIMIT:-10000}
+      YT_QUOTA_SAFETY_MARGIN: ${YT_QUOTA_SAFETY_MARGIN:-200}
+      YT_THUMBS_DIR: ${YT_THUMBS_DIR:-/app/data/yt_thumbs}
+      YT_EXPORT_DIR: ${YT_EXPORT_DIR:-/app/data/yt_export}
     volumes: *collector-volumes
     depends_on:
       postgres:

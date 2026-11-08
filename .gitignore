@@ -30,6 +30,8 @@ exports/
 logs/
 *.log
 tmp/
+data/
+thumbs/
 
 # PostgreSQL
 postgres_data/

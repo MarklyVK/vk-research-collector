@@ -2806,5 +2806,7 @@ def privacy_inspect_group(vk_id: int) -> None:
 
 
 from vk_collector.cli.panel_cli import panel_app  # noqa: E402
+from vk_collector.cli.yt_cli import yt_app  # noqa: E402
 
 app.add_typer(panel_app, name="panel")
+app.add_typer(yt_app, name="yt", help="Панель сбора и мониторинга YouTube (IEEE Access)")
