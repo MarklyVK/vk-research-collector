@@ -52,6 +52,13 @@ def upgrade() -> None:
             "panel_post_snapshots",
             "panel_media",
             "panel_community_snapshots",
+            "yt_key_daily_usage",
+            "yt_search_query_logs",
+            "yt_channels",
+            "yt_posts",
+            "yt_timeseries",
+            "yt_scheduled_measurements",
+            "yt_comments",
         }
     ]
     Base.metadata.create_all(op.get_bind(), tables=stage_one_tables)
