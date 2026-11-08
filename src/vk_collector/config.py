@@ -165,7 +165,7 @@ class Settings(BaseSettings):
     collection_pilot_groups_per_category: int = Field(default=10, ge=1)
     collection_export_dir: Path = Path("/app/exports/stage2-pilot")
     # YouTube Virality Panel (IEEE Access)
-    youtube_api_keys: list[str] = Field(default_factory=list)
+    youtube_api_keys: str | list[str] = Field(default_factory=list)
     youtube_api_key: SecretStr = SecretStr("")
     yt_daily_quota_limit: int = Field(default=10000, ge=1)
     yt_quota_safety_margin: int = Field(default=200, ge=0)
@@ -176,6 +176,8 @@ class Settings(BaseSettings):
     @classmethod
     def parse_youtube_api_keys(cls, value: object) -> list[str]:
         if isinstance(value, str):
+            if not value.strip():
+                return []
             return [k.strip() for k in value.split(",") if k.strip()]
         if isinstance(value, list):
             res: list[str] = []
@@ -261,7 +263,11 @@ class Settings(BaseSettings):
     @property
     def effective_youtube_api_keys(self) -> list[str]:
         """Вернуть список валидных YouTube API ключей из пула."""
-        keys: list[str] = list(self.youtube_api_keys)
+        keys: list[str] = (
+            [self.youtube_api_keys]
+            if isinstance(self.youtube_api_keys, str)
+            else list(self.youtube_api_keys)
+        )
         single = self.youtube_api_key.get_secret_value().strip()
         if single:
             for k in single.split(","):
