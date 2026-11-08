@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     vk_max_concurrency: int = Field(default=6, ge=1)
     vk_per_token_rps: float = Field(default=2.5, gt=0)
     media_max_concurrency: int = Field(default=3, ge=1, le=10)
+    # Суточный бюджет VK по паре токен + метод (вызовы внутри execute считаются отдельно).
+    # Формат: "wall.get=20000,wall.getById=20000". Пусто — только учёт, без остановки.
+    # Официальные числа лимитов не опубликованы в доступном виде; значения задаются
+    # по наблюдениям (ошибка 29) и уточняются по dev.vk.com.
+    vk_method_daily_limits: str = ""
+    vk_daily_budget_fraction: float = Field(default=0.8, gt=0, le=1)
+    vk_budget_timezone: str = "Europe/Moscow"
+    # Первая ошибка 29 (количественный лимит метода) — токен целиком стоп до следующих суток.
+    vk_stop_token_on_quota_error: bool = False
     media_download_timeout_seconds: float = Field(default=30.0, gt=0)
     media_max_video_seconds: int = Field(default=60, ge=1)
     media_max_resolution_long_side: int = Field(default=768, ge=64)
@@ -186,6 +195,19 @@ class Settings(BaseSettings):
         ):
             raise ValueError("minimum Pilot B не может превышать размер Pilot B")
         return self
+
+    @property
+    def method_daily_limits(self) -> dict[str, int]:
+        """Разобрать VK_METHOD_DAILY_LIMITS ("wall.get=20000,execute=50000")."""
+        limits: dict[str, int] = {}
+        for item in self.vk_method_daily_limits.split(","):
+            if not item.strip():
+                continue
+            name, _, value = item.partition("=")
+            if not name.strip() or not value.strip().isdigit() or int(value) <= 0:
+                raise ValueError(f"Некорректный элемент VK_METHOD_DAILY_LIMITS: {item!r}")
+            limits[name.strip()] = int(value)
+        return limits
 
     @property
     def sqlalchemy_url(self) -> str:

@@ -396,6 +396,33 @@ class TokenPool:
                 blocked_until = self._clock() + duration
         return blocked_until
 
+    async def block_method_for(self, lease: TokenLease, seconds: float) -> None:
+        """Закрыть пару token+method на seconds без эскалации (суточный бюджет, не ошибка VK)."""
+        seconds = max(1.0, seconds)
+        async with self._lock:
+            state = self._find_lease(lease)
+            method_state = state.methods.setdefault(lease.method, _MethodState())
+            until = self._clock() + seconds
+            method_state.blocked_until = max(method_state.blocked_until, until)
+            method_state.next_probe_at = max(method_state.next_probe_at, until)
+        if self._sessions is not None:
+            async with self._sessions() as session:
+                blocked_dt = datetime.now(UTC) + timedelta(seconds=seconds)
+                await session.execute(
+                    insert(VKTokenMethodState)
+                    .values(
+                        token_fingerprint=lease.fingerprint,
+                        method=lease.method,
+                        blocked_until=blocked_dt,
+                        next_probe_at=blocked_dt,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_vk_token_method_state",
+                        set_={"blocked_until": blocked_dt, "next_probe_at": blocked_dt},
+                    )
+                )
+                await session.commit()
+
     async def mark_success(self, lease: TokenLease) -> None:
         """Сбросить последовательные limit hits успешного метода."""
         async with self._lock:

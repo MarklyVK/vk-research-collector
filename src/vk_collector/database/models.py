@@ -4,6 +4,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -23,6 +24,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -1016,3 +1018,178 @@ class UserPostCollectionState(Base):
     collected_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     wall_private: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     unavailable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+
+class VKTokenDailyUsage(Base):
+    """Суточный счётчик вызовов VK по паре токен + метод (вызовы внутри execute считаются отдельно).
+
+    День — по Москве (`vk_budget_timezone`). По нему VKClient останавливает метод на токене при
+    достижении доли `vk_daily_budget_fraction` от лимита метода (`vk_method_daily_limits`).
+    """
+
+    __tablename__ = "vk_token_daily_usage"
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    token_fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    method: Mapped[str] = mapped_column(String(100), primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Panel(Base):
+    """Исследовательская VK-панель: фиксированная выборка сообществ и временные ряды постов."""
+
+    __tablename__ = "panels"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="draft")
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PanelCommunity(Base):
+    __tablename__ = "panel_communities"
+    __table_args__ = (
+        Index(
+            "ix_panel_communities_due",
+            "panel_id",
+            "next_poll_at",
+            postgresql_where=text("excluded_at IS NULL"),
+        ),
+    )
+
+    panel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("panels.id", ondelete="CASCADE"), primary_key=True
+    )
+    community_vk_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    name: Mapped[str] = mapped_column(String(512), nullable=False, server_default="")
+    screen_name: Mapped[str | None] = mapped_column(String(255))
+    stratum: Mapped[str] = mapped_column(String(40), nullable=False)
+    size_bucket: Mapped[str] = mapped_column(String(2), nullable=False)
+    members_at_selection: Mapped[int] = mapped_column(Integer, nullable=False)
+    selection_seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    poll_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen_post_id: Mapped[int | None] = mapped_column(BigInteger)
+    backfill_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    excluded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    excluded_reason: Mapped[str | None] = mapped_column(String(100))
+
+
+class PanelPost(Base):
+    __tablename__ = "panel_posts"
+    __table_args__ = (
+        Index("ix_panel_posts_community_published", "panel_id", "community_vk_id", "published_at"),
+        Index(
+            "ix_panel_posts_due",
+            "panel_id",
+            "next_due_at",
+            postgresql_where=text("next_due_at IS NOT NULL"),
+        ),
+    )
+
+    panel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("panels.id", ondelete="CASCADE"), primary_key=True
+    )
+    vk_owner_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    vk_post_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    community_vk_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    origin: Mapped[str] = mapped_column(String(10), nullable=False)  # backfill | live
+    post_type: Mapped[str | None] = mapped_column(String(20))
+    is_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    marked_as_ads: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_repost: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    repost_source_owner_id: Mapped[int | None] = mapped_column(BigInteger)
+    repost_source_post_id: Mapped[int | None] = mapped_column(BigInteger)
+    text: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    text_norm_hash: Mapped[str | None] = mapped_column(String(64))
+    attachments: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
+    )
+    n_photo: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    n_video: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_target_index: Mapped[int | None] = mapped_column(Integer)
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    missed_targets: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PanelPostSnapshot(Base):
+    __tablename__ = "panel_post_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_panel_snapshots_post_time", "panel_id", "vk_owner_id", "vk_post_id", "measured_at"
+        ),
+        Index(
+            "uq_panel_snapshot_target",
+            "panel_id",
+            "vk_owner_id",
+            "vk_post_id",
+            "target_age_h",
+            unique=True,
+            postgresql_where=text("target_age_h IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    panel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("panels.id", ondelete="CASCADE"), nullable=False
+    )
+    vk_owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    vk_post_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    measured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_age_h: Mapped[int | None] = mapped_column(Integer)
+    views: Mapped[int | None] = mapped_column(Integer)
+    likes: Mapped[int | None] = mapped_column(Integer)
+    reposts: Mapped[int | None] = mapped_column(Integer)
+    comments: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(10), nullable=False)  # backfill | poll | getbyid
+
+
+class PanelMedia(Base):
+    """Медиа постов панели: ссылки (из ответа VK) и pHash после скачивания через шлагбаум CDN."""
+
+    __tablename__ = "panel_media"
+    __table_args__ = (Index("ix_panel_media_pending", "panel_id", "status", "priority"),)
+
+    panel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("panels.id", ondelete="CASCADE"), primary_key=True
+    )
+    vk_owner_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    vk_post_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    # photo | video_cover | video_first_frame
+    kind: Mapped[str] = mapped_column(String(20), primary_key=True)
+    url: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    status: Mapped[str] = mapped_column(String(10), nullable=False, server_default="pending")
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    phash: Mapped[str | None] = mapped_column(String(16))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    downloaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PanelCommunitySnapshot(Base):
+    __tablename__ = "panel_community_snapshots"
+
+    panel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("panels.id", ondelete="CASCADE"), primary_key=True
+    )
+    community_vk_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    measured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    members_count: Mapped[int | None] = mapped_column(Integer)
+    is_closed: Mapped[int | None] = mapped_column(Integer)
+    deactivated: Mapped[str | None] = mapped_column(String(50))

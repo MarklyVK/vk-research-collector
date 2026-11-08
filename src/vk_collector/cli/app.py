@@ -98,6 +98,7 @@ from vk_collector.vk import (
     load_tokens,
     token_fingerprint,
 )
+from vk_collector.vk.budget import DailyBudget
 
 logger = logging.getLogger(__name__)
 app = typer.Typer(help="Поиск и ручная классификация сообществ VK.")
@@ -129,6 +130,16 @@ def configure_logging() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _daily_budget(settings: Settings, sessions: async_sessionmaker[AsyncSession]) -> DailyBudget:
+    """Суточный учёт вызовов на каждый токен и остановка метода при доле от лимита."""
+    return DailyBudget(
+        settings.method_daily_limits,
+        fraction=settings.vk_daily_budget_fraction,
+        timezone=settings.vk_budget_timezone,
+        sessions=sessions,
+    )
 
 
 def _token_pool(
@@ -178,6 +189,8 @@ async def _run_search(
         pool,
         api_version=settings.vk_api_version,
         timeout=settings.vk_request_timeout_seconds,
+        budget=_daily_budget(settings, sessions),
+        stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
     )
     try:
         service = SearchService(
@@ -684,6 +697,8 @@ async def _execute_collection(
             pool,
             api_version=settings.vk_api_version,
             timeout=settings.vk_request_timeout_seconds,
+            budget=_daily_budget(settings, sessions),
+            stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
         )
         stop_event = stop_event or asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -835,6 +850,8 @@ async def _collection_worker_service() -> None:
                         pool,
                         api_version=settings.vk_api_version,
                         timeout=settings.vk_request_timeout_seconds,
+                        budget=_daily_budget(settings, sessions),
+                        stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
                     )
                     worker = CollectionWorker(sessions, client, settings)
                     active_token_fingerprints = current_fingerprints
@@ -866,6 +883,8 @@ async def _collection_worker_service() -> None:
                     pool,
                     api_version=settings.vk_api_version,
                     timeout=settings.vk_request_timeout_seconds,
+                    budget=_daily_budget(settings, sessions),
+                    stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
                 )
                 worker = CollectionWorker(sessions, client, settings)
             ordered = targets[run_cursor:] + targets[:run_cursor]
@@ -2441,6 +2460,8 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
                 pool,
                 api_version=settings.vk_api_version,
                 timeout=settings.vk_request_timeout_seconds,
+                budget=_daily_budget(settings, sessions),
+                stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
             )
             processed = await CollectionWorker(sessions, client, settings).run(run_id)
         after = await database_metrics(sessions)
@@ -2782,3 +2803,8 @@ def privacy_inspect_group(vk_id: int) -> None:
     typer.echo(
         json.dumps(asyncio.run(_privacy_operation("group", vk_id)), ensure_ascii=False, indent=2)
     )
+
+
+from vk_collector.cli.panel_cli import panel_app  # noqa: E402
+
+app.add_typer(panel_app, name="panel")

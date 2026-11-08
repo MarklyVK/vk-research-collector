@@ -60,6 +60,18 @@ services:
       retries: 4
       start_period: 20s
 
+  panel-worker:
+    image: ${COLLECTOR_IMAGE:?COLLECTOR_IMAGE must contain an immutable sha tag}
+    pull_policy: never
+    profiles: ["panel"]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    volumes:
+      - ./config:/app/config:ro
+      - ./exports:/app/exports
+      - ./secrets/vk_tokens.txt:/run/secrets/vk_tokens.txt:ro
+
 volumes:
   postgres_data:
     name: ${POSTGRES_VOLUME_NAME:-vk_research_postgres_data}
