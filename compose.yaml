@@ -63,6 +63,9 @@ services:
       VK_METHOD_QUOTA_INITIAL_COOLDOWN_SECONDS: ${VK_METHOD_QUOTA_INITIAL_COOLDOWN_SECONDS:-3600}
       VK_METHOD_LIMIT_MAX_COOLDOWN_SECONDS: ${VK_METHOD_LIMIT_MAX_COOLDOWN_SECONDS:-86400}
       VK_METHOD_LIMIT_PROBE_SECONDS: ${VK_METHOD_LIMIT_PROBE_SECONDS:-900}
+      VK_METHOD_DAILY_LIMITS: ${VK_METHOD_DAILY_LIMITS:-}
+      VK_DAILY_BUDGET_FRACTION: ${VK_DAILY_BUDGET_FRACTION:-0.8}
+      VK_BUDGET_TIMEZONE: ${VK_BUDGET_TIMEZONE:-Europe/Moscow}
       VK_GLOBAL_RPS_COOLDOWN_SECONDS: ${VK_GLOBAL_RPS_COOLDOWN_SECONDS:-60}
       VK_LIMIT_ESCALATION_WINDOW_SECONDS: ${VK_LIMIT_ESCALATION_WINDOW_SECONDS:-60}
       VK_LIMIT_ESCALATION_DISTINCT_METHODS: ${VK_LIMIT_ESCALATION_DISTINCT_METHODS:-3}
@@ -156,6 +159,26 @@ services:
         condition: service_healthy
     mem_limit: 384m
     cpus: 0.75
+    logging: *default-logging
+
+  # VK-панель виральности: выключена по умолчанию (профиль panel), запуск только вручную:
+  # docker compose --profile panel up -d panel-worker
+  panel-worker:
+    build:
+      context: .
+    init: true
+    profiles: ["panel"]
+    command: ["panel", "run", "--name", "${PANEL_NAME:-virality-2026-11}"]
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      <<: *collector-environment
+    volumes: *collector-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 512m
+    cpus: 0.5
     logging: *default-logging
 
 volumes:

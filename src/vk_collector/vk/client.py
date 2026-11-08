@@ -3,10 +3,12 @@
 import asyncio
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 import httpx
 
+from .budget import DailyBudget
 from .errors import VKAPIError, VKRetryExhausted
 from .models import VKGroup, VKSearchPage, VKSubscriptionIDsPage
 from .tokens import TokenPool
@@ -33,8 +35,10 @@ class VKClient:
         sleep: Sleep = asyncio.sleep,
         retry_delays: Sequence[float] = (1, 3, 10),
         jitter: Jitter | None = None,
+        budget: DailyBudget | None = None,
     ) -> None:
         self._pool = token_pool
+        self._budget = budget
         self._api_version = api_version
         self._sleep = sleep
         self._retry_delays = tuple(retry_delays)
@@ -56,11 +60,30 @@ class VKClient:
         """Вернуть ближайший момент доступности метода по clock пула."""
         return await self._pool.next_available_at(method)
 
-    async def call(self, method: str, params: Mapping[str, str | int]) -> Any:
-        """Вызвать метод, применяя политику ошибок без утечки токена."""
+    async def call(
+        self,
+        method: str,
+        params: Mapping[str, str | int],
+        *,
+        inner_calls: Mapping[str, int] | None = None,
+    ) -> Any:
+        """Вызвать метод, применяя политику ошибок без утечки токена.
+
+        ``inner_calls`` — вызовы методов внутри ``execute`` (для суточного бюджета токена).
+        """
+        calls = {method: 1, **dict(inner_calls or {})}
         retry_index = 0
         while True:
             lease = await self._pool.acquire(method)
+            if self._budget is not None:
+                over = await self._budget.exceeded(lease.fingerprint, calls)
+                if over:
+                    # Доля суточного лимита исчерпана на этом токене — закрыть метод до
+                    # следующих суток, пул выберет другой токен или сообщит о недоступности.
+                    reset = self._budget.next_reset()
+                    seconds = (reset - datetime.now(reset.tzinfo)).total_seconds()
+                    await self._pool.block_method_for(lease, seconds)
+                    continue
             try:
                 response = await self._http.post(
                     method,
@@ -85,7 +108,11 @@ class VKClient:
                 if not isinstance(result, (dict, list)):
                     raise VKAPIError(-1, "Некорректная структура ответа")
                 await self._pool.mark_success(lease)
+                if self._budget is not None:
+                    await self._budget.record(lease.fingerprint, calls)
                 return result
+            if self._budget is not None:
+                await self._budget.record(lease.fingerprint, calls)
             code = int(error.get("error_code", -1))
             message = str(error.get("error_msg", "неизвестная ошибка"))
             if code in AUTH_ERRORS:

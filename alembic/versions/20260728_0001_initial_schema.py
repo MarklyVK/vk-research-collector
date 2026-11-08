@@ -45,6 +45,13 @@ def upgrade() -> None:
             "user_posts",
             "user_post_attachments",
             "user_post_collection_states",
+            "vk_token_daily_usage",
+            "panels",
+            "panel_communities",
+            "panel_posts",
+            "panel_post_snapshots",
+            "panel_media",
+            "panel_community_snapshots",
         }
     ]
     Base.metadata.create_all(op.get_bind(), tables=stage_one_tables)
