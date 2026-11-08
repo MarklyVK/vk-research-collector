@@ -44,3 +44,16 @@ docker compose ... run --rm collector panel export --name virality-2026-11 --lab
 Каждый вызов учитывается в `vk_token_daily_usage` по паре токен + метод, включая вызовы внутри
 `execute`. При `VK_METHOD_DAILY_LIMITS` метод на токене закрывается до полуночи (Москва) при доле
 `VK_DAILY_BUDGET_FRACTION` (0,8) от лимита; пул переходит на другой токен.
+
+## Значения на проде (решение Андрея 08.11)
+
+```
+VK_METHOD_DAILY_LIMITS=wall.get=20000,wall.getById=25000,execute=25000,groups.getById=25000,groups.search=1000
+VK_DAILY_BUDGET_FRACTION=0.8
+VK_STOP_TOKEN_ON_QUOTA_ERROR=true
+```
+
+`wall.get` — стоп на 16 000 вызовов в сутки на токен (80 % от 20 000); остальные — по наблюдениям,
+официальных чисел в доступной документации нет. Первая ошибка 29 останавливает токен целиком до
+полуночи (МСК): запись `vk_token_stopped_until_next_day` в логе и в `panel status`
+(`tokens_stopped_until_next_day`, `vk_usage_today`).

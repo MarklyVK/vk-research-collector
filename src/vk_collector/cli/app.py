@@ -190,6 +190,7 @@ async def _run_search(
         api_version=settings.vk_api_version,
         timeout=settings.vk_request_timeout_seconds,
         budget=_daily_budget(settings, sessions),
+        stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
     )
     try:
         service = SearchService(
@@ -697,6 +698,7 @@ async def _execute_collection(
             api_version=settings.vk_api_version,
             timeout=settings.vk_request_timeout_seconds,
             budget=_daily_budget(settings, sessions),
+            stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
         )
         stop_event = stop_event or asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -849,6 +851,7 @@ async def _collection_worker_service() -> None:
                         api_version=settings.vk_api_version,
                         timeout=settings.vk_request_timeout_seconds,
                         budget=_daily_budget(settings, sessions),
+                        stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
                     )
                     worker = CollectionWorker(sessions, client, settings)
                     active_token_fingerprints = current_fingerprints
@@ -881,6 +884,7 @@ async def _collection_worker_service() -> None:
                     api_version=settings.vk_api_version,
                     timeout=settings.vk_request_timeout_seconds,
                     budget=_daily_budget(settings, sessions),
+                    stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
                 )
                 worker = CollectionWorker(sessions, client, settings)
             ordered = targets[run_cursor:] + targets[:run_cursor]
@@ -2457,6 +2461,7 @@ async def _pilot() -> tuple[uuid.UUID, dict[str, Any], dict[str, Any]]:
                 api_version=settings.vk_api_version,
                 timeout=settings.vk_request_timeout_seconds,
                 budget=_daily_budget(settings, sessions),
+                stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
             )
             processed = await CollectionWorker(sessions, client, settings).run(run_id)
         after = await database_metrics(sessions)

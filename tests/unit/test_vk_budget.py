@@ -73,3 +73,33 @@ def test_settings_parse_daily_limits() -> None:
     assert settings.method_daily_limits == {"wall.get": 20000, "wall.getById": 15000}
     with pytest.raises(ValueError):
         _ = Settings(vk_method_daily_limits="wall.get=abc").method_daily_limits
+
+
+@pytest.mark.asyncio
+async def test_error_29_stops_whole_token_until_next_day(caplog: pytest.LogCaptureFixture) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(httpx.QueryParams(request.content.decode()))
+        method = request.url.path.rsplit("/", 1)[-1]
+        seen.append((method, params["access_token"]))
+        if params["access_token"] == "token-a" and method == "wall.get":
+            return httpx.Response(200, json={"error": {"error_code": 29, "error_msg": "limit"}})
+        return httpx.Response(200, json={"response": {"count": 0, "items": []}})
+
+    time = FakeTime()
+    pool = TokenPool(["token-a", "token-b"], rps=1000, clock=time.clock, sleep=time.sleep)
+    budget = DailyBudget({}, now=_now)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.vk.test/"
+    ) as http:
+        client = VKClient(
+            pool, http_client=http, sleep=time.sleep, budget=budget, stop_token_on_quota_error=True
+        )
+        with caplog.at_level("WARNING"):
+            await client.call("wall.get", {})
+        # другой метод тоже идёт уже только через token-b: token-a остановлен целиком
+        await client.call("groups.getById", {})
+    assert seen == [("wall.get", "token-a"), ("wall.get", "token-b"), ("groups.getById", "token-b")]
+    assert "vk_token_stopped_until_next_day" in caplog.text
+    assert pool._states[0].global_blocked_until > time.value + 3600

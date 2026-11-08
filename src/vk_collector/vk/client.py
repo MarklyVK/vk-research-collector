@@ -1,10 +1,12 @@
 """Асинхронный клиент минимальной части VK API."""
 
 import asyncio
+import logging
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -12,6 +14,8 @@ from .budget import DailyBudget
 from .errors import VKAPIError, VKRetryExhausted
 from .models import VKGroup, VKSearchPage, VKSubscriptionIDsPage
 from .tokens import TokenPool
+
+logger = logging.getLogger(__name__)
 
 Sleep = Callable[[float], Awaitable[None]]
 Jitter = Callable[[float], float]
@@ -36,9 +40,11 @@ class VKClient:
         retry_delays: Sequence[float] = (1, 3, 10),
         jitter: Jitter | None = None,
         budget: DailyBudget | None = None,
+        stop_token_on_quota_error: bool = False,
     ) -> None:
         self._pool = token_pool
         self._budget = budget
+        self._stop_token_on_quota = stop_token_on_quota_error
         self._api_version = api_version
         self._sleep = sleep
         self._retry_delays = tuple(retry_delays)
@@ -120,6 +126,22 @@ class VKClient:
                 continue
             if code in GLOBAL_RATE_LIMIT_ERRORS:
                 await self._pool.global_cooldown(lease)
+                continue
+            if code == 29 and self._stop_token_on_quota:
+                # Решение 08.11: первая ошибка 29 — токен целиком стоп до следующих суток (МСК).
+                reset = (
+                    self._budget.next_reset()
+                    if self._budget is not None
+                    else _next_moscow_midnight()
+                )
+                seconds = (reset - datetime.now(reset.tzinfo)).total_seconds()
+                logger.warning(
+                    "vk_token_stopped_until_next_day token=%s method=%s until=%s vk_error=29",
+                    lease.fingerprint[:6],
+                    method,
+                    reset.isoformat(),
+                )
+                await self._pool.global_cooldown(lease, max(60.0, seconds))
                 continue
             if code in METHOD_LIMIT_ERRORS:
                 await self._pool.method_cooldown(lease, code)
@@ -314,3 +336,9 @@ class VKClient:
             returned_count=returned_count,
             next_offset=offset + returned_count,
         )
+
+
+def _next_moscow_midnight() -> datetime:
+    tz = ZoneInfo("Europe/Moscow")
+    tomorrow = datetime.now(tz).date() + timedelta(days=1)
+    return datetime.combine(tomorrow, time(0, 0), tzinfo=tz)

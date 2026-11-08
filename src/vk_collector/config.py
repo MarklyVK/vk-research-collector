@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     vk_method_daily_limits: str = ""
     vk_daily_budget_fraction: float = Field(default=0.8, gt=0, le=1)
     vk_budget_timezone: str = "Europe/Moscow"
+    # Первая ошибка 29 (количественный лимит метода) — токен целиком стоп до следующих суток.
+    vk_stop_token_on_quota_error: bool = False
     media_download_timeout_seconds: float = Field(default=30.0, gt=0)
     media_max_video_seconds: int = Field(default=60, ge=1)
     media_max_resolution_long_side: int = Field(default=768, ge=64)

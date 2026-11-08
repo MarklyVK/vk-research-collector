@@ -16,7 +16,13 @@ import typer
 from sqlalchemy import func, select
 
 from vk_collector.config import get_settings
-from vk_collector.database.models import PanelCommunity, PanelPost, PanelPostSnapshot
+from vk_collector.database.models import (
+    PanelCommunity,
+    PanelPost,
+    PanelPostSnapshot,
+    VKTokenDailyUsage,
+    VKTokenState,
+)
 from vk_collector.database.session import create_database_engine, create_session_factory
 from vk_collector.panel.service import PanelService
 from vk_collector.panel.vk_adapter import ExecutePanelVK
@@ -42,6 +48,7 @@ async def _service(export_dir: Path = DEFAULT_EXPORT_DIR) -> AsyncIterator[Panel
         api_version=settings.vk_api_version,
         timeout=settings.vk_request_timeout_seconds,
         budget=_daily_budget(settings, sessions),
+        stop_token_on_quota_error=settings.vk_stop_token_on_quota_error,
     )
     try:
         yield PanelService(sessions, ExecutePanelVK(client), export_dir=export_dir)
@@ -158,7 +165,13 @@ def panel_export(
 
 @panel_app.command("status")
 def panel_status(name: Annotated[str, typer.Option()]) -> None:
-    """Сводка: сообщества, посты, замеры по отметкам, пропуски."""
+    """Сводка: сообщества, посты, замеры по отметкам, пропуски, токены и квоты за сегодня."""
+    settings = get_settings()
+
+    def budget_today() -> Any:
+        from vk_collector.vk.budget import DailyBudget
+
+        return DailyBudget({}, timezone=settings.vk_budget_timezone).today()
 
     async def go() -> dict[str, Any]:
         async with _service() as service:
@@ -188,7 +201,32 @@ def panel_status(name: Annotated[str, typer.Option()]) -> None:
                 missed = await session.scalar(
                     select(func.sum(PanelPost.missed_targets)).where(PanelPost.panel_id == panel.id)
                 )
+                today = budget_today()
+                usage = [
+                    {"token": fp[:6], "method": m, "calls": c}
+                    for fp, m, c in (
+                        await session.execute(
+                            select(
+                                VKTokenDailyUsage.token_fingerprint,
+                                VKTokenDailyUsage.method,
+                                VKTokenDailyUsage.calls,
+                            ).where(VKTokenDailyUsage.day == today)
+                        )
+                    ).all()
+                ]
+                stopped = [
+                    {"token": fp[:6], "until": str(until)}
+                    for fp, until in (
+                        await session.execute(
+                            select(
+                                VKTokenState.token_fingerprint, VKTokenState.global_blocked_until
+                            ).where(VKTokenState.global_blocked_until > func.now())
+                        )
+                    ).all()
+                ]
             return {
+                "tokens_stopped_until_next_day": stopped,
+                "vk_usage_today": usage,
                 "status": panel.status,
                 "communities": communities,
                 "posts": posts,
