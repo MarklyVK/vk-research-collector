@@ -25,6 +25,7 @@ import random
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 DEFAULT_PAUSE_SECONDS = (20.0, 30.0)
 GATE_DIR_ENV = "MEDIA_CDN_GATE_DIR"
@@ -140,7 +141,7 @@ class CdnGate:
         except FileNotFoundError:
             return "STOP_429"
 
-    def _state(self) -> dict[str, object]:
+    def _state(self) -> dict[str, Any]:
         try:
             data = json.loads(self.state_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
