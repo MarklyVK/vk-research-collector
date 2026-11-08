@@ -370,7 +370,11 @@ async def test_export_schema_compliance(tmp_path: Path) -> None:
         def __call__(self) -> FakeSession:
             return FakeSession()
 
-    exporter = YouTubePanelExporter(FakeSessionFactory(), export_dir=tmp_path)  # type: ignore[arg-type]
+    exporter = YouTubePanelExporter(
+        FakeSessionFactory(),  # type: ignore[arg-type]
+        export_dir=tmp_path,
+        thumbs_dir=tmp_path / "thumbs",
+    )
     files = await exporter.export_all(label="test_run")
 
     # 1. Проверяем yt_posts
