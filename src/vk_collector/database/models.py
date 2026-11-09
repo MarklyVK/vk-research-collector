@@ -1081,6 +1081,7 @@ class PanelCommunity(Base):
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_post_id: Mapped[int | None] = mapped_column(BigInteger)
     backfill_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ext_backfill_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     excluded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     excluded_reason: Mapped[str | None] = mapped_column(String(100))
 
