@@ -30,7 +30,11 @@ docker compose ... run --rm collector panel export --name virality-2026-11 --lab
 4. `interim_export_at` — Parquet в `exports/vk_panel/interim/<UTC>/`; `stop_at` — финальная выгрузка
    `exports/vk_panel/final/<UTC>/` и заморозка (`status=frozen`).
 
-Ретроспектива: все посты за `backfill_days` (90) + один снимок счётчиков; 5 страниц по 100 в `execute`.
+Ретроспектива: все посты за `backfill_days` (90) + один снимок счётчиков.
+Одна страница (100 постов) на `execute`; при ошибке VK 13 («response size is too big») `count`
+уменьшается 100 → 50 → 20. Сообщество, упавшее 3 раза подряд, уходит в конец очереди
+(лог `panel_backfill_deferred`); прогресс внутри сообщества хранится в памяти worker'а.
+Интервал тиков считается от начала тика, поэтому ретроспектива не сдвигает замеры.
 
 ## Данные
 

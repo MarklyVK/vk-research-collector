@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd  # type: ignore[import-untyped]
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from vk_collector.database.models import (
     Panel,
@@ -264,3 +264,79 @@ async def test_panel_live_cycle(tmp_path: Path) -> None:
 
 def test_normalize_text() -> None:
     assert normalize_text("Скидки! https://vk.com/x  Ёлка [club1|Магазин]") == "скидки елка магазин"
+
+
+class BackfillVK(FakeVK):
+    """Стены для ретроспективы: крупное сообщество с «тяжёлыми» страницами и одно безнадёжное."""
+
+    def __init__(self, posts: dict[int, list[dict[str, Any]]]) -> None:
+        super().__init__()
+        self.posts = posts
+        self.page_calls: list[tuple[int, list[int], int]] = []
+
+    async def wall_pages(self, community_id: int, offsets: Sequence[int], count: int) -> list[Any]:
+        from vk_collector.vk.errors import VKAPIError
+
+        self.page_calls.append((community_id, list(offsets), count))
+        if community_id == 501:  # не помещается в ответ даже по 20 постов
+            raise VKAPIError(13, "response size is too big")
+        if community_id == 502 and count > 50:  # крупное: длинные посты, 100 не влезает
+            raise VKAPIError(13, "response size is too big")
+        wall = self.posts.get(community_id, [])
+        return [{"count": len(wall), "items": wall[o : o + count]} for o in offsets]
+
+
+@pytest.mark.asyncio
+async def test_panel_backfill_big_and_stuck_communities(tmp_path: Path) -> None:
+    engine = create_database_engine(database_url())
+    sessions = create_session_factory(engine)
+    async with sessions() as session:
+        await session.execute(delete(Panel).where(Panel.name == "test-backfill"))
+        await session.commit()
+    clock = Clock()
+    # 502: 260 постов за 90 дней (по 8 ч) + старые за границей; 503: 3 поста
+    big = [_post(-502, 1000 - i, T0 - timedelta(hours=8 * i + 1)) for i in range(300)]
+    small = [_post(-503, 30 - i, T0 - timedelta(days=i + 1)) for i in range(3)]
+    vk = BackfillVK({502: big, 503: small})
+    service = PanelService(sessions, vk, export_dir=tmp_path, now=clock)
+    rows = [
+        {"vk_id": cid, "stratum": "auto", "size": "M", "members_count": 50_000, "role": "main"}
+        for cid in (501, 502, 503)
+    ]
+    panel_id = await service.freeze_selection("test-backfill", rows, seed=1, config={})
+    await service.set_status(panel_id, "active")
+
+    # 1-й проход: 501 падает (1/3), 502 качается по 50, 503 готово
+    stats = await service.backfill("test-backfill")
+    assert stats["failed"] == 1 and stats["communities"] == 2
+    in_window = sum(1 for i in range(300) if 8 * i + 1 <= 90 * 24)
+    async with sessions() as session:
+        n_big = await session.scalar(
+            select(func.count())
+            .select_from(PanelPost)
+            .where(PanelPost.panel_id == panel_id, PanelPost.community_vk_id == 502)
+        )
+    assert n_big == in_window
+    # одна страница на execute, после ошибки 13 — count 50
+    assert all(len(offsets) == 1 for _, offsets, _ in vk.page_calls)
+    assert {c for cid, _, c in vk.page_calls if cid == 502} == {100, 50}
+
+    # ещё 2 прохода: 501 падает 3 раза подряд -> в конец очереди
+    await service.backfill("test-backfill")
+    stats = await service.backfill("test-backfill")
+    assert stats["deferred"] == 1
+    assert service._bf_deferred == [501]
+    async with sessions() as session:
+        pending = (
+            await session.scalars(
+                select(PanelCommunity.community_vk_id).where(
+                    PanelCommunity.panel_id == panel_id,
+                    PanelCommunity.backfill_done_at.is_(None),
+                )
+            )
+        ).all()
+    assert list(pending) == [501]
+    async with sessions() as session:
+        await session.execute(delete(Panel).where(Panel.name == "test-backfill"))
+        await session.commit()
+    await engine.dispose()

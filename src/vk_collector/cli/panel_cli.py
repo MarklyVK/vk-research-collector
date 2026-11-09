@@ -131,6 +131,7 @@ def panel_run(
             loop.add_signal_handler(sig, stop.set)
         async with _service() as service:
             while not stop.is_set():
+                cycle_started = loop.time()
                 try:
                     result = await service.tick(name)
                     logger.info("panel_tick %s", json.dumps(result.__dict__, ensure_ascii=False))
@@ -143,8 +144,12 @@ def panel_run(
                             logger.info("panel_backfill_complete")
                 except Exception:
                     logger.exception("panel_tick_failed")
+                # интервал считается от начала тика: ретроспектива не сдвигает расписание замеров
+                elapsed = loop.time() - cycle_started
                 with suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=max(30.0, interval_seconds - elapsed)
+                    )
 
     asyncio.run(go())
 

@@ -103,7 +103,7 @@ jobs:
           alembic current
           alembic check
       - name: PostgreSQL integration suite
-        run: pytest -q tests/integration/test_postgres_workflow.py
+        run: pytest -q tests/integration/test_postgres_workflow.py tests/integration/test_vk_panel.py
       - name: Fake VK smoke test
         run: pytest -q tests/integration/test_stage2_workflow.py
 
