@@ -140,8 +140,10 @@ def panel_run(
                     if backfill_first:
                         # ретроспектива — небольшими порциями между тиками, живая панель важнее
                         stats = await service.backfill(name, limit=5)
-                        if stats["communities"] == 0:
-                            logger.info("panel_backfill_complete")
+                        if stats["communities"] == 0 and stats["failed"] == 0:
+                            # 90 дней готовы — 12 месяцев для video/clip (без медиа)
+                            ext = await service.ext_backfill(name, limit=5)
+                            logger.info("panel_ext_backfill %s", json.dumps(ext))
                 except Exception:
                     logger.exception("panel_tick_failed")
                 # интервал считается от начала тика: ретроспектива не сдвигает расписание замеров

@@ -340,3 +340,80 @@ async def test_panel_backfill_big_and_stuck_communities(tmp_path: Path) -> None:
         await session.execute(delete(Panel).where(Panel.name == "test-backfill"))
         await session.commit()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_panel_ext_backfill_12m_video_only_without_media(tmp_path: Path) -> None:
+    engine = create_database_engine(database_url())
+    sessions = create_session_factory(engine)
+    async with sessions() as session:
+        await session.execute(delete(Panel).where(Panel.name == "test-ext"))
+        await session.commit()
+    clock = Clock()
+
+    def photo_post(pid: int, published: datetime) -> dict[str, Any]:
+        post = _post(-601, pid, published)
+        post["attachments"] = post["attachments"][:1]  # только фото
+        return post
+
+    def video_post(pid: int, published: datetime) -> dict[str, Any]:
+        post = _post(-601, pid, published)
+        post["attachments"] = post["attachments"][1:]  # только видео
+        return post
+
+    # по посту в сутки на 420 дней назад: чётные — фото, нечётные — видео
+    wall = [
+        (video_post if i % 2 else photo_post)(5000 - i, T0 - timedelta(days=i, hours=1))
+        for i in range(420)
+    ]
+    vk = BackfillVK({601: wall})
+    service = PanelService(sessions, vk, export_dir=tmp_path, now=clock)
+    rows = [{"vk_id": 601, "stratum": "auto", "size": "M", "members_count": 9000, "role": "main"}]
+    panel_id = await service.freeze_selection("test-ext", rows, seed=1, config={})
+    await service.set_status(panel_id, "active")
+    async with sessions() as session:
+        panel = await session.get(Panel, panel_id)
+        assert panel is not None
+        panel.config = {**panel.config, "ext_backfill_since": "2025-11-11T00:00:00+03:00"}
+        await session.commit()
+
+    # до окончания 90 дней 12 месяцев не начинаются
+    early = await service.ext_backfill("test-ext")
+    assert early.get("waiting_90d") == 1
+    await service.backfill("test-ext")
+    media_before = await _count(sessions, PanelMedia, panel_id)
+    stats = await service.ext_backfill("test-ext")
+    assert stats["communities"] == 1
+
+    since = datetime(2025, 11, 10, 21, 0, tzinfo=UTC)
+    upper = T0 - timedelta(days=90)
+    expected = sum(
+        1 for i in range(420) if i % 2 and since <= T0 - timedelta(days=i, hours=1) < upper
+    )
+    async with sessions() as session:
+        ext = (
+            await session.scalars(
+                select(PanelPost).where(
+                    PanelPost.panel_id == panel_id, PanelPost.origin == "ext12m"
+                )
+            )
+        ).all()
+    assert len(ext) == expected
+    assert all(p.n_video == 1 and p.n_photo == 0 for p in ext)
+    assert all(since <= p.published_at < upper for p in ext)
+    # медиа для 12 месяцев не ставятся в очередь
+    assert await _count(sessions, PanelMedia, panel_id) == media_before
+    async with sessions() as session:
+        await session.execute(delete(Panel).where(Panel.name == "test-ext"))
+        await session.commit()
+    await engine.dispose()
+
+
+async def _count(sessions: Any, model: Any, panel_id: Any) -> int:
+    async with sessions() as session:
+        return int(
+            await session.scalar(
+                select(func.count()).select_from(model).where(model.panel_id == panel_id)
+            )
+            or 0
+        )

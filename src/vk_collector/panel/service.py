@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 VK_RESPONSE_TOO_BIG = 13  # «response size is too big» у execute
 BACKFILL_FALLBACK_SIZES = (50, 20)
 BACKFILL_MAX_FAILURES = 3
+# решение Андрея 09.11: для video и clip ретроспектива до 12 месяцев (с 11.11.2025), без медиа
+EXT_BACKFILL_SINCE = "2025-11-11T00:00:00+03:00"
+EXT_BACKFILL_DAILY_PAGES = 6000  # потолок страниц в сутки (МСК) — запас лимита живой панели
+EXT_ORIGIN = "ext12m"
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def has_video_or_clip(post: dict[str, Any]) -> bool:
+    """Собственное вложение поста — видео или клип (репост не считается)."""
+    return any(
+        a.get("type") in ("video", "clip", "short_video") for a in post.get("attachments") or []
+    )
 
 
 @dataclass
@@ -63,6 +76,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "poll_count": 30,
     "poll_interval_seconds": {"S": 3600, "M": 3600, "L": 3600, "XL": 3600},
     "backfill_days": 90,
+    "ext_backfill_since": EXT_BACKFILL_SINCE,
+    "ext_backfill_daily_pages": EXT_BACKFILL_DAILY_PAGES,
     "backfill_page_size": 100,
     "poll_snapshot_max_age_h": 72,
     "members_every_hours": 24,
@@ -154,6 +169,10 @@ class PanelService:
         self._bf_progress: dict[int, _BackfillProgress] = {}
         self._bf_failures: dict[int, int] = {}
         self._bf_deferred: list[int] = []
+        self._ext_progress: dict[int, _BackfillProgress] = {}
+        self._ext_failures: dict[int, int] = {}
+        self._ext_deferred: list[int] = []
+        self._ext_pages: dict[str, int] = {}
 
     # ------------------------------------------------------------------ выборка
     async def freeze_selection(
@@ -339,6 +358,8 @@ class PanelService:
         atts: Sequence[dict[str, Any]],
         origin: str,
     ) -> None:
+        if origin == EXT_ORIGIN:
+            return  # 12-месячная ретроспектива — только посты и счётчики, без медиа
         priority = 0 if origin == "live" else 1
         for pos, att in enumerate(atts):
             entries: list[tuple[str, dict[str, Any] | None]] = []
@@ -523,6 +544,157 @@ class PanelService:
             stats["posts"] += progress.new
             logger.info(
                 "panel_backfill community=%s posts=%s pages_offset=%s",
+                cid,
+                progress.new,
+                progress.offset,
+            )
+        return stats
+
+    # ------------------------------------------------------------------ ретроспектива 12 мес.
+    async def ext_backfill(self, panel_name: str, *, limit: int | None = 5) -> dict[str, int]:
+        """Посты с видео/клипами от ``ext_backfill_since`` до границы 90-дневной ретроспективы.
+
+        Начинается только когда 90-дневная ретроспектива закончена у всех сообществ. Хранит
+        посты и один снимок счётчиков (origin ``ext12m``), медиа не ставит в очередь. Страниц
+        в сутки (МСК) — не больше ``ext_backfill_daily_pages``; общий бюджет токенов (80 %)
+        действует как обычно. Сбои — как в ``backfill`` (откат count, 3 падения → конец очереди).
+        """
+        panel = await self.panel_by_name(panel_name)
+        cfg = panel.config
+        stats = {"communities": 0, "posts": 0, "pages": 0, "failed": 0, "deferred": 0, "capped": 0}
+        async with self._sessions() as session:
+            pending_90d = await session.scalar(
+                select(func.count())
+                .select_from(PanelCommunity)
+                .where(
+                    PanelCommunity.panel_id == panel.id,
+                    PanelCommunity.backfill_done_at.is_(None),
+                    PanelCommunity.excluded_at.is_(None),
+                )
+            )
+            if pending_90d:
+                stats["waiting_90d"] = int(pending_90d)
+                return stats
+            todo = list(
+                (
+                    await session.scalars(
+                        select(PanelCommunity)
+                        .where(
+                            PanelCommunity.panel_id == panel.id,
+                            PanelCommunity.ext_backfill_done_at.is_(None),
+                            PanelCommunity.excluded_at.is_(None),
+                        )
+                        .order_by(PanelCommunity.community_vk_id)
+                    )
+                ).all()
+            )
+        deferred = {cid: i for i, cid in enumerate(self._ext_deferred)}
+        todo = [c for c in todo if c.community_vk_id not in deferred] + sorted(
+            (c for c in todo if c.community_vk_id in deferred),
+            key=lambda c: deferred[c.community_vk_id],
+        )
+        if limit is not None:
+            todo = todo[:limit]
+        sizes = self._page_sizes(cfg)
+        start = panel.started_at or self._now()
+        upper = start - timedelta(days=int(cfg["backfill_days"]))
+        since = datetime.fromisoformat(str(cfg.get("ext_backfill_since", EXT_BACKFILL_SINCE)))
+        cap = int(cfg.get("ext_backfill_daily_pages", EXT_BACKFILL_DAILY_PAGES))
+        for community in todo:
+            cid = community.community_vk_id
+            if cid not in self._ext_progress:
+                # начать примерно с конца 90-дневной части стены (с перекрытием в страницу)
+                async with self._sessions() as session:
+                    seen = await session.scalar(
+                        select(func.count())
+                        .select_from(PanelPost)
+                        .where(
+                            PanelPost.panel_id == panel.id,
+                            PanelPost.community_vk_id == cid,
+                            PanelPost.published_at >= upper,
+                        )
+                    )
+                self._ext_progress[cid] = _BackfillProgress(offset=max(0, int(seen or 0) - 100))
+            progress = self._ext_progress[cid]
+            done = False
+            while not done:
+                day = self._now().astimezone(MSK).date().isoformat()
+                if self._ext_pages.get(day, 0) >= cap:
+                    stats["capped"] = 1
+                    logger.info("panel_ext_backfill_daily_cap day=%s pages=%s", day, cap)
+                    return stats
+                try:
+                    result, size = await self._backfill_page(cid, progress.offset, sizes)
+                except (VKMethodUnavailable, VKTokensUnavailable):
+                    raise
+                except Exception as exc:
+                    failures = self._ext_failures.get(cid, 0) + 1
+                    self._ext_failures[cid] = failures
+                    stats["failed"] += 1
+                    logger.warning(
+                        "panel_ext_backfill_failed community=%s offset=%s failures=%s error=%s",
+                        cid,
+                        progress.offset,
+                        failures,
+                        type(exc).__name__,
+                    )
+                    if failures >= BACKFILL_MAX_FAILURES:
+                        self._ext_failures[cid] = 0
+                        if cid in self._ext_deferred:
+                            self._ext_deferred.remove(cid)
+                        self._ext_deferred.append(cid)
+                        stats["deferred"] += 1
+                        logger.warning("panel_ext_backfill_deferred community=%s", cid)
+                    break
+                self._ext_failures.pop(cid, None)
+                self._ext_pages[day] = self._ext_pages.get(day, 0) + 1
+                stats["pages"] += 1
+                items = (result or {}).get("items") or [] if isinstance(result, dict) else []
+                keep = [
+                    p
+                    for p in items
+                    if p.get("date")
+                    and since <= datetime.fromtimestamp(int(p["date"]), UTC) < upper
+                    and has_video_or_clip(p)
+                ]
+                if keep:
+                    async with self._sessions() as session:
+                        new, _ = await self._store_posts(
+                            session,
+                            panel,
+                            cid,
+                            keep,
+                            origin=EXT_ORIGIN,
+                            now=self._now(),
+                            snapshot_source="backfill",
+                        )
+                        await session.commit()
+                    progress.new += new
+                non_pinned = [p for p in items if not p.get("is_pinned")]
+                if not items or (
+                    non_pinned and datetime.fromtimestamp(int(non_pinned[-1]["date"]), UTC) < since
+                ):
+                    done = True
+                progress.offset += size
+            if not done:
+                continue
+            async with self._sessions() as session:
+                await session.execute(
+                    update(PanelCommunity)
+                    .where(
+                        PanelCommunity.panel_id == panel.id,
+                        PanelCommunity.community_vk_id == cid,
+                    )
+                    .values(ext_backfill_done_at=self._now())
+                )
+                await session.commit()
+            self._ext_progress.pop(cid, None)
+            if cid in self._ext_deferred:
+                self._ext_deferred.remove(cid)
+            stats["communities"] += 1
+            stats["posts"] += progress.new
+            logger.info(
+                "panel_ext_backfill community=%s posts=%s offset=%s",
                 cid,
                 progress.new,
                 progress.offset,
