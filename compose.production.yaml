@@ -65,7 +65,7 @@ services:
     pull_policy: never
     profiles: ["panel"]
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 768m
     cpus: 0.5
     volumes:
       - ./config:/app/config:ro

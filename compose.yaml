@@ -186,7 +186,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    mem_limit: 512m
+    mem_limit: 768m
     cpus: 0.5
     logging: *default-logging
 

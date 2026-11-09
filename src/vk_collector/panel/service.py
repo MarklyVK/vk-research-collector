@@ -37,11 +37,24 @@ from vk_collector.database.models import (
     PanelPostSnapshot,
 )
 from vk_collector.panel.vk_adapter import PanelVK
+from vk_collector.vk.errors import VKAPIError, VKMethodUnavailable, VKTokensUnavailable
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = logging.getLogger(__name__)
+
+VK_RESPONSE_TOO_BIG = 13  # «response size is too big» у execute
+BACKFILL_FALLBACK_SIZES = (50, 20)
+BACKFILL_MAX_FAILURES = 3
+
+
+@dataclass
+class _BackfillProgress:
+    offset: int = 0
+    max_id: int | None = None
+    new: int = 0
+
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "targets_h": [1, 3, 6, 12, 24, 48, 72],
@@ -137,6 +150,10 @@ class PanelService:
         self._vk = vk
         self._export_dir = export_dir or Path("exports/vk_panel")
         self._now = now or (lambda: datetime.now(UTC))
+        # состояние ретроспективы в памяти процесса panel-worker
+        self._bf_progress: dict[int, _BackfillProgress] = {}
+        self._bf_failures: dict[int, int] = {}
+        self._bf_deferred: list[int] = []
 
     # ------------------------------------------------------------------ выборка
     async def freeze_selection(
@@ -352,10 +369,54 @@ class PanelService:
                 )
 
     # ------------------------------------------------------------------ ретроспектива
+    def _page_sizes(self, cfg: dict[str, Any]) -> list[int]:
+        first = int(cfg["backfill_page_size"])
+        return [first] + [s for s in BACKFILL_FALLBACK_SIZES if s < first]
+
+    async def _backfill_page(
+        self, community_id: int, offset: int, sizes: Sequence[int]
+    ) -> tuple[Any, int]:
+        """Одна страница стены за один execute; на ошибке VK 13 count уменьшается (100→50→20)."""
+        last: VKAPIError | None = None
+        for size in sizes:
+            try:
+                pages = await self._vk.wall_pages(community_id, [offset], size)
+            except VKAPIError as exc:
+                if exc.code != VK_RESPONSE_TOO_BIG:
+                    raise
+                logger.warning(
+                    "panel_backfill_page_too_big community=%s offset=%s count=%s",
+                    community_id,
+                    offset,
+                    size,
+                )
+                last = exc
+                continue
+            return (pages[0] if pages else None), size
+        assert last is not None
+        raise last
+
+    def _backfill_order(self, todo: list[PanelCommunity]) -> list[PanelCommunity]:
+        """Отложенные (падали 3 раза подряд) — в конец очереди, в порядке откладывания."""
+        deferred = {cid: i for i, cid in enumerate(self._bf_deferred)}
+        head = [c for c in todo if c.community_vk_id not in deferred]
+        tail = sorted(
+            (c for c in todo if c.community_vk_id in deferred),
+            key=lambda c: deferred[c.community_vk_id],
+        )
+        return head + tail
+
     async def backfill(self, panel_name: str, *, limit: int | None = None) -> dict[str, int]:
+        """Ретроспектива порциями: ``limit`` сообществ за вызов, по одной странице на execute.
+
+        Прогресс внутри сообщества (offset) держится в памяти процесса: после сбоя следующий
+        вызов продолжает с той же страницы. Сообщество, упавшее ``BACKFILL_MAX_FAILURES`` раз
+        подряд, уходит в конец очереди (лог ``panel_backfill_deferred``). Ошибки квоты/токенов
+        (``VKMethodUnavailable``, ``VKTokensUnavailable``) прерывают всю порцию.
+        """
         panel = await self.panel_by_name(panel_name)
         cfg = panel.config
-        page = int(cfg["backfill_page_size"])
+        sizes = self._page_sizes(cfg)
         start = panel.started_at or self._now()
         cutoff = start - timedelta(days=int(cfg["backfill_days"]))
         async with self._sessions() as session:
@@ -369,72 +430,102 @@ class PanelService:
                             PanelCommunity.excluded_at.is_(None),
                         )
                         .order_by(PanelCommunity.community_vk_id)
-                        .limit(limit)
                     )
                 ).all()
             )
-        stats = {"communities": 0, "posts": 0, "pages": 0}
+        todo = self._backfill_order(todo)
+        if limit is not None:
+            todo = todo[:limit]
+        stats = {"communities": 0, "posts": 0, "pages": 0, "failed": 0, "deferred": 0}
         for community in todo:
-            offset = 0
-            total_new = 0
-            max_id: int | None = None
+            cid = community.community_vk_id
+            progress = self._bf_progress.setdefault(cid, _BackfillProgress())
             done = False
             while not done:
-                offsets = [offset + k * page for k in range(5)]
-                pages = await self._vk.wall_pages(community.community_vk_id, offsets, page)
-                stats["pages"] += len(pages)
-                now = self._now()
+                try:
+                    result, size = await self._backfill_page(cid, progress.offset, sizes)
+                except (VKMethodUnavailable, VKTokensUnavailable):
+                    raise
+                except Exception as exc:
+                    failures = self._bf_failures.get(cid, 0) + 1
+                    self._bf_failures[cid] = failures
+                    stats["failed"] += 1
+                    logger.warning(
+                        "panel_backfill_failed community=%s offset=%s failures=%s error=%s",
+                        cid,
+                        progress.offset,
+                        failures,
+                        type(exc).__name__
+                        + (f"({exc.code})" if isinstance(exc, VKAPIError) else ""),
+                    )
+                    if failures >= BACKFILL_MAX_FAILURES:
+                        self._bf_failures[cid] = 0
+                        if cid in self._bf_deferred:
+                            self._bf_deferred.remove(cid)
+                        self._bf_deferred.append(cid)
+                        stats["deferred"] += 1
+                        logger.warning(
+                            "panel_backfill_deferred community=%s offset=%s -> end of queue",
+                            cid,
+                            progress.offset,
+                        )
+                    break
+                self._bf_failures.pop(cid, None)
+                stats["pages"] += 1
+                items = (result or {}).get("items") or [] if isinstance(result, dict) else []
+                fresh = [
+                    p
+                    for p in items
+                    if p.get("date") and datetime.fromtimestamp(int(p["date"]), UTC) >= cutoff
+                ]
                 async with self._sessions() as session:
-                    for result in pages:
-                        items = (
-                            (result or {}).get("items") or [] if isinstance(result, dict) else []
-                        )
-                        fresh = [
-                            p
-                            for p in items
-                            if p.get("date")
-                            and datetime.fromtimestamp(int(p["date"]), UTC) >= cutoff
-                        ]
-                        new, mid = await self._store_posts(
-                            session,
-                            panel,
-                            community.community_vk_id,
-                            fresh,
-                            origin="backfill",
-                            now=now,
-                            snapshot_source="backfill",
-                        )
-                        total_new += new
-                        if mid is not None:
-                            max_id = mid if max_id is None else max(max_id, mid)
-                        non_pinned = [p for p in items if not p.get("is_pinned")]
-                        if not items or (
-                            non_pinned
-                            and datetime.fromtimestamp(int(non_pinned[-1]["date"]), UTC) < cutoff
-                        ):
-                            done = True
-                            break
+                    new, mid = await self._store_posts(
+                        session,
+                        panel,
+                        cid,
+                        fresh,
+                        origin="backfill",
+                        now=self._now(),
+                        snapshot_source="backfill",
+                    )
                     await session.commit()
-                offset += 5 * page
+                progress.new += new
+                if mid is not None:
+                    progress.max_id = mid if progress.max_id is None else max(progress.max_id, mid)
+                non_pinned = [p for p in items if not p.get("is_pinned")]
+                if not items or (
+                    non_pinned and datetime.fromtimestamp(int(non_pinned[-1]["date"]), UTC) < cutoff
+                ):
+                    done = True
+                progress.offset += size
+            if not done:
+                continue
             async with self._sessions() as session:
                 await session.execute(
                     update(PanelCommunity)
                     .where(
                         PanelCommunity.panel_id == panel.id,
-                        PanelCommunity.community_vk_id == community.community_vk_id,
+                        PanelCommunity.community_vk_id == cid,
                     )
                     .values(
                         backfill_done_at=self._now(),
                         last_seen_post_id=func.greatest(
-                            func.coalesce(PanelCommunity.last_seen_post_id, 0), max_id or 0
+                            func.coalesce(PanelCommunity.last_seen_post_id, 0),
+                            progress.max_id or 0,
                         ),
                     )
                 )
                 await session.commit()
+            self._bf_progress.pop(cid, None)
+            if cid in self._bf_deferred:
+                self._bf_deferred.remove(cid)
             stats["communities"] += 1
-            stats["posts"] += total_new
+            stats["posts"] += progress.new
             logger.info(
-                "panel_backfill community=%s posts=%s", community.community_vk_id, total_new
+                "panel_backfill community=%s posts=%s pages_offset=%s",
+                cid,
+                progress.new,
+                progress.offset,
             )
         return stats
 
