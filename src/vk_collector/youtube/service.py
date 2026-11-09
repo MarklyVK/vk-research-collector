@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from vk_collector.config import Settings, load_yt_keywords
@@ -431,7 +431,8 @@ class YouTubePanelService:
                         comments=comments,
                     )
                     upsert_ts = ts_stmt.on_conflict_do_nothing(
-                        index_elements=["post_id", "target_age_h"]
+                        index_elements=["post_id", "target_age_h"],
+                        index_where=text("target_age_h IS NOT NULL"),
                     )
                     await session.execute(upsert_ts)
                     total_videos_saved += 1
@@ -786,6 +787,7 @@ class YouTubePanelService:
                         await session.execute(
                             ts_entry.on_conflict_do_update(
                                 index_elements=["post_id", "target_age_h"],
+                                index_where=text("target_age_h IS NOT NULL"),
                                 set_={
                                     "views": ts_entry.excluded.views,
                                     "likes": ts_entry.excluded.likes,
