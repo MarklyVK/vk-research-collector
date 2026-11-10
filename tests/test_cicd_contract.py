@@ -152,7 +152,7 @@ def test_deploy_contract_has_all_failure_guards_and_no_destructive_volume_action
         "legacy run quarantined as expected",
         "transition_data_snapshot",
         "locked_at IS NOT NULL OR locked_by IS NOT NULL",
-        "20261108_0019",
+        "20261109_0020",
     )
     assert all(item in text + transition_text for item in required)
     assert "alembic downgrade" not in text
@@ -240,7 +240,7 @@ def test_storage_cleanup_is_manual_allowlist_only_and_preserves_critical_data() 
         "docker image prune -f",
         "PostgreSQL не healthy после cleanup",
         "Worker не healthy после cleanup",
-        "20261108_0019",
+        "20261109_0020",
     )
     assert all(item in script for item in required)
     forbidden = (
@@ -674,3 +674,41 @@ def test_process_lock_rejects_second_deployment(
         result = run_dry(runtime, env)
     assert result.returncode != 0
     assert "уже выполняется" in result.stderr
+
+
+def _alembic_head() -> str:
+    """Single Alembic head, parsed from alembic/versions without importing it."""
+    revisions: set[str] = set()
+    parents: set[str] = set()
+    for path in (ROOT / "alembic" / "versions").glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        rev = re.search(r'^revision[^=]*=\s*["\']([^"\']+)["\']', text, re.M)
+        if rev is None:
+            continue
+        revisions.add(rev.group(1))
+        down = re.search(r'^down_revision[^=]*=\s*\(?\s*["\']([^"\']+)["\']', text, re.M)
+        if down is not None:
+            parents.add(down.group(1))
+    heads = revisions - parents
+    assert len(heads) == 1, f"expected one Alembic head, got {sorted(heads)}"
+    return heads.pop()
+
+
+def test_production_scripts_expect_current_alembic_head() -> None:
+    """Deploy/cleanup/control scripts must accept the latest migration.
+
+    Adding a migration without updating these hard-coded checks makes the
+    production deploy fail after `alembic upgrade` and leaves the worker
+    stopped (happened with 20261109_0020).
+    """
+    head = _alembic_head()
+    deploy = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert f"*{head}*" in deploy, f"deploy-production.sh does not expect head {head}"
+    cleanup = CLEANUP_SCRIPT.read_text(encoding="utf-8")
+    assert f'"$REVISION" == {head} ]]' in cleanup, (
+        f"cleanup-production-storage.sh does not expect head {head}"
+    )
+    control = COLLECTION_CONTROL_SCRIPT.read_text(encoding="utf-8")
+    assert f'"$REVISION" == {head} ]]' in control, (
+        f"production-collection-control.sh does not accept head {head}"
+    )
