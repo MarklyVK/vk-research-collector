@@ -129,12 +129,14 @@ class VKClient:
                 continue
             if code == 29 and self._stop_token_on_quota:
                 # Решение 08.11: первая ошибка 29 — токен целиком стоп до следующих суток (МСК).
-                reset = (
-                    self._budget.next_reset()
-                    if self._budget is not None
-                    else _next_moscow_midnight()
-                )
-                seconds = (reset - datetime.now(reset.tzinfo)).total_seconds()
+                if self._budget is not None:
+                    # одни и те же часы для «сейчас» и для границы суток
+                    reset = self._budget.next_reset()
+                    now = self._budget.now()
+                else:
+                    reset = _next_moscow_midnight()
+                    now = datetime.now(reset.tzinfo)
+                seconds = (reset - now).total_seconds()
                 logger.warning(
                     "vk_token_stopped_until_next_day token=%s method=%s until=%s vk_error=29",
                     lease.fingerprint[:6],

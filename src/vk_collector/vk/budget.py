@@ -49,6 +49,10 @@ class DailyBudget:
             return value.astimezone(self._tz)
         return datetime.now(self._tz)
 
+    def now(self) -> datetime:
+        """Текущее время по часам бюджета (в тестах — подставные часы)."""
+        return self._current()
+
     def today(self) -> date:
         return self._current().date()
 
