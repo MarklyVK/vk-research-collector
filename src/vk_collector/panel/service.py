@@ -69,6 +69,9 @@ class _BackfillProgress:
     new: int = 0
 
 
+# Порция строк при потоковой выгрузке в Parquet (память ~ порция, а не вся таблица).
+EXPORT_BATCH_ROWS = 5000
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "targets_h": [1, 3, 6, 12, 24, 48, 72],
     "tolerance_min_minutes": 20,
@@ -893,10 +896,19 @@ class PanelService:
         return TickResult(polled, new, measured, missed, deleted, members, exported, False)
 
     # ------------------------------------------------------------------ выгрузка
-    async def export(self, panel_name: str, label: str) -> str:
-        """Parquet-выгрузка всех таблиц панели в export_dir/<label>/<UTC-время>/."""
-        import pandas as pd  # type: ignore[import-untyped]
+    async def export(
+        self, panel_name: str, label: str, *, batch_rows: int = EXPORT_BATCH_ROWS
+    ) -> str:
+        """Parquet-выгрузка всех таблиц панели в export_dir/<label>/<UTC-время>/.
 
+        Потоково: строки читаются серверным курсором порциями по ``batch_rows`` и сразу
+        дописываются в Parquet (одна row group на порцию), вся таблица в память не грузится.
+        """
+        import pyarrow as pa  # type: ignore[import-untyped]
+        import pyarrow.parquet as pq  # type: ignore[import-untyped]
+
+        if batch_rows < 1:
+            raise ValueError("batch_rows должен быть >= 1")
         panel = await self.panel_by_name(panel_name)
         stamp = self._now().strftime("%Y%m%dT%H%M%SZ")
         dest = self._export_dir / label / stamp
@@ -911,17 +923,23 @@ class PanelService:
         counts: dict[str, int] = {}
         async with self._sessions() as session:
             for name, model in tables.items():
-                result = await session.execute(select(model).where(model.panel_id == panel.id))
-                objects: list[Any] = list(result.scalars().all())
-                records = [
-                    {c.name: _plain(getattr(obj, c.key)) for c in model.__table__.columns}
-                    for obj in objects
-                ]
-                frame = pd.DataFrame.from_records(
-                    records, columns=[c.name for c in model.__table__.columns]
+                columns = list(model.__table__.columns)
+                schema = pa.schema([pa.field(c.name, _arrow_type(c.type)) for c in columns])
+                stmt = (
+                    select(*columns)
+                    .where(model.__table__.c.panel_id == panel.id)
+                    .execution_options(yield_per=batch_rows)
                 )
-                frame.to_parquet(dest / f"{name}.parquet", index=False)
-                counts[name] = len(frame)
+                rows_total = 0
+                with pq.ParquetWriter(dest / f"{name}.parquet", schema) as writer:
+                    result = await session.stream(stmt)
+                    async for part in result.partitions(batch_rows):
+                        data = {
+                            c.name: [_plain(row[i]) for row in part] for i, c in enumerate(columns)
+                        }
+                        writer.write_table(pa.Table.from_pydict(data, schema=schema))
+                        rows_total += len(part)
+                counts[name] = rows_total
             done = list(panel.config.get("exports_done", []))
             if label not in done:
                 done.append(label)
@@ -936,6 +954,7 @@ class PanelService:
             "label": label,
             "exported_at": self._now().isoformat(),
             "rows": counts,
+            "batch_rows": batch_rows,
             "config": panel.config,
         }
         (dest / "manifest.json").write_text(
@@ -981,6 +1000,23 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(str(value))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _arrow_type(sa_type: Any) -> Any:
+    """Тип Arrow для столбца SQLAlchemy (фиксированная схема для всех порций выгрузки)."""
+    import pyarrow as pa
+    from sqlalchemy import BigInteger, Boolean, DateTime, Integer
+
+    if isinstance(sa_type, BigInteger):
+        return pa.int64()
+    if isinstance(sa_type, Integer):
+        return pa.int64()
+    if isinstance(sa_type, Boolean):
+        return pa.bool_()
+    if isinstance(sa_type, DateTime):
+        return pa.timestamp("us", tz="UTC" if sa_type.timezone else None)
+    # String, Text, UUID, JSON/JSONB (JSON сериализуется в строку в _plain)
+    return pa.string()
 
 
 def _plain(value: Any) -> Any:
