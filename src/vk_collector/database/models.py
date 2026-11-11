@@ -1336,6 +1336,8 @@ class YTTimeseries(Base):
     views: Mapped[int | None] = mapped_column(BigInteger)
     likes: Mapped[int | None] = mapped_column(BigInteger)
     comments: Mapped[int | None] = mapped_column(BigInteger)
+    duration_s: Mapped[int | None] = mapped_column(Integer)
+    is_short: Mapped[bool | None] = mapped_column(Boolean)
 
 
 class YTScheduledMeasurement(Base):
@@ -1379,3 +1381,40 @@ class YTComment(Base):
     reply_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     crawled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class YTTop(Base):
+    """Виральный топ видео YouTube (mostPopular, weekly top, кандидаты)."""
+
+    __tablename__ = "yt_top"
+    __table_args__ = (
+        UniqueConstraint("video_id", "source", name="uq_yt_top_video_source"),
+        Index("idx_yt_top_video_id", "video_id"),
+        Index("idx_yt_top_source", "source"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    video_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    channel_id: Mapped[str | None] = mapped_column(String(64))
+    channel_title: Mapped[str | None] = mapped_column(Text)
+    channel_subscribers: Mapped[int | None] = mapped_column(BigInteger)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    crawled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sql_text("now()")
+    )
+    views: Mapped[int | None] = mapped_column(BigInteger)
+    likes: Mapped[int | None] = mapped_column(BigInteger)
+    comments: Mapped[int | None] = mapped_column(BigInteger)
+    duration_s: Mapped[int | None] = mapped_column(Integer)
+    is_short: Mapped[bool | None] = mapped_column(Boolean)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    rank: Mapped[int | None] = mapped_column(Integer)
+    flag_news: Mapped[bool | None] = mapped_column(
+        Boolean, server_default=sql_text("false"), default=False
+    )
+    flag_infopovod: Mapped[bool | None] = mapped_column(
+        Boolean, server_default=sql_text("false"), default=False
+    )

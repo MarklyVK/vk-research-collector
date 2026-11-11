@@ -1,4 +1,4 @@
-"""Бережный загрузчик обложек и кадров YouTube в data/yt_thumbs/ с проверкой диска."""
+"""Бережный загрузчик обложек и кадров YouTube в ~/markly/data/youtube/ с проверкой диска."""
 
 from __future__ import annotations
 
@@ -24,23 +24,57 @@ logger = logging.getLogger(__name__)
 MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024
 
 
+class _RateLimiter:
+    """Ограничитель частоты запросов к i.ytimg.com (по умолчанию не более 5-10 rps)."""
+
+    def __init__(self, min_interval: float = 0.12) -> None:
+        self._min_interval = min_interval
+        self._last_time = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            elapsed = now - self._last_time
+            if elapsed < self._min_interval:
+                await asyncio.sleep(self._min_interval - elapsed)
+            self._last_time = loop.time()
+
+
 class YouTubeMediaDownloader:
     """Загрузчик медиафайлов (обложка + 3 кадра) с контролем диска и rate limit."""
 
     def __init__(
         self,
-        thumbs_dir: Path = Path("data/yt_thumbs"),
+        base_dir: Path | str = Path("~/markly/data/youtube"),
         *,
+        thumbs_dir: Path | str | None = None,
         http_client: httpx.AsyncClient | None = None,
         min_free_bytes: int = MIN_FREE_DISK_BYTES,
-        sleep_range: tuple[float, float] = (1.0, 2.0),
+        sleep_range: tuple[float, float] = (0.05, 0.15),
     ) -> None:
-        self._thumbs_dir = thumbs_dir
+        if thumbs_dir is not None:
+            self._base_dir = Path(thumbs_dir).expanduser()
+            self._legacy_mode = True
+        else:
+            self._base_dir = Path(base_dir).expanduser()
+            self._legacy_mode = False
+
         self._external_client = http_client is not None
-        self._http = http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._http = http_client or httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=30),
+        )
         self._min_free_bytes = min_free_bytes
         self._sleep_range = sleep_range
-        self._semaphore = asyncio.Semaphore(1)
+        self._semaphore = asyncio.Semaphore(4)
+        self._rate_limiter = _RateLimiter(min_interval=0.12)
+
+    @property
+    def base_dir(self) -> Path:
+        return self._base_dir
 
     async def aclose(self) -> None:
         if not self._external_client:
@@ -54,7 +88,7 @@ class YouTubeMediaDownloader:
 
     def _ensure_disk_capacity(self) -> None:
         """Проверить наличие свободного места на диске (не менее 2 ГиБ резерва)."""
-        target = self._thumbs_dir if self._thumbs_dir.exists() else Path.cwd()
+        target = self._base_dir if self._base_dir.exists() else Path.cwd()
         usage = shutil.disk_usage(target)
         if usage.free < self._min_free_bytes:
             raise RuntimeError(
@@ -62,22 +96,41 @@ class YouTubeMediaDownloader:
                 f"требуется не менее {self._min_free_bytes / 1024**3:.2f} GiB"
             )
 
-    def is_media_already_downloaded(self, post_id: str) -> bool:
+    def get_video_dir(self, video_id: str, is_top: bool = False) -> Path:
+        """Получить путь к директории хранения изображений видео."""
+        if is_top:
+            return self._base_dir / "top" / video_id
+        return self._base_dir / video_id
+
+    def is_media_already_downloaded(self, post_id: str, is_top: bool = False) -> bool:
         """Проверить наличие всех 4 файлов размера > 0 байт на диске."""
-        files = [
-            self._thumbs_dir / f"{post_id}_max.jpg",
-            self._thumbs_dir / f"{post_id}_1.jpg",
-            self._thumbs_dir / f"{post_id}_2.jpg",
-            self._thumbs_dir / f"{post_id}_3.jpg",
+        # 1. Структура: {base_dir}/[{top}/]{video_id}/{cover.jpg, hq1.jpg, hq2.jpg, hq3.jpg}
+        v_dir = self.get_video_dir(post_id, is_top=is_top)
+        std_files = [
+            v_dir / "cover.jpg",
+            v_dir / "hq1.jpg",
+            v_dir / "hq2.jpg",
+            v_dir / "hq3.jpg",
         ]
-        return all(f.exists() and f.stat().st_size > 0 for f in files)
+        if all(f.exists() and f.stat().st_size > 0 for f in std_files):
+            return True
+
+        # 2. Обратная совместимость с плоской структурой: {base_dir}/{post_id}_max.jpg, etc.
+        legacy_files = [
+            self._base_dir / f"{post_id}_max.jpg",
+            self._base_dir / f"{post_id}_1.jpg",
+            self._base_dir / f"{post_id}_2.jpg",
+            self._base_dir / f"{post_id}_3.jpg",
+        ]
+        return all(f.exists() and f.stat().st_size > 0 for f in legacy_files)
 
     async def _download_one_file(self, urls: Sequence[str], destination: Path) -> bool:
-        """Скачать файл, пробуя URL по цепочке (для fallback с maxresdefault на hqdefault)."""
+        """Скачать файл, пробуя URL по цепочке с вежливым rate limit."""
         destination.parent.mkdir(parents=True, exist_ok=True)
         for url in urls:
             if not url:
                 continue
+            await self._rate_limiter.acquire()
             try:
                 resp = await self._http.get(url)
                 if resp.status_code == 200 and len(resp.content) > 0:
@@ -85,48 +138,72 @@ class YouTubeMediaDownloader:
                     return True
                 if resp.status_code == 404:
                     continue
+            except (httpx.TimeoutException, httpx.NetworkError) as err:
+                logger.debug("Таймаут/сеть при скачивании %s: %s", url, err)
+                continue
             except httpx.HTTPError as err:
-                logger.debug("Ошибка загрузки %s: %s", url, err)
+                logger.debug("Ошибка HTTP при загрузке %s: %s", url, err)
                 continue
         return False
 
-    async def download_post_media(self, post_id: str, thumbnail_url: str) -> bool:
-        """Скачать максимальную обложку и 3 кадра для видео строго в 1 поток."""
-        if self.is_media_already_downloaded(post_id):
+    async def download_video_media(
+        self,
+        video_id: str,
+        *,
+        is_top: bool = False,
+        thumbnail_url: str = "",
+    ) -> bool:
+        """Скачать обложку (cover.jpg) и 3 кадра (hq1.jpg, hq2.jpg, hq3.jpg)."""
+        if self.is_media_already_downloaded(video_id, is_top=is_top):
             return True
 
         async with self._semaphore:
             self._ensure_disk_capacity()
-            self._thumbs_dir.mkdir(parents=True, exist_ok=True)
+            v_dir = self.get_video_dir(video_id, is_top=is_top)
+            v_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Максимальная обложка (_max.jpg): цепочка fallback
-            max_urls: list[str] = [
-                f"https://i.ytimg.com/vi/{post_id}/maxresdefault.jpg",
-                thumbnail_url,
-                f"https://i.ytimg.com/vi/{post_id}/hqdefault.jpg",
-                f"https://i.ytimg.com/vi/{post_id}/mqdefault.jpg",
-                f"https://i.ytimg.com/vi/{post_id}/default.jpg",
-            ]
-            max_file = self._thumbs_dir / f"{post_id}_max.jpg"
-            if not (max_file.exists() and max_file.stat().st_size > 0):
-                await self._download_one_file(max_urls, max_file)
+            # 1. Обложка (cover.jpg): цепочка fallback maxresdefault -> sddefault -> hqdefault
+            cover_file = v_dir / "cover.jpg"
+            if not (cover_file.exists() and cover_file.stat().st_size > 0):
+                cover_urls: list[str] = [
+                    f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                    f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
+                    f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                ]
+                if thumbnail_url:
+                    cover_urls.append(thumbnail_url)
+                await self._download_one_file(cover_urls, cover_file)
 
             # 2. Кадры hq1, hq2, hq3
             for i in (1, 2, 3):
-                frame_file = self._thumbs_dir / f"{post_id}_{i}.jpg"
+                frame_file = v_dir / f"hq{i}.jpg"
                 if not (frame_file.exists() and frame_file.stat().st_size > 0):
                     frame_urls = [
-                        f"https://i.ytimg.com/vi/{post_id}/hq{i}.jpg",
-                        f"https://i.ytimg.com/vi/{post_id}/{i}.jpg",
+                        f"https://i.ytimg.com/vi/{video_id}/hq{i}.jpg",
+                        f"https://i.ytimg.com/vi/{video_id}/{i}.jpg",
                     ]
                     await self._download_one_file(frame_urls, frame_file)
 
-            # Пауза между видео по ТЗ
+            # Поддержка legacy-файлов, если задан thumbs_dir
+            if self._legacy_mode:
+                max_legacy = self._base_dir / f"{video_id}_max.jpg"
+                if cover_file.exists() and not max_legacy.exists():
+                    shutil.copyfile(cover_file, max_legacy)
+                for i in (1, 2, 3):
+                    f_new = v_dir / f"hq{i}.jpg"
+                    f_leg = self._base_dir / f"{video_id}_{i}.jpg"
+                    if f_new.exists() and not f_leg.exists():
+                        shutil.copyfile(f_new, f_leg)
+
             if self._sleep_range[1] > 0:
                 delay = random.uniform(self._sleep_range[0], self._sleep_range[1])
                 await asyncio.sleep(delay)
 
-            return self.is_media_already_downloaded(post_id)
+            return self.is_media_already_downloaded(video_id, is_top=is_top)
+
+    async def download_post_media(self, post_id: str, thumbnail_url: str = "") -> bool:
+        """Совместимость с методом загрузки для поста основной выборки."""
+        return await self.download_video_media(post_id, is_top=False, thumbnail_url=thumbnail_url)
 
     async def download_media_for_posts(
         self,
@@ -148,7 +225,7 @@ class YouTubeMediaDownloader:
         downloaded_count = 0
         for post_id, thumb_url in rows:
             try:
-                ok = await self.download_post_media(post_id, thumb_url)
+                ok = await self.download_video_media(post_id, is_top=False, thumbnail_url=thumb_url)
                 if ok:
                     async with sessions() as session:
                         await session.execute(

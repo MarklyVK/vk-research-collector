@@ -295,6 +295,91 @@ class YouTubeClient:
 
         return results
 
+    async def get_most_popular_videos(
+        self,
+        region_code: str = "RU",
+        max_total: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Выгрузка чарта Most Popular (videos.list, chart=mostPopular, 1 ед. за страницу)."""
+        endpoint = "videos.list"
+        results: list[dict[str, Any]] = []
+        page_token: str | None = None
+
+        while len(results) < max_total:
+            per_page = min(50, max_total - len(results))
+            params: dict[str, Any] = {
+                "chart": "mostPopular",
+                "regionCode": region_code,
+                "part": "snippet,contentDetails,statistics",
+                "maxResults": per_page,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            data = await self._request_with_quota(endpoint, "videos", params)
+            items: list[dict[str, Any]] = data.get("items", [])
+            if not items:
+                break
+            results.extend(items)
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+        return results[:max_total]
+
+    async def search_videos(
+        self,
+        *,
+        query: str | None = None,
+        published_after: datetime | None = None,
+        published_before: datetime | None = None,
+        order: str = "viewCount",
+        region_code: str = "RU",
+        relevance_language: str = "ru",
+        max_pages: int = 2,
+        max_results: int = 50,
+    ) -> list[str]:
+        """Поиск видео (search.list, стоимость 100 ед. за страницу)."""
+        endpoint = "search.list"
+        video_ids: list[str] = []
+        page_token: str | None = None
+        pages_fetched = 0
+
+        while pages_fetched < max_pages:
+            params: dict[str, Any] = {
+                "part": "id",
+                "type": "video",
+                "regionCode": region_code,
+                "relevanceLanguage": relevance_language,
+                "order": order,
+                "maxResults": min(50, max(1, max_results)),
+            }
+            if query:
+                params["q"] = query
+            if published_after is not None:
+                params["publishedAfter"] = published_after.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if published_before is not None:
+                params["publishedBefore"] = published_before.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if page_token:
+                params["pageToken"] = page_token
+
+            data = await self._request_with_quota(endpoint, "search", params)
+            items: list[dict[str, Any]] = data.get("items", [])
+            if not items:
+                break
+
+            for it in items:
+                v_id = it.get("id", {}).get("videoId")
+                if v_id and v_id not in video_ids:
+                    video_ids.append(v_id)
+
+            pages_fetched += 1
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+        return video_ids
+
     async def get_top_comments(
         self,
         video_id: str,

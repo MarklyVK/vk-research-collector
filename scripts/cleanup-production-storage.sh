@@ -123,7 +123,7 @@ POSTGRES_USER=${POSTGRES_USER:-vk_collector}
 POSTGRES_DB=${POSTGRES_DB:-vk_research}
 REVISION=$(compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   -Atqc 'SELECT version_num FROM alembic_version')
-[[ "$REVISION" == 20261109_0020 ]] || die "Неожиданная Alembic revision: $REVISION"
+[[ "$REVISION" == 20261111_0021 ]] || die "Неожиданная Alembic revision: $REVISION"
 
 BACKUP_DIR="$DEPLOY_DIR/backups"
 PROTECTED_BACKUPS=()

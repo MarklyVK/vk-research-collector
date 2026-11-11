@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -167,9 +168,12 @@ class Settings(BaseSettings):
     # YouTube Virality Panel (IEEE Access)
     youtube_api_keys: str | list[str] = Field(default_factory=list)
     youtube_api_key: SecretStr = SecretStr("")
+    yt_main_api_key: SecretStr = SecretStr("")
+    yt_top_api_key: SecretStr = SecretStr("")
     yt_daily_quota_limit: int = Field(default=10000, ge=1)
     yt_quota_safety_margin: int = Field(default=200, ge=0)
     yt_thumbs_dir: Path = Path("data/yt_thumbs")
+    yt_media_dir: Path = Path("~/markly/data/youtube")
     yt_export_dir: Path = Path("data/yt_export")
 
     @field_validator("youtube_api_keys", mode="before")
@@ -275,6 +279,32 @@ class Settings(BaseSettings):
                 if k_clean and k_clean not in keys:
                     keys.append(k_clean)
         return keys
+
+    @property
+    def effective_yt_main_api_key(self) -> str:
+        """API-ключ для основного сбора YouTube (Задача 1)."""
+        val = self.yt_main_api_key.get_secret_value().strip()
+        if val:
+            return val
+        env_val = os.environ.get("YT_MAIN_API_KEY", "").strip()
+        if env_val:
+            return env_val
+        keys = self.effective_youtube_api_keys
+        return keys[0] if keys else ""
+
+    @property
+    def effective_yt_top_api_key(self) -> str:
+        """API-ключ для сбора вирального топа YouTube (Задача 2)."""
+        val = self.yt_top_api_key.get_secret_value().strip()
+        if val:
+            return val
+        env_val = os.environ.get("YT_TOP_API_KEY", "").strip()
+        if env_val:
+            return env_val
+        keys = self.effective_youtube_api_keys
+        if len(keys) > 1:
+            return keys[1]
+        return ""
 
 
 class Keyword(BaseModel):
