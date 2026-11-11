@@ -55,7 +55,6 @@ async def _service_context() -> AsyncIterator[tuple[YouTubePanelService, YouTube
     client = YouTubeClient(budget)
     media_downloader = YouTubeMediaDownloader(
         base_dir=settings.yt_media_dir,
-        thumbs_dir=settings.yt_thumbs_dir,
     )
     service = YouTubePanelService(sessions, client, settings, media_downloader)
     try:

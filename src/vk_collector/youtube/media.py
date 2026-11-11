@@ -54,12 +54,9 @@ class YouTubeMediaDownloader:
         min_free_bytes: int = MIN_FREE_DISK_BYTES,
         sleep_range: tuple[float, float] = (0.05, 0.15),
     ) -> None:
-        if thumbs_dir is not None:
-            self._base_dir = Path(thumbs_dir).expanduser()
-            self._legacy_mode = True
-        else:
-            self._base_dir = Path(base_dir).expanduser()
-            self._legacy_mode = False
+        self._base_dir = Path(base_dir).expanduser()
+        self._thumbs_dir = Path(thumbs_dir).expanduser() if thumbs_dir is not None else None
+        self._legacy_mode = self._thumbs_dir is not None
 
         self._external_client = http_client is not None
         self._http = http_client or httpx.AsyncClient(
@@ -207,13 +204,13 @@ class YouTubeMediaDownloader:
                     await self._download_one_file(frame_urls, frame_file)
 
             # Поддержка legacy-файлов, если задан thumbs_dir
-            if self._legacy_mode:
-                max_legacy = self._base_dir / f"{video_id}_max.jpg"
+            if self._legacy_mode and self._thumbs_dir is not None:
+                max_legacy = self._thumbs_dir / f"{video_id}_max.jpg"
                 if cover_file.exists() and not max_legacy.exists():
                     shutil.copyfile(cover_file, max_legacy)
                 for i in (1, 2, 3):
                     f_new = v_dir / f"hq{i}.jpg"
-                    f_leg = self._base_dir / f"{video_id}_{i}.jpg"
+                    f_leg = self._thumbs_dir / f"{video_id}_{i}.jpg"
                     if f_new.exists() and not f_leg.exists():
                         shutil.copyfile(f_new, f_leg)
 
