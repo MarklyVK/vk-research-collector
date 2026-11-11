@@ -251,7 +251,9 @@ class YouTubeMediaDownloader:
             rows = (await session.execute(stmt)).all()
 
         downloaded_count = 0
-        for post_id, thumb_url in rows:
+        total_rows = len(rows)
+        logger.info("Запуск загрузки медиа для %d видео...", total_rows)
+        for idx, (post_id, thumb_url) in enumerate(rows, start=1):
             try:
                 ok = await self.download_video_media(post_id, is_top=False, thumbnail_url=thumb_url)
                 if ok:
@@ -263,6 +265,13 @@ class YouTubeMediaDownloader:
                         )
                         await session.commit()
                     downloaded_count += 1
+                if idx % 50 == 0 or idx == total_rows:
+                    logger.info(
+                        "Медиа Task 1: обработано %d/%d (успешно сохранено: %d)",
+                        idx,
+                        total_rows,
+                        downloaded_count,
+                    )
             except Exception as err:
                 logger.warning("Не удалось скачать медиа для видео %s: %s", post_id, err)
                 if "Недостаточно места на диске" in str(err):
