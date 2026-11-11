@@ -71,6 +71,27 @@ class YouTubeMediaDownloader:
         self._sleep_range = sleep_range
         self._semaphore = asyncio.Semaphore(4)
         self._rate_limiter = _RateLimiter(min_interval=0.12)
+        self._prefer_http: bool | None = None
+
+    async def _resolve_scheme(self) -> str:
+        if self._prefer_http is not None:
+            return "http" if self._prefer_http else "https"
+        if self._external_client:
+            self._prefer_http = False
+            return "https"
+        try:
+            resp = await self._http.get(
+                "https://i.ytimg.com/vi/dQw4w9WgXcQ/hq1.jpg",
+                timeout=2.5,
+            )
+            if resp.status_code == 200:
+                self._prefer_http = False
+                return "https"
+        except Exception:
+            pass
+        logger.info("HTTPS к i.ytimg.com заблокирован/недоступен, переключаемся на HTTP")
+        self._prefer_http = True
+        return "http"
 
     @property
     def base_dir(self) -> Path:
@@ -159,6 +180,7 @@ class YouTubeMediaDownloader:
 
         async with self._semaphore:
             self._ensure_disk_capacity()
+            scheme = await self._resolve_scheme()
             v_dir = self.get_video_dir(video_id, is_top=is_top)
             v_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,9 +188,9 @@ class YouTubeMediaDownloader:
             cover_file = v_dir / "cover.jpg"
             if not (cover_file.exists() and cover_file.stat().st_size > 0):
                 cover_urls: list[str] = [
-                    f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-                    f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
-                    f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    f"{scheme}://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                    f"{scheme}://i.ytimg.com/vi/{video_id}/sddefault.jpg",
+                    f"{scheme}://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
                 ]
                 if thumbnail_url:
                     cover_urls.append(thumbnail_url)
@@ -179,8 +201,8 @@ class YouTubeMediaDownloader:
                 frame_file = v_dir / f"hq{i}.jpg"
                 if not (frame_file.exists() and frame_file.stat().st_size > 0):
                     frame_urls = [
-                        f"https://i.ytimg.com/vi/{video_id}/hq{i}.jpg",
-                        f"https://i.ytimg.com/vi/{video_id}/{i}.jpg",
+                        f"{scheme}://i.ytimg.com/vi/{video_id}/hq{i}.jpg",
+                        f"{scheme}://i.ytimg.com/vi/{video_id}/{i}.jpg",
                     ]
                     await self._download_one_file(frame_urls, frame_file)
 

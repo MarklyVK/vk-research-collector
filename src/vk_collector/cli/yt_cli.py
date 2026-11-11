@@ -126,10 +126,11 @@ def yt_check_connection() -> None:
             except Exception as err:
                 api_status = f"error: {err}"
 
-            # 2. Проверка CDN картинок
+            # 2. Проверка CDN картинок (с fallback на HTTP для РФ)
             cdn_status = "ok"
             cdn_bytes = 0
-            async with httpx.AsyncClient(timeout=10.0) as http:
+            used_cdn_url = cdn_url
+            async with httpx.AsyncClient(timeout=3.0) as http:
                 try:
                     resp = await http.get(cdn_url)
                     if resp.status_code == 200:
@@ -137,7 +138,17 @@ def yt_check_connection() -> None:
                     else:
                         cdn_status = f"http_{resp.status_code}"
                 except Exception as err:
-                    cdn_status = f"error: {err}"
+                    http_url = f"http://i.ytimg.com/vi/{test_video_id}/hq1.jpg"
+                    used_cdn_url = http_url
+                    try:
+                        resp = await http.get(http_url)
+                        if resp.status_code == 200:
+                            cdn_bytes = len(resp.content)
+                            cdn_status = "ok (http fallback)"
+                        else:
+                            cdn_status = f"http_{resp.status_code}"
+                    except Exception as http_err:
+                        cdn_status = f"error: {err}; fallback: {http_err}"
 
             day_pt = budget.today_pt()
             return {
@@ -150,7 +161,7 @@ def yt_check_connection() -> None:
                 },
                 "cdn_check": {
                     "status": cdn_status,
-                    "url": cdn_url,
+                    "url": used_cdn_url,
                     "bytes_received": cdn_bytes,
                 },
             }
