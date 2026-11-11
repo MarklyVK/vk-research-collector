@@ -63,11 +63,11 @@ def upgrade() -> None:
             flag_news BOOLEAN DEFAULT FALSE,
             flag_infopovod BOOLEAN DEFAULT FALSE,
             UNIQUE (video_id, source)
-        );
-        CREATE INDEX IF NOT EXISTS idx_yt_top_video_id ON yt_top(video_id);
-        CREATE INDEX IF NOT EXISTS idx_yt_top_source ON yt_top(source);
+        )
         """
     )
+    op.execute("CREATE INDEX IF NOT EXISTS idx_yt_top_video_id ON yt_top(video_id)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_yt_top_source ON yt_top(source)")
 
 
 def downgrade() -> None:
