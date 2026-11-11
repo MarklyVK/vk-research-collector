@@ -54,9 +54,17 @@ class YouTubeMediaDownloader:
         min_free_bytes: int = MIN_FREE_DISK_BYTES,
         sleep_range: tuple[float, float] = (0.05, 0.15),
     ) -> None:
-        self._base_dir = Path(base_dir).expanduser()
-        self._thumbs_dir = Path(thumbs_dir).expanduser() if thumbs_dir is not None else None
-        self._legacy_mode = self._thumbs_dir is not None
+        self._thumbs_dir: Path | None
+        if thumbs_dir is not None and (
+            base_dir == Path("~/markly/data/youtube") or base_dir == "~/markly/data/youtube"
+        ):
+            self._base_dir = Path(thumbs_dir).expanduser()
+            self._thumbs_dir = self._base_dir
+            self._legacy_mode = True
+        else:
+            self._base_dir = Path(base_dir).expanduser()
+            self._thumbs_dir = Path(thumbs_dir).expanduser() if thumbs_dir is not None else None
+            self._legacy_mode = self._thumbs_dir is not None
 
         self._external_client = http_client is not None
         self._http = http_client or httpx.AsyncClient(
@@ -133,12 +141,13 @@ class YouTubeMediaDownloader:
         if all(f.exists() and f.stat().st_size > 0 for f in std_files):
             return True
 
-        # 2. Обратная совместимость с плоской структурой: {base_dir}/{post_id}_max.jpg, etc.
+        # 2. Обратная совместимость с плоской структурой: {chk_dir}/{post_id}_max.jpg, etc.
+        chk_dir = self._thumbs_dir or self._base_dir
         legacy_files = [
-            self._base_dir / f"{post_id}_max.jpg",
-            self._base_dir / f"{post_id}_1.jpg",
-            self._base_dir / f"{post_id}_2.jpg",
-            self._base_dir / f"{post_id}_3.jpg",
+            chk_dir / f"{post_id}_max.jpg",
+            chk_dir / f"{post_id}_1.jpg",
+            chk_dir / f"{post_id}_2.jpg",
+            chk_dir / f"{post_id}_3.jpg",
         ]
         return all(f.exists() and f.stat().st_size > 0 for f in legacy_files)
 

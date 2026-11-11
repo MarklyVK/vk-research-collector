@@ -403,15 +403,16 @@ class YouTubeTopService:
         weeks_skipped = 0
         total_videos = 0
 
-        for w_num, w_start, w_end in active_weeks:
-            source = f"weekly_top_W{w_num:02d}"
+        for _w_num, w_start, w_end in active_weeks:
+            year, week, _ = w_start.isocalendar()
+            source = f"weekly_top_{year}-W{week:02d}"
 
             # Проверка чекпоинта: если неделя уже собрана в yt_top, пропускаем
             async with self._sessions() as session:
                 existing_count = await session.scalar(
                     select(func.count()).select_from(YTTop).where(YTTop.source == source)
                 )
-            if existing_count and existing_count >= 50:
+            if existing_count and existing_count > 0:
                 logger.info(
                     "Чекпоинт: неделя %s уже содержит %d видео, пропускаем",
                     source,

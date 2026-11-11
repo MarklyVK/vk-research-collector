@@ -316,11 +316,13 @@ async def test_top_service_submodes(tmp_path: Path) -> None:
         assert ("pop_1", "mostPopular_2026-11-11") in saved_top
         assert (base_dir / "top" / "pop_1" / "cover.jpg").exists()
 
-        # 2. Тест подрежима 2б: Weekly Top (проверяем разбиение на 53 недели)
+        # 2. Тест подрежима 2б: Weekly Top (проверяем разбиение на 53 недели и формат source)
         weeks = service.get_weekly_intervals()
         assert len(weeks) == 53
         assert weeks[0][0] == 1
         assert weeks[-1][0] == 53
+        w1_year, w1_week, _ = weeks[0][1].isocalendar()
+        assert f"weekly_top_{w1_year}-W{w1_week:02d}".startswith("weekly_top_")
 
         # 3. Тест подрежима 2в: Candidates Top
         cand_file = tmp_path / "test_cand.csv"
