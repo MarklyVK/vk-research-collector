@@ -250,6 +250,27 @@ async def test_panel_live_cycle(tmp_path: Path) -> None:
     assert len(posts_df) == 3 and len(snaps_df) >= 4
     assert (path / "manifest.json").exists()
 
+    # потоковая выгрузка порциями: те же строки, несколько row group, типы по схеме
+    import pyarrow.parquet as pq  # type: ignore[import-untyped]
+
+    clock.now = clock.now + timedelta(seconds=1)  # другой каталог <UTC-время>
+    small = Path(await service.export("test-panel", "interim_small", batch_rows=2))
+    snaps_small = pd.read_parquet(small / "snapshots.parquet")
+    assert pq.ParquetFile(small / "snapshots.parquet").num_row_groups == -(-len(snaps_df) // 2)
+    assert pq.ParquetFile(small / "posts.parquet").num_row_groups == 2
+    key = ["vk_owner_id", "vk_post_id", "measured_at"]
+    pd.testing.assert_frame_equal(
+        snaps_small.sort_values(key).reset_index(drop=True),
+        snaps_df.sort_values(key).reset_index(drop=True),
+        check_dtype=False,
+    )
+    schema = pq.read_schema(small / "posts.parquet")
+    assert str(schema.field("published_at").type) == "timestamp[us, tz=UTC]"
+    assert str(schema.field("vk_post_id").type) == "int64"
+    assert str(schema.field("attachments").type) == "string"
+    posts_small = pd.read_parquet(small / "posts.parquet")
+    assert posts_small["next_due_at"].dtype.kind == "M"  # даты, а не object
+
     # заморозка по stop_at
     async with sessions() as session:
         panel = await session.get(Panel, panel_id)
