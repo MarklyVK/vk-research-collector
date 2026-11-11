@@ -304,7 +304,7 @@ class Settings(BaseSettings):
         keys = self.effective_youtube_api_keys
         if len(keys) > 1:
             return keys[1]
-        return ""
+        return keys[0] if keys else ""
 
 
 class Keyword(BaseModel):

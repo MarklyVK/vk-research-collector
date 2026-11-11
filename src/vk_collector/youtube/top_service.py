@@ -176,7 +176,7 @@ class YouTubeTopService:
                 continue
             if cid in self._subscribers_cache:
                 result[cid] = self._subscribers_cache[cid]
-            else:
+            elif cid not in missing:
                 missing.append(cid)
 
         if not missing:

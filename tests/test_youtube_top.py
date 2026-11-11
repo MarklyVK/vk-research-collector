@@ -338,3 +338,114 @@ async def test_top_service_submodes(tmp_path: Path) -> None:
         assert res_2c["candidates_skipped_news"] == 1  # "Срочные Новости" пропущены!
         assert ("cand_vid_1", "candidate_Интервьюер") in saved_top
         assert (base_dir / "top" / "cand_vid_1" / "cover.jpg").exists()
+
+
+# =============================================================================
+# 5. Тест недельного топа с 2 страницами по 50 видео и fallback ключа
+# =============================================================================
+@pytest.mark.asyncio
+async def test_weekly_top_collection_and_key_fallback(tmp_path: Path) -> None:
+    base_dir = tmp_path / "youtube"
+    saved_top: dict[tuple[str, str], dict[str, Any]] = {}
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def execute(self, stmt: Any) -> Any:
+            class FakeResult:
+                def all(self) -> list[Any]:
+                    return []
+
+            return FakeResult()
+
+        async def scalar(self, stmt: Any) -> int:
+            return 0
+
+        async def commit(self) -> None:
+            pass
+
+    class FakeSessionFactory:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    def mock_yt_api(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/search"):
+            page_token = request.url.params.get("pageToken")
+            if not page_token:
+                # Первая страница (50 элементов + nextPageToken)
+                items = [{"id": {"videoId": f"w_vid_{i}"}} for i in range(1, 51)]
+                return httpx.Response(200, json={"items": items, "nextPageToken": "page_2_token"})
+            else:
+                # Вторая страница (еще 50 элементов, всего 100)
+                items = [{"id": {"videoId": f"w_vid_{i}"}} for i in range(51, 101)]
+                return httpx.Response(200, json={"items": items})
+
+        if path.endswith("/videos"):
+            ids = request.url.params.get("id", "").split(",")
+            items = [
+                {
+                    "id": vid,
+                    "snippet": {
+                        "title": f"Video {vid}",
+                        "channelId": "UC_test_ch",
+                        "publishedAt": "2025-11-12T10:00:00Z",
+                    },
+                    "statistics": {"viewCount": "100000", "likeCount": "5000"},
+                    "contentDetails": {"duration": "PT3M00S"},
+                }
+                for vid in ids
+            ]
+            return httpx.Response(200, json={"items": items})
+
+        if path.endswith("/channels"):
+            return httpx.Response(
+                200,
+                json={"items": [{"id": "UC_test_ch", "statistics": {"subscriberCount": "50000"}}]},
+            )
+
+        if "i.ytimg.com" in str(request.url):
+            return httpx.Response(200, content=b"fake_image")
+
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(mock_yt_api)
+    async with httpx.AsyncClient(transport=transport) as http:
+        budget = YouTubeQuotaBudget(["single_test_key"], daily_limit=10000)
+        client = YouTubeClient(budget, http_client=http)
+        settings = Settings(yt_media_dir=base_dir, youtube_api_key="single_test_key")
+
+        # Проверяем fallback для effective_yt_top_api_key
+        assert settings.effective_yt_top_api_key == "single_test_key"
+
+        service = YouTubeTopService(
+            FakeSessionFactory(),  # type: ignore[arg-type]
+            client,
+            settings,
+            media_downloader=YouTubeMediaDownloader(base_dir=base_dir, http_client=http),
+        )
+
+        async def fake_upsert(video_data: dict[str, Any], source: str, **kwargs: Any) -> bool:
+            v_id = video_data.get("id")
+            saved_top[(v_id, source)] = {"video": video_data, "source": source, "kwargs": kwargs}
+            return True
+
+        service._upsert_and_download_video = fake_upsert  # type: ignore[assignment]
+
+        # Ограничиваем список недель одной тестовой неделей для скорости
+        service.get_weekly_intervals = lambda: [  # type: ignore[method-assign]
+            (1, datetime(2025, 11, 11, tzinfo=UTC), datetime(2025, 11, 18, tzinfo=UTC))
+        ]
+
+        res = await service.collect_weekly_top(batch=1)
+        assert res["batch"] == 1
+        assert res["weeks_processed"] == 1
+        assert res["total_videos"] == 100  # Ровно 100 видео за 2 страницы по 50!
+
+        # Проверяем формат source (weekly_top_2025-W46)
+        sources = {src for (_, src) in saved_top}
+        assert "weekly_top_2025-W46" in sources
