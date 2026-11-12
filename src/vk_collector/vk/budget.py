@@ -14,7 +14,7 @@ from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from vk_collector.database.models import VKTokenDailyUsage
@@ -104,7 +104,11 @@ class DailyBudget:
                 await session.execute(
                     stmt.on_conflict_do_update(
                         index_elements=["day", "token_fingerprint", "method"],
-                        set_={"calls": VKTokenDailyUsage.calls + stmt.excluded.calls},
+                        set_={
+                            "calls": VKTokenDailyUsage.calls + stmt.excluded.calls,
+                            # иначе updated_at = момент создания строки суток, а не последний вызов
+                            "updated_at": func.now(),
+                        },
                     )
                 )
             await session.commit()

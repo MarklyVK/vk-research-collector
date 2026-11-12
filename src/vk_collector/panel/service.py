@@ -20,7 +20,7 @@ import logging
 import re
 import uuid
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -153,6 +153,10 @@ class TickResult:
     members: int
     exported: str | None
     frozen: bool
+    # пост в плане, но счётчики не получены (ошибка wall.getById в execute) — повтор позже
+    unmeasured: int = 0
+    # вызовы VK по токенам за такт (отпечаток[:6] -> число запросов)
+    tokens: dict[str, int] = field(default_factory=dict)
 
 
 class PanelService:
@@ -167,6 +171,7 @@ class PanelService:
         self._sessions = sessions
         self._vk = vk
         self._export_dir = export_dir or Path("exports/vk_panel")
+        self._last_unmeasured = 0
         self._now = now or (lambda: datetime.now(UTC))
         # состояние ретроспективы в памяти процесса panel-worker
         self._bf_progress: dict[int, _BackfillProgress] = {}
@@ -785,15 +790,22 @@ class PanelService:
             return 0, 0, 0
         keys = [f"{owner}_{post}" for owner, post, _, _ in rows]
         counters = await self._vk.posts_counters(keys)
+        failed = {str(r["failed"]) for r in counters if r.get("failed") is not None}
         by_key = {
             (int(r["owner_id"]), int(r["id"])): r for r in counters if r.get("id") is not None
         }
+        self._last_unmeasured = 0
         now = self._now()
         measured = missed = deleted = 0
         async with self._sessions() as session:
             for owner, post_id, published, idx in rows:
                 values: dict[str, Any]
                 found = by_key.get((int(owner), int(post_id)))
+                if found is None and f"{owner}_{post_id}" in failed:
+                    # счётчики не получены (ошибка VK) — НЕ удаление: пост остаётся в плане,
+                    # next_due_at не меняется, замер повторится в следующем такте
+                    self._last_unmeasured += 1
+                    continue
                 if found is None:
                     values = {"deleted_at": now, "next_due_at": None, "next_target_index": None}
                     deleted += 1
@@ -881,8 +893,9 @@ class PanelService:
         if stop_at is not None and now >= stop_at:
             path = await self.export(panel_name, "final")
             await self.set_status(panel.id, "frozen")
-            return TickResult(0, 0, 0, 0, 0, 0, path, True)
+            return TickResult(0, 0, 0, 0, 0, 0, path, True, tokens=self._take_tokens())
         polled, new = await self.poll_due(panel)
+        self._last_unmeasured = 0
         measured, missed, deleted = await self.measure_due(panel)
         members = await self.members_daily(panel)
         exported = None
@@ -893,7 +906,123 @@ class PanelService:
             and "interim" not in cfg.get("exports_done", [])
         ):
             exported = await self.export(panel_name, "interim")
-        return TickResult(polled, new, measured, missed, deleted, members, exported, False)
+        return TickResult(
+            polled,
+            new,
+            measured,
+            missed,
+            deleted,
+            members,
+            exported,
+            False,
+            unmeasured=self._last_unmeasured,
+            tokens=self._take_tokens(),
+        )
+
+    def _take_tokens(self) -> dict[str, int]:
+        take = getattr(self._vk, "take_token_calls", None)
+        return take() if callable(take) else {}
+
+    # ------------------------------------------------------------------ восстановление
+    async def restore_false_deletions(
+        self, panel_name: str, since: datetime, *, apply: bool = False
+    ) -> dict[str, Any]:
+        """Снять ложные «удаления» (решение Андрея 12.11.2026).
+
+        Критерий: measure_due ставит всем постам одного такта одинаковый deleted_at (= момент
+        такта). Такт считается ложным, если в этот же момент у панели не записано НИ ОДНОГО
+        замера (panel_post_snapshots.measured_at = deleted_at): так выглядел такт, в котором
+        wall.getById внутри execute вернул ошибку и все посты такта ушли в «удалённые».
+        Посты, удалённые в такте, где были замеры, не трогаются (это настоящие удаления).
+
+        Восстановление: deleted_at = NULL; следующая отметка — по плану с отметки, которая
+        была due на момент ложного удаления (последняя отметка с временем ≤ deleted_at),
+        пропущенные к текущему моменту отметки прибавляются к missed_targets.
+        apply=False — сухой прогон: только посчитать.
+        """
+        panel = await self.panel_by_name(panel_name)
+        cfg = panel.config
+        targets: list[int] = cfg["targets_h"]
+        now = self._now()
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        PanelPost.vk_owner_id,
+                        PanelPost.vk_post_id,
+                        PanelPost.published_at,
+                        PanelPost.deleted_at,
+                    ).where(
+                        PanelPost.panel_id == panel.id,
+                        PanelPost.deleted_at.is_not(None),
+                        PanelPost.deleted_at >= since,
+                    )
+                )
+            ).all()
+            moments = sorted({r.deleted_at for r in rows})
+            measured_at = (
+                set(
+                    (
+                        await session.execute(
+                            select(PanelPostSnapshot.measured_at)
+                            .where(
+                                PanelPostSnapshot.panel_id == panel.id,
+                                PanelPostSnapshot.measured_at.in_(moments),
+                            )
+                            .distinct()
+                        )
+                    ).scalars()
+                )
+                if moments
+                else set()
+            )
+            false_moments = [m for m in moments if m not in measured_at]
+            false_set = set(false_moments)
+            stats: dict[str, Any] = {
+                "since": since.isoformat(),
+                "deleted_since": len(rows),
+                "ticks_with_deletions": len(moments),
+                "false_ticks": len(false_moments),
+                "kept_real_deletions": sum(1 for r in rows if r.deleted_at not in false_set),
+                "restore": 0,
+                "back_in_plan": 0,
+                "all_targets_passed": 0,
+                "skipped_targets_total": 0,
+                "first_false_tick": false_moments[0].isoformat() if false_moments else None,
+                "last_false_tick": false_moments[-1].isoformat() if false_moments else None,
+                "applied": apply,
+            }
+            for r in rows:
+                if r.deleted_at not in false_set:
+                    continue
+                due_idx = 0
+                for i, h in enumerate(targets):
+                    if r.published_at + timedelta(hours=h) <= r.deleted_at:
+                        due_idx = i
+                nxt, due, skipped = self._target_plan(cfg, r.published_at, now, due_idx)
+                stats["restore"] += 1
+                stats["back_in_plan"] += nxt is not None
+                stats["all_targets_passed"] += nxt is None
+                stats["skipped_targets_total"] += skipped
+                if apply:
+                    await session.execute(
+                        update(PanelPost)
+                        .where(
+                            PanelPost.panel_id == panel.id,
+                            PanelPost.vk_owner_id == r.vk_owner_id,
+                            PanelPost.vk_post_id == r.vk_post_id,
+                        )
+                        .values(
+                            deleted_at=None,
+                            next_target_index=nxt,
+                            next_due_at=due,
+                            missed_targets=PanelPost.missed_targets + skipped,
+                        )
+                    )
+            if apply:
+                await session.commit()
+        logger.info("panel_restore_false_deletions %s", json.dumps(stats, ensure_ascii=False))
+        return stats
 
     # ------------------------------------------------------------------ выгрузка
     async def export(
