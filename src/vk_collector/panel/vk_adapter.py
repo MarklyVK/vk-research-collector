@@ -47,7 +47,24 @@ class ExecutePanelVK:
         self.getbyid_per_execute = getbyid_per_execute
 
     async def _execute(self, code: str, inner: dict[str, int]) -> Any:
-        return await self._client.call("execute", {"code": code}, inner_calls=inner)
+        # токен выбирается по внутреннему методу: ошибка 9/29 на нём закрывает токен
+        # только для таких execute (см. VKClient._inner_errors)
+        result, _ = await self._execute_checked(code, inner)
+        return result
+
+    async def _execute_checked(self, code: str, inner: dict[str, int]) -> tuple[Any, list[Any]]:
+        """execute + список ошибок внутренних вызовов (execute_errors)."""
+        key = "execute:" + "+".join(sorted(inner))
+        out = await self._client.call(
+            "execute", {"code": code}, inner_calls=inner, lease_key=key, return_errors=True
+        )
+        if isinstance(out, tuple) and len(out) == 2:
+            return out[0], list(out[1] or [])
+        return out, []  # клиент без return_errors (тестовые подмены)
+
+    def take_token_calls(self) -> dict[str, int]:
+        take = getattr(self._client, "take_token_calls", None)
+        return take() if callable(take) else {}
 
     async def wall_latest(self, community_ids: Sequence[int], count: int) -> dict[int, Any]:
         """Последние count постов каждой стены (полные объекты).
@@ -87,7 +104,12 @@ class ExecutePanelVK:
         return pages
 
     async def posts_counters(self, keys: Sequence[str]) -> list[dict[str, Any]]:
-        """Счётчики постов по ключам "owner_post" (≤100 в wall.getById) — облегчённо через @."""
+        """Счётчики постов по ключам "owner_post" (≤100 в wall.getById) — облегчённо через @.
+
+        Если wall.getById внутри execute вернул ошибку (VK отдаёт false, например ошибка 9),
+        для каждого ключа этой порции возвращается {"failed": key}: пост НЕ замерен, но и не
+        удалён. Удалённым считается только пост, которого нет в успешном ответе VK.
+        """
         rows: list[dict[str, Any]] = []
         chunks = [list(keys[i : i + 100]) for i in range(0, len(keys), 100)]
         step = self.getbyid_per_execute
@@ -96,15 +118,29 @@ class ExecutePanelVK:
             code = (
                 f"var p={json.dumps(part)};var res=[];var i=0;"
                 'while(i<p.length){var r=API.wall.getById({"posts":p[i]});'
+                'if(!r){res.push({"ok":0});}else{'
                 "var it=r.items;if(!it){it=r;}"
-                'res.push({"id":it@.id,"owner_id":it@.owner_id,"date":it@.date,'
-                '"views":it@.views,"likes":it@.likes,"reposts":it@.reposts,"comments":it@.comments});'
+                'res.push({"ok":1,"id":it@.id,"owner_id":it@.owner_id,"date":it@.date,'
+                '"views":it@.views,"likes":it@.likes,"reposts":it@.reposts,"comments":it@.comments});}'
                 "i=i+1;}return res;"
             )
-            result = await self._execute(code, {"wall.getById": len(part)})
-            for block in result or []:
-                if not isinstance(block, dict):
+            group = chunks[i : i + step]
+            result, errors = await self._execute_checked(code, {"wall.getById": len(part)})
+            # «не получено» — только если VK сообщил об ошибке wall.getById в этом execute;
+            # иначе пустой ответ = все посты порции удалены (явный признак VK, как раньше)
+            getbyid_failed = any(
+                isinstance(e, dict) and str(e.get("method", "")).endswith("wall.getById")
+                for e in errors
+            )
+            blocks = result if isinstance(result, list) else []
+            for n, chunk in enumerate(group):
+                block = blocks[n] if n < len(blocks) else None
+                bad = not isinstance(block, dict) or block.get("ok") == 0
+                if bad and (getbyid_failed or not isinstance(result, list)):
+                    rows.extend({"failed": key} for key in chunk)
                     continue
+                if bad or not isinstance(block, dict):
+                    continue  # успешный пустой ответ: постов порции у VK нет
                 ids = block.get("id") or []
                 for j, post_id in enumerate(ids):
                     rows.append(

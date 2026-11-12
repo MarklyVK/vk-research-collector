@@ -170,6 +170,26 @@ def panel_export(
     typer.echo(asyncio.run(go()))
 
 
+@panel_app.command("restore-deleted")
+def panel_restore_deleted(
+    name: Annotated[str, typer.Option()],
+    since: Annotated[str, typer.Option(help="ISO-время, например 2026-11-12T08:00:00+00:00")],
+    apply: Annotated[bool, typer.Option("--apply", help="без флага — сухой прогон")] = False,
+) -> None:
+    """Снять ложные «удаления» (такты без единого замера) с момента since и вернуть посты в план."""
+    from datetime import datetime
+
+    moment = datetime.fromisoformat(since)
+    if moment.tzinfo is None:
+        raise typer.BadParameter("since должен быть с часовым поясом")
+
+    async def go() -> dict[str, Any]:
+        async with _service() as service:
+            return await service.restore_false_deletions(name, moment, apply=apply)
+
+    typer.echo(json.dumps(asyncio.run(go()), ensure_ascii=False, indent=1))
+
+
 @panel_app.command("status")
 def panel_status(name: Annotated[str, typer.Option()]) -> None:
     """Сводка: сообщества, посты, замеры по отметкам, пропуски, токены и квоты за сегодня."""
