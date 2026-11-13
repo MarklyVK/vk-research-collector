@@ -559,8 +559,8 @@ for old_backup in "${OLD_BACKUPS[@]}"; do
   fi
 done
 ALEMBIC_REVISION=$(compose_cli alembic current | tail -n 1 | tr -d '\r')
-[[ "$ALEMBIC_REVISION" == *20261109_0020* ]] \
-  || die "Alembic находится не на ожидаемом head 20261109_0020: $ALEMBIC_REVISION"
+[[ "$ALEMBIC_REVISION" == *20261111_0021* ]] \
+  || die "Alembic находится не на ожидаемом head 20261111_0021: $ALEMBIC_REVISION"
 
 ROLLBACK_ALLOWED=1
 if [[ -n "$RUN_ID" ]]; then

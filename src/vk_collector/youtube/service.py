@@ -22,6 +22,7 @@ from vk_collector.database.models import (
     YTSearchQueryLog,
     YTTimeseries,
 )
+from vk_collector.youtube.budget import YouTubeQuotaExhaustedError
 from vk_collector.youtube.client import (
     YouTubeClient,
     is_short_video,
@@ -429,6 +430,8 @@ class YouTubePanelService:
                         views=views,
                         likes=likes,
                         comments=comments,
+                        duration_s=duration_s,
+                        is_short=is_short_video(duration_s),
                     )
                     upsert_ts = ts_stmt.on_conflict_do_nothing(
                         index_elements=["post_id", "target_age_h"],
@@ -438,6 +441,13 @@ class YouTubePanelService:
                     total_videos_saved += 1
 
                 await session.commit()
+
+            # Скачивание обложки и кадров hq1-hq3 в ~/markly/data/youtube/{video_id}/
+            for v_id in video_ids:
+                try:
+                    await self._media_downloader.download_video_media(v_id, is_top=False)
+                except Exception as dl_err:
+                    logger.debug("Ошибка скачивания медиа для %s: %s", v_id, dl_err)
 
             channels_processed += 1
 
@@ -490,7 +500,13 @@ class YouTubePanelService:
         now_utc = datetime.now(UTC)
 
         for pid in sampled_post_ids:
-            status, items = await self._client.get_top_comments(pid, max_results=20)
+            try:
+                await self._client._budget.acquire_key("commentThreads.list", 1)
+            except YouTubeQuotaExhaustedError:
+                logger.warning("Суточная квота для сбора комментариев исчерпана, останавливаемся.")
+                break
+
+            status, items = await self._client.get_top_comments(pid, max_results=100)
             async with self._sessions() as session:
                 if status == "disabled":
                     disabled_count += 1
@@ -675,6 +691,8 @@ class YouTubePanelService:
                         views=views,
                         likes=likes,
                         comments=comments,
+                        duration_s=dur_s,
+                        is_short=is_short_video(dur_s),
                     )
                     session.add(ts_row)
 
@@ -783,6 +801,8 @@ class YouTubePanelService:
                             views=views,
                             likes=likes,
                             comments=comments,
+                            duration_s=post.duration_s if post else None,
+                            is_short=post.is_short if post else None,
                         )
                         await session.execute(
                             ts_entry.on_conflict_do_update(
@@ -794,6 +814,8 @@ class YouTubePanelService:
                                     "comments": ts_entry.excluded.comments,
                                     "crawled_at": ts_entry.excluded.crawled_at,
                                     "age_seconds": ts_entry.excluded.age_seconds,
+                                    "duration_s": ts_entry.excluded.duration_s,
+                                    "is_short": ts_entry.excluded.is_short,
                                 },
                             )
                         )

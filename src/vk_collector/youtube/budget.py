@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
@@ -51,6 +53,7 @@ class YouTubeQuotaBudget:
         safety_margin: int = 200,
         sessions: async_sessionmaker[AsyncSession] | None = None,
         now: Callable[[], datetime] | None = None,
+        json_path: Path | str | None = None,
     ) -> None:
         self._api_keys = [k.strip() for k in api_keys if k.strip()]
         self._fingerprints = [compute_key_fingerprint(k) for k in self._api_keys]
@@ -59,6 +62,7 @@ class YouTubeQuotaBudget:
         self._safety_margin = safety_margin
         self._sessions = sessions
         self._now = now
+        self._json_path = Path(json_path).expanduser() if json_path else None
         # In-memory хранилище для тестов / работы без сессий:
         # (fingerprint, endpoint, day_pt) -> units
         self._memory_usage: dict[tuple[str, str, date], int] = defaultdict(int)
@@ -164,29 +168,30 @@ class YouTubeQuotaBudget:
     ) -> None:
         """Зафиксировать расход единиц квоты по ключу и эндпоинту."""
         day_pt = self.today_pt()
-        if self._sessions is None:
-            self._memory_usage[(fingerprint, endpoint, day_pt)] += units
-            self._memory_calls[(fingerprint, endpoint, day_pt)] += calls
-            return
+        self._memory_usage[(fingerprint, endpoint, day_pt)] += units
+        self._memory_calls[(fingerprint, endpoint, day_pt)] += calls
 
-        async with self._sessions() as session:
-            stmt = insert(YTKeyDailyUsage).values(
-                key_fingerprint=fingerprint,
-                endpoint=endpoint,
-                day_pt=day_pt,
-                calls_count=calls,
-                units_spent=units,
-            )
-            upsert_stmt = stmt.on_conflict_do_update(
-                index_elements=["key_fingerprint", "endpoint", "day_pt"],
-                set_={
-                    "calls_count": YTKeyDailyUsage.calls_count + stmt.excluded.calls_count,
-                    "units_spent": YTKeyDailyUsage.units_spent + stmt.excluded.units_spent,
-                    "updated_at": func.now(),
-                },
-            )
-            await session.execute(upsert_stmt)
-            await session.commit()
+        if self._sessions is not None:
+            async with self._sessions() as session:
+                stmt = insert(YTKeyDailyUsage).values(
+                    key_fingerprint=fingerprint,
+                    endpoint=endpoint,
+                    day_pt=day_pt,
+                    calls_count=calls,
+                    units_spent=units,
+                )
+                upsert_stmt = stmt.on_conflict_do_update(
+                    index_elements=["key_fingerprint", "endpoint", "day_pt"],
+                    set_={
+                        "calls_count": YTKeyDailyUsage.calls_count + stmt.excluded.calls_count,
+                        "units_spent": YTKeyDailyUsage.units_spent + stmt.excluded.units_spent,
+                        "updated_at": func.now(),
+                    },
+                )
+                await session.execute(upsert_stmt)
+                await session.commit()
+
+        self._sync_json()
 
     async def mark_quota_exceeded(self, fingerprint: str) -> None:
         """Немедленно заблокировать ключ до конца суток PT при получении ошибки quotaExceeded."""
@@ -199,33 +204,89 @@ class YouTubeQuotaBudget:
             self.next_reset_pt().isoformat(),
         )
 
-        if self._sessions is None:
-            return
-
-        async with self._sessions() as session:
-            stmt = insert(YTKeyDailyUsage).values(
-                key_fingerprint=fingerprint,
-                endpoint="quota_exceeded",
-                day_pt=day_pt,
-                calls_count=0,
-                units_spent=0,
-                quota_exceeded_at=now_utc,
-            )
-            upsert_stmt = stmt.on_conflict_do_update(
-                index_elements=["key_fingerprint", "endpoint", "day_pt"],
-                set_={
-                    "quota_exceeded_at": now_utc,
-                    "updated_at": func.now(),
-                },
-            )
-            await session.execute(upsert_stmt)
-            # Также обновим quota_exceeded_at во всех существующих строках этого ключа за сегодня
-            await session.execute(
-                update(YTKeyDailyUsage)
-                .where(
-                    YTKeyDailyUsage.key_fingerprint == fingerprint,
-                    YTKeyDailyUsage.day_pt == day_pt,
+        if self._sessions is not None:
+            async with self._sessions() as session:
+                stmt = insert(YTKeyDailyUsage).values(
+                    key_fingerprint=fingerprint,
+                    endpoint="quota_exceeded",
+                    day_pt=day_pt,
+                    calls_count=0,
+                    units_spent=0,
+                    quota_exceeded_at=now_utc,
                 )
-                .values(quota_exceeded_at=now_utc)
-            )
-            await session.commit()
+                upsert_stmt = stmt.on_conflict_do_update(
+                    index_elements=["key_fingerprint", "endpoint", "day_pt"],
+                    set_={
+                        "quota_exceeded_at": now_utc,
+                        "updated_at": func.now(),
+                    },
+                )
+                await session.execute(upsert_stmt)
+                # Обновим quota_exceeded_at во всех строках этого ключа за сегодня
+                await session.execute(
+                    update(YTKeyDailyUsage)
+                    .where(
+                        YTKeyDailyUsage.key_fingerprint == fingerprint,
+                        YTKeyDailyUsage.day_pt == day_pt,
+                    )
+                    .values(quota_exceeded_at=now_utc)
+                )
+                await session.commit()
+
+        self._sync_json()
+
+    def _sync_json(self) -> None:
+        """Синхронизировать расход квоты в JSON-файл quota_usage.json."""
+        if not self._json_path:
+            return
+        try:
+            p = self._json_path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            day_str = str(self.today_pt())
+
+            data: dict[str, Any] = {}
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+
+            data["updated_at"] = datetime.now(UTC).isoformat()
+            data["day_pt"] = day_str
+            keys_info = data.get("keys", {})
+
+            for fp in self._fingerprints:
+                spent = sum(
+                    units
+                    for (k_fp, _, d), units in self._memory_usage.items()
+                    if k_fp == fp and d == self.today_pt()
+                )
+                blocked = (fp, self.today_pt()) in self._memory_blocked
+                endpoints: dict[str, dict[str, int]] = {}
+                for (k_fp, ep, d), units in self._memory_usage.items():
+                    if k_fp == fp and d == self.today_pt():
+                        calls = self._memory_calls.get((k_fp, ep, d), 0)
+                        endpoints[ep] = {"calls": calls, "units": units}
+
+                entry = keys_info.get(fp, {})
+                entry["fingerprint"] = fp
+                entry["day_pt"] = day_str
+                entry["total_spent"] = max(entry.get("total_spent", 0), spent)
+                entry["limit"] = self._daily_limit
+                entry["blocked"] = blocked or entry.get("blocked", False)
+                if "endpoints" not in entry:
+                    entry["endpoints"] = {}
+                for ep, stats in endpoints.items():
+                    prev = entry["endpoints"].get(ep, {"calls": 0, "units": 0})
+                    entry["endpoints"][ep] = {
+                        "calls": max(prev.get("calls", 0), stats["calls"]),
+                        "units": max(prev.get("units", 0), stats["units"]),
+                    }
+                keys_info[fp] = entry
+
+            data["keys"] = keys_info
+            tmp_p = p.with_suffix(".tmp")
+            tmp_p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp_p.replace(p)
+        except Exception as exc:
+            logger.debug("Не удалось записать quota_usage.json: %s", exc)

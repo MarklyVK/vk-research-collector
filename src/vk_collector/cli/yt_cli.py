@@ -8,6 +8,7 @@ import logging
 import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -27,7 +28,9 @@ from vk_collector.youtube.budget import YouTubeQuotaBudget, YouTubeQuotaExhauste
 from vk_collector.youtube.client import YouTubeClient
 from vk_collector.youtube.export import YouTubePanelExporter
 from vk_collector.youtube.media import YouTubeMediaDownloader
+from vk_collector.youtube.report import generate_status_report
 from vk_collector.youtube.service import YouTubePanelService
+from vk_collector.youtube.top_service import YouTubeTopService
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +42,55 @@ async def _service_context() -> AsyncIterator[tuple[YouTubePanelService, YouTube
     settings = get_settings()
     engine = create_database_engine(settings.sqlalchemy_url)
     sessions = create_session_factory(engine)
-    keys = settings.effective_youtube_api_keys
+    main_key = settings.effective_yt_main_api_key
+    keys = [main_key] if main_key else settings.effective_youtube_api_keys
 
     budget = YouTubeQuotaBudget(
         keys,
         daily_limit=settings.yt_daily_quota_limit,
         safety_margin=settings.yt_quota_safety_margin,
         sessions=sessions,
+        json_path=Path("~/markly/data/youtube/quota_usage.json"),
     )
     client = YouTubeClient(budget)
-    media_downloader = YouTubeMediaDownloader(thumbs_dir=settings.yt_thumbs_dir)
+    media_downloader = YouTubeMediaDownloader(
+        base_dir=settings.yt_media_dir,
+    )
     service = YouTubePanelService(sessions, client, settings, media_downloader)
+    try:
+        yield service, budget, sessions
+    finally:
+        await client.aclose()
+        await media_downloader.aclose()
+        await engine.dispose()
+
+
+_TopContext = tuple[YouTubeTopService, YouTubeQuotaBudget, Any]
+
+
+@asynccontextmanager
+async def _top_service_context() -> AsyncIterator[_TopContext]:
+    settings = get_settings()
+    engine = create_database_engine(settings.sqlalchemy_url)
+    sessions = create_session_factory(engine)
+    top_key = settings.effective_yt_top_api_key
+    if not top_key:
+        typer.secho(
+            "ОШИБКА: Не настроен ключ YT_TOP_API_KEY для сбора вирального топа!",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    budget = YouTubeQuotaBudget(
+        [top_key],
+        daily_limit=settings.yt_daily_quota_limit,
+        safety_margin=settings.yt_quota_safety_margin,
+        sessions=sessions,
+        json_path=Path("~/markly/data/youtube/quota_usage.json"),
+    )
+    client = YouTubeClient(budget)
+    media_downloader = YouTubeMediaDownloader(base_dir=settings.yt_media_dir)
+    service = YouTubeTopService(sessions, client, settings, media_downloader)
     try:
         yield service, budget, sessions
     finally:
@@ -84,10 +125,11 @@ def yt_check_connection() -> None:
             except Exception as err:
                 api_status = f"error: {err}"
 
-            # 2. Проверка CDN картинок
+            # 2. Проверка CDN картинок (с fallback на HTTP для РФ)
             cdn_status = "ok"
             cdn_bytes = 0
-            async with httpx.AsyncClient(timeout=10.0) as http:
+            used_cdn_url = cdn_url
+            async with httpx.AsyncClient(timeout=3.0) as http:
                 try:
                     resp = await http.get(cdn_url)
                     if resp.status_code == 200:
@@ -95,7 +137,17 @@ def yt_check_connection() -> None:
                     else:
                         cdn_status = f"http_{resp.status_code}"
                 except Exception as err:
-                    cdn_status = f"error: {err}"
+                    http_url = f"http://i.ytimg.com/vi/{test_video_id}/hq1.jpg"
+                    used_cdn_url = http_url
+                    try:
+                        resp = await http.get(http_url)
+                        if resp.status_code == 200:
+                            cdn_bytes = len(resp.content)
+                            cdn_status = "ok (http fallback)"
+                        else:
+                            cdn_status = f"http_{resp.status_code}"
+                    except Exception as http_err:
+                        cdn_status = f"error: {err}; fallback: {http_err}"
 
             day_pt = budget.today_pt()
             return {
@@ -108,7 +160,7 @@ def yt_check_connection() -> None:
                 },
                 "cdn_check": {
                     "status": cdn_status,
-                    "url": cdn_url,
+                    "url": used_cdn_url,
                     "bytes_received": cdn_bytes,
                 },
             }
@@ -365,3 +417,101 @@ def yt_export(
     files = asyncio.run(go())
     typer.echo("Экспорт YouTube панели успешно завершён:")
     typer.echo(json.dumps(files, ensure_ascii=False, indent=2))
+
+
+@yt_app.command("top-daily")
+def yt_top_daily() -> None:
+    """Подрежим 2а: Daily Most Popular (до 200 видео в сутки)."""
+
+    async def go() -> dict[str, Any]:
+        async with _top_service_context() as (service, _, _):
+            return await service.collect_daily_most_popular()
+
+    result = asyncio.run(go())
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@yt_app.command("top-weekly")
+def yt_top_weekly(
+    batch: Annotated[
+        int, typer.Option(help="Номер батча: 1 (недели 1-27) или 2 (недели 28-53)")
+    ] = 1,
+) -> None:
+    """Подрежим 2б: Weekly Top for 12 Months (--batch 1|2)."""
+    if batch not in (1, 2):
+        typer.secho("ОШИБКА: batch должен быть 1 или 2", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    async def go() -> dict[str, Any]:
+        async with _top_service_context() as (service, _, _):
+            return await service.collect_weekly_top(batch=batch)
+
+    result = asyncio.run(go())
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@yt_app.command("top-candidates")
+def yt_top_candidates(
+    file: Annotated[Path, typer.Option(help="Путь к файлу кандидатов (CSV/TSV/JSON/XLSX)")],
+) -> None:
+    """Подрежим 2в: Search by Candidates List (--file <path>)."""
+
+    async def go() -> dict[str, Any]:
+        async with _top_service_context() as (service, _, _):
+            return await service.collect_candidates_top(file_path=file)
+
+    result = asyncio.run(go())
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@yt_app.command("report")
+def yt_report(
+    output: Annotated[
+        Path | None, typer.Option(help="Путь для сохранения status_report.md")
+    ] = None,
+) -> None:
+    """Сформировать и сохранить сводный отчёт status_report.md."""
+    target_out = output or Path("~/markly/data/youtube/status_report.md")
+    report_text = asyncio.run(generate_status_report(output_path=target_out))
+    typer.echo(report_text)
+
+
+@yt_app.command("run")
+def yt_run(
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="Режим: top-daily, top-weekly, top-candidates, backfill, tracker, comments",
+        ),
+    ],
+    batch: Annotated[int, typer.Option("--batch", help="Батч для top-weekly (1 или 2)")] = 1,
+    file: Annotated[
+        Path | None, typer.Option("--file", help="Файл со списком кандидатов для top-candidates")
+    ] = None,
+    days: Annotated[int, typer.Option(help="Число дней ретроспективы для main-backfill")] = 90,
+    sample_size: Annotated[int, typer.Option(help="Размер выборки для main-comments")] = 3000,
+) -> None:
+    """Единая точка запуска контуров сбора YouTube по флагу --mode."""
+    mode_clean = mode.strip().lower()
+    if mode_clean in ("top-daily", "2a"):
+        yt_top_daily()
+    elif mode_clean in ("top-weekly", "2b"):
+        yt_top_weekly(batch=batch)
+    elif mode_clean in ("top-candidates", "2c", "candidates"):
+        if not file:
+            typer.secho(
+                "ОШИБКА: Для режима top-candidates требуется указать --file <path>",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=1)
+        yt_top_candidates(file=file)
+    elif mode_clean in ("main-backfill", "backfill"):
+        yt_backfill(days=days)
+    elif mode_clean in ("main-tracker", "worker", "tracker"):
+        yt_worker()
+    elif mode_clean in ("main-comments", "comments"):
+        yt_collect_comments(sample_size=sample_size)
+    else:
+        typer.secho(f"ОШИБКА: Неизвестный режим: {mode}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)

@@ -2810,3 +2810,4 @@ from vk_collector.cli.yt_cli import yt_app  # noqa: E402
 
 app.add_typer(panel_app, name="panel")
 app.add_typer(yt_app, name="yt", help="Панель сбора и мониторинга YouTube (IEEE Access)")
+app.add_typer(yt_app, name="youtube", help="Панель сбора и мониторинга YouTube (IEEE Access)")
