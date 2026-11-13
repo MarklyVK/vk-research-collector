@@ -60,6 +60,7 @@ class FakeVK:
         self.latest_calls: list[list[int]] = []
         self.counter_calls: list[list[str]] = []
         self.views = 100
+        self.failing = False  # имитация ошибки wall.getById внутри execute (ошибка 9)
 
     async def wall_latest(self, community_ids: Sequence[int], count: int) -> dict[int, Any]:
         self.latest_calls.append(list(community_ids))
@@ -71,6 +72,8 @@ class FakeVK:
     async def posts_counters(self, keys: Sequence[str]) -> list[dict[str, Any]]:
         self.counter_calls.append(list(keys))
         self.views += 50
+        if self.failing:
+            return [{"failed": key} for key in keys]
         out = []
         for key in keys:
             if key in self.deleted:
@@ -250,6 +253,27 @@ async def test_panel_live_cycle(tmp_path: Path) -> None:
     assert len(posts_df) == 3 and len(snaps_df) >= 4
     assert (path / "manifest.json").exists()
 
+    # потоковая выгрузка порциями: те же строки, несколько row group, типы по схеме
+    import pyarrow.parquet as pq  # type: ignore[import-untyped]
+
+    clock.now = clock.now + timedelta(seconds=1)  # другой каталог <UTC-время>
+    small = Path(await service.export("test-panel", "interim_small", batch_rows=2))
+    snaps_small = pd.read_parquet(small / "snapshots.parquet")
+    assert pq.ParquetFile(small / "snapshots.parquet").num_row_groups == -(-len(snaps_df) // 2)
+    assert pq.ParquetFile(small / "posts.parquet").num_row_groups == 2
+    key = ["vk_owner_id", "vk_post_id", "measured_at"]
+    pd.testing.assert_frame_equal(
+        snaps_small.sort_values(key).reset_index(drop=True),
+        snaps_df.sort_values(key).reset_index(drop=True),
+        check_dtype=False,
+    )
+    schema = pq.read_schema(small / "posts.parquet")
+    assert str(schema.field("published_at").type) == "timestamp[us, tz=UTC]"
+    assert str(schema.field("vk_post_id").type) == "int64"
+    assert str(schema.field("attachments").type) == "string"
+    posts_small = pd.read_parquet(small / "posts.parquet")
+    assert posts_small["next_due_at"].dtype.kind == "M"  # даты, а не object
+
     # заморозка по stop_at
     async with sessions() as session:
         panel = await session.get(Panel, panel_id)
@@ -417,3 +441,69 @@ async def _count(sessions: Any, model: Any, panel_id: Any) -> int:
             )
             or 0
         )
+
+
+@pytest.mark.asyncio
+async def test_panel_vk_error_is_not_deletion_and_false_deletions_restore(tmp_path: Path) -> None:
+    engine = create_database_engine(database_url())
+    sessions = create_session_factory(engine)
+    async with sessions() as session:
+        await session.execute(delete(Panel).where(Panel.name == "test-panel-fd"))
+        await session.commit()
+    clock = Clock()
+    vk = FakeVK()
+    service = PanelService(sessions, vk, export_dir=tmp_path, now=clock)
+    rows = [{"vk_id": 111, "stratum": "auto", "size": "XL", "members_count": 9000, "role": "main"}]
+    panel_id = await service.freeze_selection("test-panel-fd", rows, seed=1, config={})
+    await service.set_status(panel_id, "active")
+    vk.walls[111] = {
+        "count": 2,
+        "items": [
+            _post(-111, 1, T0 - timedelta(minutes=50)),
+            _post(-111, 2, T0 - timedelta(minutes=55)),
+        ],
+    }
+    await service.tick("test-panel-fd")
+
+    # отметка 1 ч, но VK вернул ошибку на wall.getById: посты не удалены, остаются в плане
+    vk.failing = True
+    clock.now = T0 + timedelta(minutes=12)
+    r = await service.tick("test-panel-fd")
+    assert (r.measured, r.deleted, r.unmeasured) == (0, 0, 2)
+    async with sessions() as session:
+        posts = (
+            await session.scalars(select(PanelPost).where(PanelPost.panel_id == panel_id))
+        ).all()
+        assert all(p.deleted_at is None and p.next_target_index == 0 for p in posts)
+
+    # имитация старого бага: такт без единого замера пометил оба поста удалёнными
+    bad_tick = T0 + timedelta(minutes=13)
+    async with sessions() as session:
+        for p in (
+            await session.scalars(select(PanelPost).where(PanelPost.panel_id == panel_id))
+        ).all():
+            p.deleted_at, p.next_due_at, p.next_target_index = bad_tick, None, None
+        await session.commit()
+
+    clock.now = T0 + timedelta(hours=2)
+    dry = await service.restore_false_deletions("test-panel-fd", T0, apply=False)
+    assert (dry["false_ticks"], dry["restore"], dry["kept_real_deletions"]) == (1, 2, 0)
+    async with sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(PanelPost)
+                .where(PanelPost.panel_id == panel_id, PanelPost.deleted_at.is_not(None))
+            )
+            == 2
+        )  # сухой прогон ничего не меняет
+    done = await service.restore_false_deletions("test-panel-fd", T0, apply=True)
+    assert done["restore"] == 2 and done["back_in_plan"] == 2
+    async with sessions() as session:
+        posts = (
+            await session.scalars(select(PanelPost).where(PanelPost.panel_id == panel_id))
+        ).all()
+        # на 06:00 отметка 1 ч прошла (пропуск), следующая — 3 ч
+        assert all(p.deleted_at is None and p.next_target_index == 1 for p in posts)
+        assert all(p.missed_targets == 1 for p in posts)
+    await engine.dispose()

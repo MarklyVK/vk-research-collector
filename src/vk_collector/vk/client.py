@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import random
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, time, timedelta
 from typing import Any
@@ -53,6 +54,14 @@ class VKClient:
             base_url="https://api.vk.com/method/", timeout=timeout
         )
         self._owns_http = http_client is None
+        # вызовы по токенам (первые 6 символов отпечатка) — для лога такта панели
+        self._token_calls: Counter[str] = Counter()
+
+    def take_token_calls(self) -> dict[str, int]:
+        """Вернуть и обнулить число вызовов по токенам (отпечаток[:6]) с прошлого вызова."""
+        out = dict(self._token_calls)
+        self._token_calls.clear()
+        return out
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -72,15 +81,22 @@ class VKClient:
         params: Mapping[str, str | int],
         *,
         inner_calls: Mapping[str, int] | None = None,
+        lease_key: str | None = None,
+        return_errors: bool = False,
     ) -> Any:
         """Вызвать метод, применяя политику ошибок без утечки токена.
 
         ``inner_calls`` — вызовы методов внутри ``execute`` (для суточного бюджета токена).
+        ``lease_key`` — ключ выбора токена в пуле вместо имени метода (например
+        ``execute:wall.getById``): так ошибка 9/29 внутреннего метода закрывает токен только
+        для таких ``execute``, а не для всех.
+        ``return_errors`` — вернуть пару (response, execute_errors) вместо response.
         """
         calls = {method: 1, **dict(inner_calls or {})}
         retry_index = 0
         while True:
-            lease = await self._pool.acquire(method)
+            lease = await self._pool.acquire(lease_key or method)
+            self._token_calls[lease.fingerprint[:6]] += 1
             if self._budget is not None:
                 over = await self._budget.exceeded(lease.fingerprint, calls)
                 if over:
@@ -116,6 +132,11 @@ class VKClient:
                 await self._pool.mark_success(lease)
                 if self._budget is not None:
                     await self._budget.record(lease.fingerprint, calls)
+                inner_errors = body.get("execute_errors") if method == "execute" else None
+                if inner_errors:
+                    await self._inner_errors(lease, inner_errors)
+                if return_errors:
+                    return result, inner_errors if isinstance(inner_errors, list) else []
                 return result
             if self._budget is not None:
                 await self._budget.record(lease.fingerprint, calls)
@@ -157,6 +178,45 @@ class VKClient:
             if code in {PERMISSION_ERROR, INVALID_PARAMS_ERROR}:
                 raise VKAPIError(code, message)
             raise VKAPIError(code, message)
+
+    async def _inner_errors(self, lease: Any, errors: Any) -> None:
+        """Ошибки вызовов внутри execute (VK кладёт их в execute_errors, сам execute успешен).
+
+        Каждая логируется с отпечатком токена. Ошибка 9 (flood control) или 29 (лимит) на
+        внутреннем методе закрывает этот токен до следующих суток (МСК) для данного
+        ``lease_key`` — пул выберет другой токен (решение Андрея 12.11.2026).
+        """
+        if not isinstance(errors, list):
+            return
+        stop: set[int] = set()
+        for err in errors:
+            if not isinstance(err, dict):
+                continue
+            code = int(err.get("error_code", -1))
+            logger.warning(
+                "vk_execute_inner_error token=%s lease=%s method=%s vk_error=%s",
+                lease.fingerprint[:6],
+                lease.method,
+                err.get("method", "?"),
+                code,
+            )
+            if code in (9, 29):
+                stop.add(code)
+        if stop:
+            if self._budget is not None:
+                reset, now = self._budget.next_reset(), self._budget.now()
+            else:
+                reset = _next_moscow_midnight()
+                now = datetime.now(reset.tzinfo)
+            seconds = max(60.0, (reset - now).total_seconds())
+            logger.warning(
+                "vk_token_method_stopped_until_next_day token=%s lease=%s until=%s vk_error=%s",
+                lease.fingerprint[:6],
+                lease.method,
+                reset.isoformat(),
+                ",".join(str(c) for c in sorted(stop)),
+            )
+            await self._pool.block_method_for(lease, seconds)
 
     async def search_page(
         self,
