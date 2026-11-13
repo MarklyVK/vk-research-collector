@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
-"""Wrapper ╨┤╨╗╤П ╨╖╨░╨┐╤Г╤Б╨║╨░ ╨╛╤В╤З╤С╤В╨░ youtube/report.py ╨╕╨╖ ╨║╨╛╤А╨╜╤П ╤А╨╡╨┐╨╛╨╖╨╕╤В╨╛╤А╨╕╤П."""
+#!/usr/bin/env python3
+"""Обертка для запуска отчета youtube/report.py из корня репозитория."""
 
 import sys
 from pathlib import Path
 
-# ╨Ф╨╛╨▒╨░╨▓╨╗╤П╨╡╨╝ src ╨▓ sys.path
+# Добавляем src в sys.path
 root = Path(__file__).resolve().parent.parent
 src = root / "src"
 if str(src) not in sys.path:
