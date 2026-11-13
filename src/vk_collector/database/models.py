@@ -1388,7 +1388,7 @@ class YTTop(Base):
 
     __tablename__ = "yt_top"
     __table_args__ = (
-        UniqueConstraint("video_id", "source", name="uq_yt_top_video_source"),
+        UniqueConstraint("video_id", "source", name="yt_top_video_id_source_key"),
         Index("idx_yt_top_video_id", "video_id"),
         Index("idx_yt_top_source", "source"),
     )
