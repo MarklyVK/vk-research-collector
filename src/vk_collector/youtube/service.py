@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
@@ -589,9 +590,21 @@ class YouTubePanelService:
                 # Фоллбэк на 1 страницу playlistItems.list (1 единица квоты)
                 p_id = ch.uploads_playlist_id or derive_uploads_playlist_id(ch.channel_id)
                 if p_id:
-                    p_items = await self._client.get_playlist_items(
-                        p_id, published_after=monitoring_start, max_pages=1
-                    )
+                    try:
+                        p_items = await self._client.get_playlist_items(
+                            p_id, published_after=monitoring_start, max_pages=1
+                        )
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code in (403, 404):
+                            logger.warning(
+                                "Канал %s (плейлист %s) недоступен (HTTP %s), пропуск: %s",
+                                ch.channel_id,
+                                p_id,
+                                exc.response.status_code,
+                                exc,
+                            )
+                            continue
+                        raise
                     for it in p_items:
                         v_id = it.get("contentDetails", {}).get("videoId")
                         pub_raw = it.get("snippet", {}).get("publishedAt")

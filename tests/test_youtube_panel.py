@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -13,6 +14,7 @@ import pytest
 
 from vk_collector.config import load_yt_keywords
 from vk_collector.database.models import (
+    YTChannel,
     YTComment,
     YTPost,
     YTScheduledMeasurement,
@@ -749,3 +751,253 @@ async def test_stratification_active_priority_and_domain_collision(tmp_path: Pat
 
         assert stats["total_discovered"] == 4
         assert stats["valid_russian_channels"] == 3
+
+
+# =============================================================================
+# 11. Тест устойчивости panel_tick к 404/403 в playlistItems и выполнения Фазы 2
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_panel_tick_handles_404_and_403_and_reaches_phase_2(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now_utc = datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC)
+
+    ch_404 = YTChannel(
+        channel_id="UC_err_404",
+        title="Канал 404",
+        domain="юмор и развлечения",
+        size_tier="S",
+        uploads_playlist_id="UU_err_404",
+        is_selected=True,
+    )
+    ch_403 = YTChannel(
+        channel_id="UC_err_403",
+        title="Канал 403",
+        domain="юмор и развлечения",
+        size_tier="S",
+        uploads_playlist_id="UU_err_403",
+        is_selected=True,
+    )
+    ch_ok = YTChannel(
+        channel_id="UC_ok",
+        title="Канал OK",
+        domain="авто",
+        size_tier="M",
+        uploads_playlist_id="UU_ok",
+        is_selected=True,
+    )
+
+    sched_due = YTScheduledMeasurement(
+        id=1,
+        post_id="vid_due",
+        target_age_h=1,
+        scheduled_for=now_utc - timedelta(minutes=10),
+        status="pending",
+    )
+
+    mock_post_due = YTPost(
+        post_id="vid_due",
+        url="https://www.youtube.com/watch?v=vid_due",
+        channel_id="UC_ok",
+        published_at=now_utc - timedelta(hours=1, minutes=10),
+        crawled_at=now_utc - timedelta(hours=1, minutes=10),
+        duration_s=120,
+        is_short=False,
+    )
+
+    added_objects: list[Any] = []
+
+    class MockSession:
+        async def __aenter__(self) -> MockSession:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        def add(self, obj: Any) -> None:
+            added_objects.append(obj)
+
+        async def get(self, entity: Any, ident: Any) -> Any:
+            if entity is YTPost and ident == "vid_due":
+                return mock_post_due
+            return None
+
+        async def execute(self, stmt: Any) -> Any:
+            class MockResult:
+                def all(self) -> list[Any]:
+                    return []
+
+            return MockResult()
+
+        async def scalars(self, stmt: Any) -> Any:
+            s = str(stmt).lower()
+
+            class MockScalars:
+                def __init__(self, data: list[Any]) -> None:
+                    self._data = data
+
+                def all(self) -> list[Any]:
+                    return self._data
+
+                def first(self) -> Any:
+                    return self._data[0] if self._data else None
+
+            if "yt_channels" in s:
+                return MockScalars([ch_404, ch_403, ch_ok])
+            if "yt_scheduled_measurements" in s:
+                return MockScalars([sched_due])
+            if "yt_posts" in s:
+                return MockScalars([])
+            return MockScalars([])
+
+        async def commit(self) -> None:
+            pass
+
+    class MockSessionFactory:
+        def __call__(self) -> MockSession:
+            return MockSession()
+
+    mock_client = AsyncMock(spec=YouTubeClient)
+    mock_client.fetch_channel_rss_video_ids = AsyncMock(return_value=[])
+
+    async def mock_get_playlist_items(playlist_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        if playlist_id == "UU_err_404":
+            req = httpx.Request("GET", f"https://api.test/playlistItems?id={playlist_id}")
+            resp = httpx.Response(404, request=req)
+            raise httpx.HTTPStatusError("Not Found", request=req, response=resp)
+        if playlist_id == "UU_err_403":
+            req = httpx.Request("GET", f"https://api.test/playlistItems?id={playlist_id}")
+            resp = httpx.Response(403, request=req)
+            raise httpx.HTTPStatusError("Forbidden", request=req, response=resp)
+        if playlist_id == "UU_ok":
+            return [
+                {
+                    "contentDetails": {"videoId": "vid_new"},
+                    "snippet": {"publishedAt": "2026-11-10T12:00:00Z"},
+                }
+            ]
+        return []
+
+    mock_client.get_playlist_items = AsyncMock(side_effect=mock_get_playlist_items)
+
+    async def mock_get_videos_batch(vids: list[str]) -> list[dict[str, Any]]:
+        res: list[dict[str, Any]] = []
+        for vid in vids:
+            if vid == "vid_new":
+                res.append(
+                    {
+                        "id": "vid_new",
+                        "snippet": {
+                            "title": "Новое видео",
+                            "publishedAt": "2026-11-10T12:00:00Z",
+                            "thumbnails": {},
+                        },
+                        "statistics": {"viewCount": "100", "likeCount": "10", "commentCount": "2"},
+                        "contentDetails": {"duration": "PT60S"},
+                    }
+                )
+            elif vid == "vid_due":
+                res.append(
+                    {
+                        "id": "vid_due",
+                        "snippet": {"title": "Плановое видео"},
+                        "statistics": {"viewCount": "500", "likeCount": "50", "commentCount": "5"},
+                    }
+                )
+        return res
+
+    mock_client.get_videos_batch = AsyncMock(side_effect=mock_get_videos_batch)
+
+    mock_downloader = AsyncMock(spec=YouTubeMediaDownloader)
+    mock_downloader.download_media_for_posts = AsyncMock(return_value=1)
+
+    from vk_collector.config import Settings
+
+    settings = Settings()
+    service = YouTubePanelService(
+        MockSessionFactory(),  # type: ignore[arg-type]
+        mock_client,
+        settings,
+        media_downloader=mock_downloader,
+    )
+
+    caplog.set_level("WARNING")
+
+    res = await service.panel_tick(now=now_utc)
+
+    # 1. Проверяем, что вызов завершился успешно без падения
+    assert res["new_posts_registered"] == 1
+    assert res["measurements_completed"] == 1
+    assert res["media_downloaded"] == 1
+
+    # 2. Проверяем, что статус is_selected у каналов НЕ изменился
+    assert ch_404.is_selected is True
+    assert ch_403.is_selected is True
+    assert ch_ok.is_selected is True
+
+    # 3. Проверяем, что замер в Фазе 2 выполнен
+    assert sched_due.status == "completed"
+    assert sched_due.completed_at == now_utc
+
+    # 4. Проверяем логирование предупреждений с channel_id и кодами 404 и 403
+    assert "UC_err_404" in caplog.text
+    assert "HTTP 404" in caplog.text
+    assert "UC_err_403" in caplog.text
+    assert "HTTP 403" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_panel_tick_propagates_unhandled_http_errors() -> None:
+    now_utc = datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC)
+
+    ch_500 = YTChannel(
+        channel_id="UC_err_500",
+        title="Канал 500",
+        domain="юмор и развлечения",
+        size_tier="S",
+        uploads_playlist_id="UU_err_500",
+        is_selected=True,
+    )
+
+    class MockSession:
+        async def __aenter__(self) -> MockSession:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def scalars(self, stmt: Any) -> Any:
+            class MockScalars:
+                def all(self) -> list[Any]:
+                    return [ch_500]
+
+            return MockScalars()
+
+    class MockSessionFactory:
+        def __call__(self) -> MockSession:
+            return MockSession()
+
+    mock_client = AsyncMock(spec=YouTubeClient)
+    mock_client.fetch_channel_rss_video_ids = AsyncMock(return_value=[])
+
+    req = httpx.Request("GET", "https://api.test/playlistItems")
+    resp = httpx.Response(500, request=req)
+    mock_client.get_playlist_items = AsyncMock(
+        side_effect=httpx.HTTPStatusError("Server Error", request=req, response=resp)
+    )
+
+    from vk_collector.config import Settings
+
+    settings = Settings()
+    service = YouTubePanelService(
+        MockSessionFactory(),  # type: ignore[arg-type]
+        mock_client,
+        settings,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await service.panel_tick(now=now_utc)
+
+    assert exc_info.value.response.status_code == 500
